@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/debt-flow/sip-gateway/internal/call"
@@ -24,9 +25,10 @@ type Limits struct {
 }
 
 type Store struct {
-	db     *sql.DB
-	path   string
-	limits Limits
+	db      *sql.DB
+	path    string
+	limits  Limits
+	writeMu sync.Mutex
 }
 
 type CommandStatus string
@@ -255,6 +257,8 @@ func (s *Store) ConsumeCapability(ctx context.Context, capabilityID string, expi
 	if capabilityID == "" || !expiresAt.After(now) {
 		return false, errors.New("invalid capability consumption")
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -283,6 +287,8 @@ func HashPayload(payload []byte) string {
 }
 
 func (s *Store) BeginCommand(ctx context.Context, commandID string, payload []byte, now time.Time) (BeginCommandResult, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	hash := HashPayload(payload)
 	record, err := s.Command(ctx, commandID)
 	if err == nil {
@@ -321,6 +327,8 @@ func (s *Store) FinishCommand(ctx context.Context, commandID string, status Comm
 	if status != CommandCompleted && status != CommandFailed {
 		return errors.New("command final status must be completed or failed")
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	res, err := s.db.ExecContext(ctx, `
 UPDATE commands SET status = ?, result = ?, error_code = ?, updated_at_utc = ?
 WHERE command_id = ? AND status IN ('received','executing')`, status, result, errorCode, utc(now), commandID)
@@ -335,6 +343,8 @@ WHERE command_id = ? AND status IN ('received','executing')`, status, result, er
 }
 
 func (s *Store) RecoverInterruptedCommands(ctx context.Context, now time.Time) (int64, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	result, err := s.db.ExecContext(ctx, `
 UPDATE commands
 SET status = 'failed', error_code = 'gateway_restarted', updated_at_utc = ?
@@ -353,6 +363,8 @@ func (s *Store) AppendEvent(ctx context.Context, sessionID, agentInstanceID, eve
 	if sessionID == "" || agentInstanceID == "" {
 		return Event{}, errors.New("event session and agent instance are required")
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Event{}, err
@@ -407,6 +419,8 @@ ORDER BY sequence LIMIT ?`, sessionID, after, limit)
 }
 
 func (s *Store) Acknowledge(ctx context.Context, sessionID string, through uint64, now time.Time) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	_, err := s.db.ExecContext(ctx, `
 UPDATE outbox SET acked_at_utc = COALESCE(acked_at_utc, ?)
 WHERE session_id = ? AND sequence <= ?`, utc(now), sessionID, through)
@@ -421,6 +435,8 @@ func (s *Store) SaveCall(ctx context.Context, sessionID, agentInstanceID string,
 	if err != nil {
 		return err
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	active := snapshot.State != call.StateEnded
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO calls(call_id, session_id, agent_instance_id, snapshot_json, active, updated_at_utc)
@@ -436,6 +452,8 @@ ON CONFLICT(call_id) DO UPDATE SET
 }
 
 func (s *Store) RecoverRestartedCalls(ctx context.Context, now time.Time) (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -554,6 +572,8 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 }
 
 func (s *Store) Maintain(ctx context.Context, before, now time.Time) (MaintenanceResult, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return MaintenanceResult{}, err

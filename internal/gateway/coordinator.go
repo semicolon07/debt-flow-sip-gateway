@@ -896,6 +896,7 @@ func (c *Coordinator) startCall(ctx context.Context, session *runtimeSession, en
 		return nil, commandError{"media_not_ready"}
 	}
 	if err := c.sip.StartCall(ctx, session.claims.SessionID, command.CallID, authorization.Destination, localSDP); err != nil {
+		c.logger.Error("start outbound SIP call failed", "callId", command.CallID, "error", err)
 		c.closeCallMedia(session, command.CallID)
 		machine.RemoteHangup(call.EndSIPFailed, c.now())
 		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, machine.Snapshot(), c.now())
@@ -1665,9 +1666,12 @@ func (c *Coordinator) snapshotLocked(session *runtimeSession) map[string]any {
 		"registration": session.registration, "leaseExpiresAtUtc": session.leaseExpires,
 	}
 	if session.activeCall != nil {
-		value["call"] = session.activeCall.Snapshot()
-		if session.remoteParty != "" {
-			value["remoteParty"] = session.remoteParty
+		snapshot := session.activeCall.Snapshot()
+		if snapshot.State != call.StateEnded {
+			value["call"] = snapshot
+			if session.remoteParty != "" {
+				value["remoteParty"] = session.remoteParty
+			}
 		}
 	}
 	return value

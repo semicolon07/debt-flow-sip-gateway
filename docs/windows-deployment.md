@@ -16,6 +16,24 @@ SIP Gateway ไม่มี route, URL, credential, client certificate หรื
 - Web API configuration: `PhoneGateway:PublicWebSocketUrl`, `PhoneGateway:GatewayId`,
   `PhoneGateway:Capability:Issuer`, `Audience`, `ActiveKeyId` และ `Keys:<keyId>`
 
+เปิดใช้งานฝั่ง Web API ด้วย environment variables ด้านล่าง โดย `GatewayId`, issuer, audience, key ID
+และ decoded key ต้องตรงกับ Gateway configuration ทุกค่า:
+
+```text
+PhoneGateway__Enabled=true
+PhoneGateway__PublicWebSocketUrl=wss://sip-gateway.uniga.app/gateway/v1
+PhoneGateway__GatewayId=sip-gateway-01
+PhoneGateway__Capability__Issuer=debt-flow-web-api
+PhoneGateway__Capability__Audience=debt-flow-sip-gateway
+PhoneGateway__Capability__ActiveKeyId=cap-2026-10
+PhoneGateway__Capability__Keys__cap-2026-10=<base64-encoded-32-byte-key>
+```
+
+ห้ามเก็บ capability key จริงใน `appsettings*.json`, source control หรือ deployment manifest ให้ inject
+จาก secret manager เท่านั้น Web API จะปฏิเสธการเริ่ม process เมื่อ `PhoneGateway__Enabled=true` แต่ URL,
+identity หรือ active key ตั้งค่าไม่ครบ/ไม่ถูกต้อง หากยังใช้เฉพาะ Desktop Agent ให้คง `Enabled=false`
+ไว้ได้โดยไม่ต้อง provision capability key
+
 ## Install
 
 1. Build release พร้อม release manifest, CycloneDX SBOM, checksums และ Authenticode signature:

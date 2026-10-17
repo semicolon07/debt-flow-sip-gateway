@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -132,6 +134,77 @@ func TestOutboxSequenceIsMonotonicAcrossSessionsForTheSameAgent(t *testing.T) {
 	otherAgent, err := store.AppendEvent(ctx, "session-3", "agent-2", "third", "call.state_changed", []byte(`{}`), now)
 	if err != nil || otherAgent.Sequence != 1 {
 		t.Fatalf("independent agent sequence: event=%+v err=%v", otherAgent, err)
+	}
+}
+
+func TestConcurrentWritersAreSerializedWithoutSQLiteBusy(t *testing.T) {
+	const workers = 200
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "concurrent.db"), Limits{
+		PerSession: 10, Global: workers * 10, MaxBytes: 1 << 30,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	now := time.Now().UTC()
+	start := make(chan struct{})
+	errorsFound := make(chan error, workers+1)
+	sequences := make(chan uint64, workers)
+	var wait sync.WaitGroup
+
+	for index := range workers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			commandID := fmt.Sprintf("command-%d", index)
+			sessionID := fmt.Sprintf("session-%d", index)
+			if _, err := database.BeginCommand(ctx, commandID, []byte(`{"type":"call.start"}`), now); err != nil {
+				errorsFound <- fmt.Errorf("begin %s: %w", commandID, err)
+				return
+			}
+			event, err := database.AppendEvent(ctx, sessionID, "agent-1", commandID,
+				"registration.state_changed", []byte(`{"state":"registered"}`), now)
+			if err != nil {
+				errorsFound <- fmt.Errorf("append %s: %w", commandID, err)
+				return
+			}
+			sequences <- event.Sequence
+			if err := database.FinishCommand(ctx, commandID, CommandCompleted, nil, "", now); err != nil {
+				errorsFound <- fmt.Errorf("finish %s: %w", commandID, err)
+				return
+			}
+			if err := database.Acknowledge(ctx, sessionID, event.Sequence, now); err != nil {
+				errorsFound <- fmt.Errorf("acknowledge %s: %w", commandID, err)
+			}
+		}()
+	}
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		<-start
+		for range 10 {
+			if _, err := database.Maintain(ctx, now.Add(-time.Hour), now); err != nil {
+				errorsFound <- fmt.Errorf("maintain: %w", err)
+				return
+			}
+		}
+	}()
+
+	close(start)
+	wait.Wait()
+	close(errorsFound)
+	close(sequences)
+	for err := range errorsFound {
+		t.Error(err)
+	}
+	seen := make(map[uint64]struct{}, workers)
+	for sequence := range sequences {
+		seen[sequence] = struct{}{}
+	}
+	if len(seen) != workers {
+		t.Fatalf("unique sequences=%d, want %d", len(seen), workers)
 	}
 }
 

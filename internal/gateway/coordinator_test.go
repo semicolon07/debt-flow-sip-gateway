@@ -771,6 +771,38 @@ func TestCoordinatorUsesCanonicalAuthorizedDestinationAndDeduplicates(t *testing
 	}
 }
 
+func TestCoordinatorSnapshotOmitsTerminalCall(t *testing.T) {
+	coordinator := newTestCoordinator(t, &fakeCapabilityVerifier{}, newFakeSIP())
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+		t.Fatal(err)
+	}
+	session, err := coordinator.session(claims.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	machine, err := call.NewOutbound(uuid.NewString(), time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !machine.RemoteHangup(call.EndCancelled, time.Now().UTC()) {
+		t.Fatal("expected call to become terminal")
+	}
+	session.mu.Lock()
+	session.activeCall = machine
+	snapshot := coordinator.snapshotLocked(session)
+	session.mu.Unlock()
+	if _, exists := snapshot["call"]; exists {
+		t.Fatal("terminal call must not be exposed as active in gateway snapshot")
+	}
+}
+
 func TestCoordinatorRequiresRegistrationBeforeStartingCall(t *testing.T) {
 	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
 	sipRuntime := newFakeSIP()

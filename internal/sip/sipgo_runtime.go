@@ -242,9 +242,9 @@ func (r *SIPGoRuntime) StartCall(ctx context.Context, sessionID, callID, destina
 	if err != nil {
 		return err
 	}
-	var recipient sipmessage.Uri
-	if err := sipmessage.ParseUri(destination, &recipient); err != nil {
-		return errors.New("canonical destination is not a valid SIP URI")
+	recipient, err := outboundRecipient(destination, session.configuration)
+	if err != nil {
+		return err
 	}
 	setURITransport(&recipient, session.configuration.Transport)
 	callCtx, cancel := context.WithCancelCause(context.Background())
@@ -613,6 +613,40 @@ func buildContact(cfg SIPGoConfig, configuration Configuration) (sipmessage.Cont
 	address := sipmessage.Uri{User: configuration.Username, Host: cfg.AdvertisedIP, Port: port}
 	setURITransport(&address, configuration.Transport)
 	return sipmessage.ContactHeader{Address: address}, nil
+}
+
+func outboundRecipient(destination string, configuration Configuration) (sipmessage.Uri, error) {
+	value := destination
+	lower := strings.ToLower(value)
+	if !strings.HasPrefix(lower, "sip:") && !strings.HasPrefix(lower, "sips:") {
+		if !isCanonicalDialDestination(value) {
+			return sipmessage.Uri{}, errors.New("canonical destination is invalid")
+		}
+		value = "sip:" + value + "@" + net.JoinHostPort(
+			configuration.Host, strconv.Itoa(int(configuration.Port)),
+		)
+	}
+	var recipient sipmessage.Uri
+	if err := sipmessage.ParseUri(value, &recipient); err != nil {
+		return sipmessage.Uri{}, errors.New("canonical destination is not a valid SIP URI")
+	}
+	return recipient, nil
+}
+
+func isCanonicalDialDestination(value string) bool {
+	digits := 0
+	for index, character := range value {
+		switch {
+		case character >= '0' && character <= '9':
+			digits++
+		case character == '*' || character == '#':
+			digits++
+		case character == '+' && index == 0:
+		default:
+			return false
+		}
+	}
+	return digits >= 1 && digits <= 32
 }
 
 func setURITransport(uri *sipmessage.Uri, transport Transport) {

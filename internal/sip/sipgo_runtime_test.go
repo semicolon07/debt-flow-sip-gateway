@@ -70,6 +70,38 @@ func TestSetURITransportOverridesCanonicalDestination(t *testing.T) {
 	}
 }
 
+func TestOutboundRecipientBuildsSIPURIFromCanonicalPhoneNumber(t *testing.T) {
+	recipient, err := outboundRecipient("0955948679", Configuration{
+		Host: "192.168.1.247", Port: 5060, Transport: TransportUDP,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := recipient.String(), "sip:0955948679@192.168.1.247:5060"; got != want {
+		t.Fatalf("recipient=%q, want %q", got, want)
+	}
+}
+
+func TestOutboundRecipientPreservesExplicitSIPURI(t *testing.T) {
+	recipient, err := outboundRecipient("sip:100@pbx.example.test:5060", Configuration{
+		Host: "192.168.1.247", Port: 5060, Transport: TransportUDP,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := recipient.String(), "sip:100@pbx.example.test:5060"; got != want {
+		t.Fatalf("recipient=%q, want %q", got, want)
+	}
+}
+
+func TestOutboundRecipientRejectsNonCanonicalDestination(t *testing.T) {
+	if _, err := outboundRecipient("100@example.test", Configuration{
+		Host: "192.168.1.247", Port: 5060, Transport: TransportUDP,
+	}); err == nil {
+		t.Fatal("expected non-canonical destination to be rejected")
+	}
+}
+
 func TestRegistrationRetryDelayIsExponentiallyBounded(t *testing.T) {
 	for failures, expected := range map[int]time.Duration{
 		0: time.Second, 1: time.Second, 2: 2 * time.Second, 3: 4 * time.Second,
