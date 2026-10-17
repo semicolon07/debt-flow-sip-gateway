@@ -550,7 +550,7 @@ func (c *Coordinator) OnWebRTCState(sessionID string, state pion.PeerConnectionS
 	snapshot := machine.Snapshot()
 	session.mu.Unlock()
 	_ = c.store.SaveCall(context.Background(), sessionID, session.claims.AgentInstanceID, snapshot, c.now())
-	_, _ = c.emit(context.Background(), session, "call.ended", snapshot, "call-ended:"+snapshot.CallID)
+	_ = c.emitCallEnded(context.Background(), session, snapshot)
 	_ = c.sip.Hangup(context.Background(), sessionID, snapshot.CallID)
 	c.closeCallMedia(session, snapshot.CallID)
 }
@@ -837,7 +837,6 @@ func (c *Coordinator) startCall(ctx context.Context, session *runtimeSession, en
 		return nil, commandError{"call_capacity_reached"}
 	}
 	machine, _ := call.NewOutbound(command.CallID, c.now())
-	_ = machine.BeginAuthorization()
 	session.activeCall = machine
 	session.remoteParty = ""
 	session.mu.Unlock()
@@ -850,6 +849,11 @@ func (c *Coordinator) startCall(ctx context.Context, session *runtimeSession, en
 		c.logger.Error("persist call.created event failed", "callId", command.CallID, "error", err)
 		c.failCallBeforeInvite(ctx, session, machine, command.CommandID, "event_outbox_failed")
 		return nil, commandError{"event_outbox_failed"}
+	}
+	if err := machine.BeginAuthorization(); err != nil {
+		c.releaseCallOwner(command.CallID)
+		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, "call_state_conflict", c.now())
+		return nil, commandError{"call_state_conflict"}
 	}
 	authorization, err := c.capability.VerifyCall(command.GatewayCapability, capability.CallBinding{
 		SessionID: session.claims.SessionID, UserSessionID: session.claims.UserSessionID,
@@ -871,7 +875,7 @@ func (c *Coordinator) startCall(ctx context.Context, session *runtimeSession, en
 		machine.AuthorizationFailed(c.now())
 		c.releaseCallOwner(command.CallID)
 		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, machine.Snapshot(), c.now())
-		_, _ = c.emit(ctx, session, "call.ended", machine.Snapshot(), "call-ended:"+command.CallID)
+		_ = c.emitCallEnded(ctx, session, machine.Snapshot())
 		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, "call_authorization_failed", c.now())
 		return nil, commandError{"call_authorization_failed"}
 	}
@@ -881,9 +885,15 @@ func (c *Coordinator) startCall(ctx context.Context, session *runtimeSession, en
 		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, "call_state_conflict", c.now())
 		return nil, commandError{"call_state_conflict"}
 	}
-	if err := c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, machine.Snapshot(), c.now()); err != nil {
+	dialing := machine.Snapshot()
+	if err := c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, dialing, c.now()); err != nil {
 		c.failCallBeforeInvite(ctx, session, machine, command.CommandID, "call_persistence_failed")
 		return nil, commandError{"call_persistence_failed"}
+	}
+	if _, err := c.emit(ctx, session, "call.state_changed", dialing, "call-dialing:"+command.CallID); err != nil {
+		c.logger.Error("persist outbound dialing event failed", "callId", command.CallID, "error", err)
+		c.failCallBeforeInvite(ctx, session, machine, command.CommandID, "event_outbox_failed")
+		return nil, commandError{"event_outbox_failed"}
 	}
 	localSDP, err := c.setupCallMedia(session, command.CallID)
 	if err != nil {
@@ -891,7 +901,7 @@ func (c *Coordinator) startCall(ctx context.Context, session *runtimeSession, en
 		c.closeCallMedia(session, command.CallID)
 		machine.RemoteHangup(call.EndMediaFailed, c.now())
 		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, machine.Snapshot(), c.now())
-		_, _ = c.emit(ctx, session, "call.ended", machine.Snapshot(), "call-ended:"+command.CallID)
+		_ = c.emitCallEnded(ctx, session, machine.Snapshot())
 		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, "media_not_ready", c.now())
 		return nil, commandError{"media_not_ready"}
 	}
@@ -900,7 +910,7 @@ func (c *Coordinator) startCall(ctx context.Context, session *runtimeSession, en
 		c.closeCallMedia(session, command.CallID)
 		machine.RemoteHangup(call.EndSIPFailed, c.now())
 		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, machine.Snapshot(), c.now())
-		_, _ = c.emit(ctx, session, "call.ended", machine.Snapshot(), "call-ended:"+command.CallID)
+		_ = c.emitCallEnded(ctx, session, machine.Snapshot())
 		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, "sip_adapter_unavailable", c.now())
 		return nil, commandError{"sip_adapter_unavailable"}
 	}
@@ -922,15 +932,20 @@ func (c *Coordinator) hangup(ctx context.Context, session *runtimeSession, envel
 		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, "call_not_found", c.now())
 		return nil, commandError{"call_not_found"}
 	}
-	_, emitted := machine.LocalHangup(c.now())
-	snapshot := machine.Snapshot()
+	_, emitted := machine.BeginEnding()
+	ending := machine.Snapshot()
 	session.mu.Unlock()
 	if !emitted {
 		return c.finishCommand(ctx, command.CommandID, "call.hangup")
 	}
+	_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, ending, c.now())
+	_, _ = c.emit(ctx, session, "call.state_changed", ending, "call-ending:"+command.CallID)
 	sipErr := c.sip.Hangup(ctx, session.claims.SessionID, command.CallID)
-	_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now())
-	_, _ = c.emit(ctx, session, "call.ended", snapshot, "call-ended:"+command.CallID)
+	if machine.CompleteEnding(call.EndLocalHangup, c.now()) {
+		snapshot := machine.Snapshot()
+		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now())
+		_ = c.emitCallEnded(ctx, session, snapshot)
+	}
 	c.closeCallMedia(session, command.CallID)
 	if sipErr != nil && !errors.Is(sipErr, sip.ErrSpikeGateNotPassed) {
 		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, "sip_hangup_failed", c.now())
@@ -962,16 +977,23 @@ func (c *Coordinator) answer(ctx context.Context, session *runtimeSession, envel
 	snapshot := machine.Snapshot()
 	localSDP := append([]byte(nil), media.localSDP...)
 	session.mu.Unlock()
+	if err := c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now()); err != nil {
+		c.failCallBeforeAnswer(ctx, session, machine, command.CommandID, "call_persistence_failed")
+		return nil, commandError{"call_persistence_failed"}
+	}
+	if _, err := c.emit(ctx, session, "call.state_changed", snapshot, "call-answering:"+command.CallID); err != nil {
+		c.failCallBeforeAnswer(ctx, session, machine, command.CommandID, "event_outbox_failed")
+		return nil, commandError{"event_outbox_failed"}
+	}
 	if err := c.sip.Answer(ctx, session.claims.SessionID, command.CallID, localSDP); err != nil {
 		machine.RemoteHangup(call.EndSIPFailed, c.now())
 		failed := machine.Snapshot()
 		c.closeCallMedia(session, command.CallID)
 		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, failed, c.now())
-		_, _ = c.emit(ctx, session, "call.ended", failed, "call-ended:"+command.CallID)
+		_ = c.emitCallEnded(ctx, session, failed)
 		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, "sip_answer_failed", c.now())
 		return nil, commandError{"sip_answer_failed"}
 	}
-	_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now())
 	return c.finishCommand(ctx, command.CommandID, "call.answer")
 }
 
@@ -990,13 +1012,18 @@ func (c *Coordinator) reject(ctx context.Context, session *runtimeSession, envel
 		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, "call_not_found", c.now())
 		return nil, commandError{"call_not_found"}
 	}
-	_, emitted := machine.RejectInbound(c.now())
-	snapshot := machine.Snapshot()
+	_, emitted := machine.BeginRejectInbound()
+	ending := machine.Snapshot()
 	session.mu.Unlock()
 	if emitted {
+		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, ending, c.now())
+		_, _ = c.emit(ctx, session, "call.state_changed", ending, "call-ending:"+command.CallID)
 		sipErr := c.sip.Reject(ctx, session.claims.SessionID, command.CallID, 486)
-		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now())
-		_, _ = c.emit(ctx, session, "call.ended", snapshot, "call-ended:"+command.CallID)
+		if machine.CompleteEnding(call.EndRejected, c.now()) {
+			snapshot := machine.Snapshot()
+			_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now())
+			_ = c.emitCallEnded(ctx, session, snapshot)
+		}
 		c.closeCallMedia(session, command.CallID)
 		if sipErr != nil {
 			_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, "sip_reject_failed", c.now())
@@ -1119,7 +1146,7 @@ func (c *Coordinator) applySIPEvent(event sip.Event) {
 		}
 	case sip.EventIncoming:
 		c.applyIncomingCall(session, event)
-	case sip.EventRinging, sip.EventConnected, sip.EventEnded, sip.EventFailed:
+	case sip.EventTrying, sip.EventRinging, sip.EventConnected, sip.EventEnded, sip.EventFailed:
 		c.applyCallEvent(session, event)
 	}
 }
@@ -1146,6 +1173,12 @@ func (c *Coordinator) applyIncomingCall(session *runtimeSession, event sip.Event
 		return
 	}
 	machine, _ := call.NewInbound(event.CallID, c.now())
+	created := machine.Snapshot()
+	if err := machine.MarkIncoming(); err != nil {
+		session.mu.Unlock()
+		_ = c.sip.Reject(context.Background(), event.SessionID, event.CallID, 500)
+		return
+	}
 	session.activeCall = machine
 	session.remoteParty = event.RemoteParty
 	session.mu.Unlock()
@@ -1170,8 +1203,8 @@ func (c *Coordinator) applyIncomingCall(session *runtimeSession, event sip.Event
 		c.closeCallMedia(session, event.CallID)
 		return
 	}
-	snapshot := machine.Snapshot()
-	if err := c.store.SaveCall(context.Background(), event.SessionID, session.claims.AgentInstanceID, snapshot, c.now()); err != nil {
+	incoming := machine.Snapshot()
+	if err := c.store.SaveCall(context.Background(), event.SessionID, session.claims.AgentInstanceID, incoming, c.now()); err != nil {
 		machine.RemoteHangup(call.EndAPIUnavailable, c.now())
 		c.discardCall(session, machine)
 		_ = c.sip.Reject(context.Background(), event.SessionID, event.CallID, 500)
@@ -1179,15 +1212,24 @@ func (c *Coordinator) applyIncomingCall(session *runtimeSession, event sip.Event
 		return
 	}
 	payload := map[string]any{
-		"callId": snapshot.CallID, "direction": snapshot.Direction, "state": snapshot.State,
-		"createdAtUtc": snapshot.CreatedAt, "revision": snapshot.Revision,
+		"callId": created.CallID, "direction": created.Direction, "state": created.State,
+		"createdAtUtc": created.CreatedAt, "revision": created.Revision,
 		"remoteParty": event.RemoteParty,
 	}
 	if _, err := c.emit(context.Background(), session, "call.created", payload, "call-created:"+event.CallID); err != nil {
 		machine.RemoteHangup(call.EndAPIUnavailable, c.now())
 		terminal := machine.Snapshot()
 		_ = c.store.SaveCall(context.Background(), event.SessionID, session.claims.AgentInstanceID, terminal, c.now())
-		_, _ = c.emit(context.Background(), session, "call.ended", terminal, "call-ended:"+event.CallID)
+		_ = c.emitCallEnded(context.Background(), session, terminal)
+		_ = c.sip.Reject(context.Background(), event.SessionID, event.CallID, 500)
+		c.closeCallMedia(session, event.CallID)
+		return
+	}
+	if _, err := c.emit(context.Background(), session, "call.state_changed", incoming, "call-incoming:"+event.CallID); err != nil {
+		machine.RemoteHangup(call.EndAPIUnavailable, c.now())
+		terminal := machine.Snapshot()
+		_ = c.store.SaveCall(context.Background(), event.SessionID, session.claims.AgentInstanceID, terminal, c.now())
+		_ = c.emitCallEnded(context.Background(), session, terminal)
 		_ = c.sip.Reject(context.Background(), event.SessionID, event.CallID, 500)
 		c.closeCallMedia(session, event.CallID)
 	}
@@ -1204,8 +1246,16 @@ func (c *Coordinator) applyCallEvent(session *runtimeSession, event sip.Event) {
 	closeMedia := false
 	hangupSIP := false
 	switch event.Type {
+	case sip.EventTrying:
+		if err := machine.MarkTrying(); err != nil {
+			session.mu.Unlock()
+			return
+		}
 	case sip.EventRinging:
-		_ = machine.MarkRinging()
+		if err := machine.MarkRinging(); err != nil {
+			session.mu.Unlock()
+			return
+		}
 	case sip.EventConnected:
 		remote, err := sip.ParseRemoteSDP(event.RemoteSDP)
 		media := session.activeMedia
@@ -1218,7 +1268,10 @@ func (c *Coordinator) applyCallEvent(session *runtimeSession, event sip.Event) {
 			closeMedia = true
 			hangupSIP = true
 		} else {
-			_ = machine.Connected(c.now())
+			if err := machine.Connected(c.now()); err != nil {
+				session.mu.Unlock()
+				return
+			}
 		}
 	case sip.EventEnded:
 		machine.RemoteHangup(endReason(event.Reason), c.now())
@@ -1232,11 +1285,11 @@ func (c *Coordinator) applyCallEvent(session *runtimeSession, event sip.Event) {
 	snapshot := machine.Snapshot()
 	session.mu.Unlock()
 	_ = c.store.SaveCall(context.Background(), session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now())
-	eventKey := ""
 	if eventType == "call.ended" {
-		eventKey = "call-ended:" + event.CallID
+		_ = c.emitCallEnded(context.Background(), session, snapshot)
+	} else {
+		_, _ = c.emit(context.Background(), session, eventType, snapshot, "")
 	}
-	_, _ = c.emit(context.Background(), session, eventType, snapshot, eventKey)
 	if hangupSIP {
 		_ = c.sip.Hangup(context.Background(), session.claims.SessionID, event.CallID)
 	}
@@ -1332,7 +1385,23 @@ func (c *Coordinator) failCallBeforeInvite(
 	machine.RemoteHangup(call.EndAPIUnavailable, c.now())
 	snapshot := machine.Snapshot()
 	_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now())
-	_, _ = c.emit(ctx, session, "call.ended", snapshot, "call-ended:"+snapshot.CallID)
+	_ = c.emitCallEnded(ctx, session, snapshot)
+	c.closeCallMedia(session, snapshot.CallID)
+	_ = c.store.FinishCommand(ctx, commandID, store.CommandFailed, nil, errorCode, c.now())
+}
+
+func (c *Coordinator) failCallBeforeAnswer(
+	ctx context.Context,
+	session *runtimeSession,
+	machine *call.Machine,
+	commandID string,
+	errorCode string,
+) {
+	machine.RemoteHangup(call.EndAPIUnavailable, c.now())
+	snapshot := machine.Snapshot()
+	_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now())
+	_ = c.emitCallEnded(ctx, session, snapshot)
+	_ = c.sip.Reject(ctx, session.claims.SessionID, snapshot.CallID, 500)
 	c.closeCallMedia(session, snapshot.CallID)
 	_ = c.store.FinishCommand(ctx, commandID, store.CommandFailed, nil, errorCode, c.now())
 }
@@ -1571,7 +1640,7 @@ func (c *Coordinator) terminateSession(session *runtimeSession, reason call.EndR
 	session.mu.Unlock()
 	if snapshot.CallID != "" {
 		_ = c.store.SaveCall(context.Background(), session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now())
-		_, _ = c.emit(context.Background(), session, "call.ended", snapshot, "call-ended:"+snapshot.CallID)
+		_ = c.emitCallEnded(context.Background(), session, snapshot)
 		_ = c.sip.Hangup(context.Background(), session.claims.SessionID, snapshot.CallID)
 		c.closeCallMedia(session, snapshot.CallID)
 	}
@@ -1579,9 +1648,23 @@ func (c *Coordinator) terminateSession(session *runtimeSession, reason call.EndR
 	c.removeSession(session.claims.SessionID)
 }
 
+func (c *Coordinator) emitCallEnded(ctx context.Context, session *runtimeSession, snapshot call.Snapshot) error {
+	session.eventMu.Lock()
+	defer session.eventMu.Unlock()
+	if _, err := c.emitLocked(ctx, session, "call.state_changed", snapshot, "call-ended-state:"+snapshot.CallID); err != nil {
+		return err
+	}
+	_, err := c.emitLocked(ctx, session, "call.ended", snapshot, "call-ended:"+snapshot.CallID)
+	return err
+}
+
 func (c *Coordinator) emit(ctx context.Context, session *runtimeSession, eventType string, payload any, eventKey string) (protocol.Envelope, error) {
 	session.eventMu.Lock()
 	defer session.eventMu.Unlock()
+	return c.emitLocked(ctx, session, eventType, payload, eventKey)
+}
+
+func (c *Coordinator) emitLocked(ctx context.Context, session *runtimeSession, eventType string, payload any, eventKey string) (protocol.Envelope, error) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return protocol.Envelope{}, err

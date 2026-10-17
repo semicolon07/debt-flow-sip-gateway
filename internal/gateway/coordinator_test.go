@@ -702,7 +702,7 @@ func TestCoordinatorTerminatesTheSIPCallWhenWebRTCFails(t *testing.T) {
 func TestCoordinatorAcceptsInboundOnlyForHealthyPortal(t *testing.T) {
 	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
 	sipRuntime := newFakeSIP()
-	coordinator := newTestCoordinator(t, api, sipRuntime)
+	coordinator, _, _, database := newTestCoordinatorWithStore(t, api, sipRuntime)
 	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
 		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
 		SupportedProtocolVersions: []int{1},
@@ -724,6 +724,29 @@ func TestCoordinatorAcceptsInboundOnlyForHealthyPortal(t *testing.T) {
 	if _, err := coordinator.Handle(context.Background(), claims, protocol.Envelope{Type: "call.answer", Payload: answerPayload}); err != nil {
 		t.Fatal(err)
 	}
+	events, err := database.PendingEvents(context.Background(), claims.SessionID, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 4 || events[0].Type != "registration.state_changed" ||
+		events[1].Type != "call.created" || events[2].Type != "call.state_changed" ||
+		events[3].Type != "call.state_changed" {
+		t.Fatalf("unexpected inbound event order: %+v", events)
+	}
+	var incoming call.Snapshot
+	if err := json.Unmarshal(events[2].Payload, &incoming); err != nil {
+		t.Fatal(err)
+	}
+	if incoming.State != call.StateIncoming {
+		t.Fatalf("durable state=%q, want %q", incoming.State, call.StateIncoming)
+	}
+	var answering call.Snapshot
+	if err := json.Unmarshal(events[3].Payload, &answering); err != nil {
+		t.Fatal(err)
+	}
+	if answering.State != call.StateAnswering {
+		t.Fatalf("durable state=%q, want %q", answering.State, call.StateAnswering)
+	}
 	sipRuntime.mu.Lock()
 	defer sipRuntime.mu.Unlock()
 	if sipRuntime.answers != 1 || len(sipRuntime.localSDP) == 0 {
@@ -731,10 +754,75 @@ func TestCoordinatorAcceptsInboundOnlyForHealthyPortal(t *testing.T) {
 	}
 }
 
+func TestCoordinatorEmitsDesktopAgentCompatibleOutboundLifecycle(t *testing.T) {
+	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	coordinator, _, _, database := newTestCoordinatorWithStore(t, api, newFakeSIP())
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventRegistered, SessionID: claims.SessionID})
+	callID := uuid.NewString()
+	startPayload, _ := json.Marshal(protocol.StartCall{
+		CommandID: uuid.NewString(), CallID: callID, CallContextID: "context-1", GatewayCapability: "call-capability",
+	})
+	if _, err := coordinator.Handle(context.Background(), claims,
+		protocol.Envelope{Type: "call.start", Payload: startPayload}); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventTrying, SessionID: claims.SessionID, CallID: callID})
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventRinging, SessionID: claims.SessionID, CallID: callID})
+	remoteSDP := []byte("v=0\r\nc=IN IP4 10.0.0.20\r\nm=audio 20500 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n")
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventConnected, SessionID: claims.SessionID, CallID: callID, RemoteSDP: remoteSDP,
+	})
+	hangupPayload, _ := json.Marshal(protocol.CallCommand{CommandID: uuid.NewString(), CallID: callID})
+	if _, err := coordinator.Handle(context.Background(), claims,
+		protocol.Envelope{Type: "call.hangup", Payload: hangupPayload}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := database.PendingEvents(context.Background(), claims.SessionID, 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTypes := []string{
+		"registration.state_changed", "call.created", "call.state_changed", "call.state_changed",
+		"call.state_changed", "call.state_changed", "call.state_changed", "call.state_changed", "call.ended",
+	}
+	if len(events) != len(wantTypes) {
+		t.Fatalf("got %d events, want %d: %+v", len(events), len(wantTypes), events)
+	}
+	wantStates := []call.State{
+		call.StateCreated, call.StateDialing, call.StateTrying, call.StateRinging,
+		call.StateConnected, call.StateEnding, call.StateEnded, call.StateEnded,
+	}
+	for index, event := range events {
+		if event.Type != wantTypes[index] {
+			t.Fatalf("event %d type=%q, want %q", index, event.Type, wantTypes[index])
+		}
+		if index == 0 {
+			continue
+		}
+		var snapshot call.Snapshot
+		if err := json.Unmarshal(event.Payload, &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		if snapshot.State != wantStates[index-1] {
+			t.Fatalf("event %d state=%q, want %q", index, snapshot.State, wantStates[index-1])
+		}
+	}
+}
+
 func TestCoordinatorUsesCanonicalAuthorizedDestinationAndDeduplicates(t *testing.T) {
 	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
 	sipRuntime := newFakeSIP()
-	coordinator := newTestCoordinator(t, api, sipRuntime)
+	coordinator, _, _, database := newTestCoordinatorWithStore(t, api, sipRuntime)
 	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
 		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
 		SupportedProtocolVersions: []int{1},
@@ -755,6 +843,21 @@ func TestCoordinatorUsesCanonicalAuthorizedDestinationAndDeduplicates(t *testing
 	result, err := coordinator.Handle(context.Background(), claims, envelope)
 	if err != nil || len(result) != 1 || result[0].Type != "command_result" {
 		t.Fatalf("unexpected call result: %+v %v", result, err)
+	}
+	events, err := database.PendingEvents(context.Background(), claims.SessionID, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 || events[0].Type != "registration.state_changed" ||
+		events[1].Type != "call.created" || events[2].Type != "call.state_changed" {
+		t.Fatalf("unexpected durable event order: %+v", events)
+	}
+	var dialing call.Snapshot
+	if err := json.Unmarshal(events[2].Payload, &dialing); err != nil {
+		t.Fatal(err)
+	}
+	if dialing.State != call.StateDialing {
+		t.Fatalf("durable state=%q, want %q", dialing.State, call.StateDialing)
 	}
 	sipRuntime.mu.Lock()
 	if sipRuntime.destination != api.destination || sipRuntime.starts != 1 {

@@ -478,15 +478,15 @@ function setCallState(callState, direction = '', endReason = '') {
     stopCallTone();
   } else {
     const suffix = direction ? ` · ${direction}` : '';
-    setPill('callStatus', `Call: ${callState}${suffix}`, ['connected', 'ringing'].includes(callState) ? 'good' : '');
-    if (callState === 'ringing') startCallTone(direction === 'inbound' ? 'ringtone' : 'ringback');
+    setPill('callStatus', `Call: ${callState}${suffix}`, ['connected', 'ringing', 'incoming'].includes(callState) ? 'good' : '');
+    if (callState === 'ringing' || callState === 'incoming') startCallTone(direction === 'inbound' ? 'ringtone' : 'ringback');
     else if (callState === 'connected' || callState === 'answering' || callState === 'idle') stopCallTone();
   }
   updateCallControls();
 }
 
 function updateCallControls() {
-  const inboundRinging = state.callDirection === 'inbound' && state.callState === 'ringing';
+  const inboundRinging = state.callDirection === 'inbound' && ['incoming', 'ringing'].includes(state.callState);
   const active = !['idle', 'ended'].includes(state.callState);
   $('answer').disabled = !inboundRinging;
   $('reject').disabled = !inboundRinging;
@@ -508,7 +508,7 @@ function startCallTone(kind) {
   const generation = state.toneGeneration;
   void primeCallAudio().then(() => {
     const context = state.toneContext;
-    if (!context || state.activeTone || generation !== state.toneGeneration || state.callState !== 'ringing') return;
+    if (!context || state.activeTone || generation !== state.toneGeneration || !['incoming', 'ringing'].includes(state.callState)) return;
     state.activeTone = kind;
     const gain = context.createGain();
     gain.gain.value = 0;
@@ -846,7 +846,7 @@ function bind() {
   });
   $('enableCallTones').addEventListener('change', () => {
     if (!$('enableCallTones').checked) stopCallTone();
-    else if (state.callState === 'ringing') startCallTone(state.callDirection === 'inbound' ? 'ringtone' : 'ringback');
+    else if (state.callState === 'ringing' || state.callState === 'incoming') startCallTone(state.callDirection === 'inbound' ? 'ringtone' : 'ringback');
   });
   $('mute').addEventListener('change', () => {
     state.localStream?.getAudioTracks().forEach((track) => { track.enabled = !$('mute').checked; });

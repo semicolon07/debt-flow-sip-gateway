@@ -79,6 +79,22 @@
   เพื่อไม่ขอ microphone/capability วนเมื่อ permission ถูกปฏิเสธหรือ revoke
 - legacy data ที่ไม่มี runtime/transport normalize เป็น `desktop_agent` + `udp`
 
+## Desktop Agent contract/lifecycle parity fix (2026-10-18)
+
+ตรวจเทียบกับ `sip-windows-agent` ที่ `CallLifecyclePlanner` และ `CallReducer` แล้ว Gateway ส่ง lifecycle
+เข้าสู่ `PhoneEventRelayService`/Web API ตามลำดับเดียวกัน:
+
+- outbound: `created → dialing → trying → ringing → connected → ending → ended` แล้วตามด้วย `call.ended`
+- inbound: `created → incoming → answering → connected → ending → ended` แล้วตามด้วย `call.ended`
+- terminal transition ส่ง durable event เป็นคู่ `call.state_changed(ended)` + `call.ended` เหมือน Desktop Agent
+- event sequence เพิ่มขึ้นทางเดียว, replay ใช้ business event ID เดิม และ cumulative ACK ยังห้ามข้ามช่องว่าง
+- Web App Gateway adapter preserve `trying`, `incoming` และ `ending` แทนการแปลงเป็น `null`
+- Web API ยอมรับ legacy forward-only `created → ringing/connected` เพื่อ drain outbox จาก Gateway รุ่นก่อนหน้า
+  โดยไม่ต้องลบ SQLite; Gateway รุ่นใหม่ไม่ใช้ทางลัดนี้แล้ว
+
+Regression tests ครอบคลุม outbound lifecycle ทั้งเส้น, inbound `incoming/answering`, terminal event pair,
+legacy API ingest และ Gateway-to-existing-durable-contract normalization
+
 ## Local verification
 
 - `go test -race ./...` ผ่านทุก package รวม deployment-script ordering/least-privilege/alert-threshold contract tests
@@ -108,9 +124,9 @@
   ที่พบใน API test graph ถูก pin เป็น `2.1.13` แล้ว พร้อมรัน API 870 tests และ rescan ยืนยันว่า advisory หาย
 - benchmark harness ครอบคลุม capability/JSON/RTP 200 streams/runtime snapshot 250 sessions+200 calls/SQLite;
   live Windows sampler เก็บ normalized CPU, working/private memory, Go heap, sockets และ Gateway high-water marks
-- Web API: Application 2,089 + API 870 + Infrastructure 2,563 tests ผ่าน; SQL Server-dependent 93 tests skip
+- Web API Infrastructure 2,573 tests ผ่าน (90 tests skip ตาม environment) รวม legacy Gateway ingest regression
 - Web API `dotnet format --verify-no-changes --no-restore` ผ่าน
-- Web App: 570 test files / 4,037 tests, strict app/spec, worker types, production build/graph/budget ผ่าน;
+- Web App: 570 test files / 4,050 tests, strict app/spec, worker types, production build/graph/budget ผ่าน;
   microphone/speaker test paths ปิด media tracks และ `AudioContext` ผ่าน `finally` แม้ browser API ล้มกลางทาง
 - diagnostics allowlist report ผ่าน automated secret-leak test และ manual pattern scan
 - local browser POC ที่ `test/poc/sip-gateway-poc.html` ครอบคลุม API-assisted/manual capability,

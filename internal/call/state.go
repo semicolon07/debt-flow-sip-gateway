@@ -20,9 +20,12 @@ const (
 	StateCreated     State = "created"
 	StateAuthorizing State = "authorizing"
 	StateDialing     State = "dialing"
+	StateTrying      State = "trying"
 	StateRinging     State = "ringing"
+	StateIncoming    State = "incoming"
 	StateAnswering   State = "answering"
 	StateConnected   State = "connected"
+	StateEnding      State = "ending"
 	StateEnded       State = "ended"
 )
 
@@ -86,7 +89,7 @@ func NewInbound(callID string, now time.Time) (*Machine, error) {
 		return nil, errors.New("callID is required")
 	}
 	return &Machine{snapshot: Snapshot{
-		CallID: callID, Direction: Inbound, State: StateRinging,
+		CallID: callID, Direction: Inbound, State: StateCreated,
 		CreatedAt: now.UTC(), Revision: 1,
 	}}, nil
 }
@@ -106,8 +109,8 @@ func ValidateSnapshot(snapshot Snapshot) error {
 		return errors.New("invalid call direction")
 	}
 	switch snapshot.State {
-	case StateCreated, StateAuthorizing, StateDialing, StateRinging, StateAnswering,
-		StateConnected, StateEnded:
+	case StateCreated, StateAuthorizing, StateDialing, StateTrying, StateRinging, StateIncoming, StateAnswering,
+		StateConnected, StateEnding, StateEnded:
 	default:
 		return errors.New("invalid call state")
 	}
@@ -166,7 +169,8 @@ func (m *Machine) AuthorizationSucceeded() (Action, error) {
 func (m *Machine) MarkRinging() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.snapshot.Direction != Outbound || (m.snapshot.State != StateDialing && m.snapshot.State != StateRinging) {
+	if m.snapshot.Direction != Outbound ||
+		(m.snapshot.State != StateDialing && m.snapshot.State != StateTrying && m.snapshot.State != StateRinging) {
 		return fmt.Errorf("cannot mark %s call ringing from %s", m.snapshot.Direction, m.snapshot.State)
 	}
 	if m.snapshot.State != StateRinging {
@@ -175,10 +179,33 @@ func (m *Machine) MarkRinging() error {
 	return nil
 }
 
+func (m *Machine) MarkTrying() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.snapshot.Direction != Outbound ||
+		(m.snapshot.State != StateDialing && m.snapshot.State != StateTrying) {
+		return fmt.Errorf("cannot mark %s call trying from %s", m.snapshot.Direction, m.snapshot.State)
+	}
+	if m.snapshot.State != StateTrying {
+		m.setState(StateTrying)
+	}
+	return nil
+}
+
+func (m *Machine) MarkIncoming() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.snapshot.Direction != Inbound || m.snapshot.State != StateCreated {
+		return fmt.Errorf("cannot mark %s call incoming from %s", m.snapshot.Direction, m.snapshot.State)
+	}
+	m.setState(StateIncoming)
+	return nil
+}
+
 func (m *Machine) AnswerInbound() (Action, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.snapshot.Direction != Inbound || m.snapshot.State != StateRinging {
+	if m.snapshot.Direction != Inbound || m.snapshot.State != StateIncoming {
 		return ActionNone, fmt.Errorf("cannot answer %s call from %s", m.snapshot.Direction, m.snapshot.State)
 	}
 	m.setState(StateAnswering)
@@ -188,7 +215,7 @@ func (m *Machine) AnswerInbound() (Action, error) {
 func (m *Machine) RejectInbound(now time.Time) (Action, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.snapshot.Direction != Inbound || m.snapshot.State != StateRinging {
+	if m.snapshot.Direction != Inbound || m.snapshot.State != StateIncoming {
 		return ActionNone, false
 	}
 	m.end(EndRejected, now)
@@ -198,13 +225,53 @@ func (m *Machine) RejectInbound(now time.Time) (Action, bool) {
 func (m *Machine) Connected(now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.snapshot.State != StateDialing && m.snapshot.State != StateRinging && m.snapshot.State != StateAnswering {
+	if m.snapshot.State != StateDialing && m.snapshot.State != StateTrying &&
+		m.snapshot.State != StateRinging && m.snapshot.State != StateIncoming && m.snapshot.State != StateAnswering {
 		return fmt.Errorf("cannot connect call from %s", m.snapshot.State)
 	}
 	connected := now.UTC()
 	m.snapshot.ConnectedAt = &connected
 	m.setState(StateConnected)
 	return nil
+}
+
+// BeginEnding records the durable, non-terminal transition that must precede a
+// user-initiated SIP teardown. CompleteEnding terminalizes the call after the
+// SIP side effect has been attempted.
+func (m *Machine) BeginEnding() (Action, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.snapshot.State == StateEnding || m.snapshot.State == StateEnded {
+		return ActionNone, false
+	}
+	action := ActionCancel
+	if m.snapshot.Direction == Inbound && m.snapshot.State == StateIncoming {
+		action = ActionReject
+	} else if m.snapshot.State == StateConnected {
+		action = ActionBYE
+	}
+	m.setState(StateEnding)
+	return action, true
+}
+
+func (m *Machine) BeginRejectInbound() (Action, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.snapshot.Direction != Inbound || m.snapshot.State != StateIncoming {
+		return ActionNone, false
+	}
+	m.setState(StateEnding)
+	return ActionReject, true
+}
+
+func (m *Machine) CompleteEnding(reason EndReason, now time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.snapshot.State != StateEnding {
+		return false
+	}
+	m.end(reason, now)
+	return true
 }
 
 func (m *Machine) LocalHangup(now time.Time) (Action, bool) {
@@ -214,7 +281,7 @@ func (m *Machine) LocalHangup(now time.Time) (Action, bool) {
 		return ActionNone, false
 	}
 	action := ActionCancel
-	if m.snapshot.Direction == Inbound && m.snapshot.State == StateRinging {
+	if m.snapshot.Direction == Inbound && m.snapshot.State == StateIncoming {
 		action = ActionReject
 	} else if m.snapshot.State == StateConnected {
 		action = ActionBYE
