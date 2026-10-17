@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<scenario name="REGISTER expires zero">
+  <recv request="REGISTER" crlf="true">
+    <action>
+      <ereg regexp="(^|[;[:space:]])0([;[:space:]]|$)" search_in="hdr" header="Expires:" check_it="true" />
+    </action>
+  </recv>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=sipp-unregister
+[last_Call-ID:]
+[last_CSeq:]
+[last_Contact:]
+Expires: 0
+Content-Length: 0
+
+]]></send>
+</scenario>

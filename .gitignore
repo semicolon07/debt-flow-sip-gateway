@@ -1,0 +1,10 @@
+/bin/
+/dist/
+/coverage/
+*.exe
+*.db
+*.db-shm
+*.db-wal
+*.log
+config.local.yaml
+

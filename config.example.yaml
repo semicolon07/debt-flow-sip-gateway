@@ -1,0 +1,72 @@
+nodeId: "sip-gateway-01"
+
+http:
+  listen: "127.0.0.1:8080"
+  metricsListen: "127.0.0.1:9090"
+  allowedOrigin: "https://debt-flow.uniga.app"
+  # Development POC only. Production preflight rejects true.
+  allowInsecureLoopbackOrigin: false
+  authTimeout: 5s
+  heartbeat: 15s
+  idleTimeout: 45s
+
+logging:
+  path: "C:\\ProgramData\\DebtFlow\\SipGateway\\logs\\gateway.jsonl"
+  maxBytes: 10485760
+  maxBackups: 5
+
+capability:
+  issuer: "debt-flow-web-api"
+  audience: "debt-flow-sip-gateway"
+  protectedKeys:
+    cap-2026-10: "C:\\ProgramData\\DebtFlow\\SipGateway\\keys\\cap-2026-10.dpapi"
+  plaintextKeys: {}
+  allowPlaintextKeys: false
+
+storage:
+  path: "C:\\ProgramData\\DebtFlow\\SipGateway\\data\\gateway.db"
+  maxBytes: 1073741824
+  retentionDays: 30
+  maxPendingGlobal: 100000
+  maxPendingSession: 10000
+
+ice:
+  udpMuxListen: "0.0.0.0:22000"
+  advertisedIp: "10.0.0.10"
+
+turn:
+  enabled: true
+  listenUdp: "0.0.0.0:3478"
+  listenTcp: "0.0.0.0:3478"
+  realm: "sip-gateway.uniga.app"
+  advertisedIp: "10.0.0.10"
+  relayMinPort: 30000
+  relayMaxPort: 30999
+  credentialTtl: 2m
+  maxAllocations: 250
+  # Per authenticated session, upload + download combined (2 Mbit/s).
+  bytesPerSecond: 262144
+
+sip:
+  # Change only after the external SIPp + Issabel/Asterisk gate passes.
+  spikeApproved: false
+  listenUdp: "0.0.0.0:5060"
+  listenTcp: "0.0.0.0:5060"
+  rtpAdvertisedIp: "10.0.0.10"
+  rtpMinPort: 20000
+  rtpMaxPort: 21999
+
+limits:
+  maxMessageBytes: 65536
+  messagesPerWindow: 60
+  messageWindow: 10s
+  writerQueue: 256
+  maxSessions: 250
+  maxCalls: 200
+
+lease:
+  renewEvery: 45s
+  expiresAfter: 120s
+  reconnectGrace: 60s
+
+shutdownGrace: 15s

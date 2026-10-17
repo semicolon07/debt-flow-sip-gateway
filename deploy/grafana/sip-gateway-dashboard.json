@@ -1,0 +1,81 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Connected sessions",
+      "targets": [{ "expr": "debt_flow_sip_gateway_connected_sessions", "refId": "A" }],
+      "gridPos": { "h": 6, "w": 4, "x": 0, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "PeerConnections",
+      "targets": [{ "expr": "debt_flow_sip_gateway_peer_connections", "refId": "A" }],
+      "gridPos": { "h": 6, "w": 4, "x": 4, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "TURN quota",
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1 } },
+      "targets": [{ "expr": "debt_flow_sip_gateway_turn_allocation_quota_ratio", "refId": "A" }],
+      "gridPos": { "h": 6, "w": 4, "x": 8, "y": 0 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Calls by state and direction",
+      "targets": [{ "expr": "debt_flow_sip_gateway_calls", "legendFormat": "{{direction}} {{state}}", "refId": "A" }],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Call setup p95",
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [{
+        "expr": "histogram_quantile(0.95, sum by (le, direction) (rate(debt_flow_sip_gateway_call_setup_seconds_bucket[5m])))",
+        "legendFormat": "{{direction}}",
+        "refId": "A"
+      }],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }
+    },
+    {
+      "type": "timeseries",
+      "title": "ICE route",
+      "targets": [{ "expr": "debt_flow_sip_gateway_ice_routes", "legendFormat": "{{route}}", "refId": "A" }],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 }
+    },
+    {
+      "type": "timeseries",
+      "title": "RTP packets and errors",
+      "targets": [
+        { "expr": "rate(debt_flow_sip_gateway_rtp_packets_total[1m])", "legendFormat": "packets {{direction}}", "refId": "A" },
+        { "expr": "rate(debt_flow_sip_gateway_rtp_bridge_errors_total[1m])", "legendFormat": "errors {{direction}}", "refId": "B" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox and WSS queue",
+      "targets": [
+        { "expr": "debt_flow_sip_gateway_outbox_pending_events", "legendFormat": "outbox", "refId": "A" },
+        { "expr": "debt_flow_sip_gateway_wss_writer_queue_depth", "legendFormat": "WSS queue", "refId": "B" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 }
+    },
+    {
+      "type": "stat",
+      "title": "Outbox capacity pressure",
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1 } },
+      "targets": [{ "expr": "debt_flow_sip_gateway_outbox_capacity_ratio", "refId": "A" }],
+      "gridPos": { "h": 6, "w": 4, "x": 0, "y": 24 }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["debt-flow", "sip-gateway"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "title": "Debt Flow SIP Gateway",
+  "uid": "debt-flow-sip-gateway",
+  "version": 1
+}

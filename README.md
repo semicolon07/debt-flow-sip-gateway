@@ -1,0 +1,73 @@
+# Debt Flow SIP Gateway
+
+SIP Gateway สำหรับให้ Debt Flow Portal โทรผ่าน browser ด้วย WebRTC โดยไม่ต้องติดตั้ง
+Debt Flow SIP Windows Agent ที่เครื่องผู้ใช้
+
+สถานะปัจจุบัน: **P1 implementation baseline complete; external interoperability/pilot gates pending**
+
+เอกสารหลัก:
+
+- [P1 implementation plan](docs/2026-10-17-p1-implementation-plan.md)
+- [P1 implementation result](docs/2026-10-17-p1-implementation-result.md)
+- [Windows deployment](docs/windows-deployment.md)
+- [Incident runbook](docs/incident-runbook.md)
+- [Pilot acceptance matrix](docs/pilot-acceptance-matrix.md)
+- [Performance and capacity testing](docs/performance-testing.md)
+- [Local browser POC](test/poc/README.md)
+
+P1 baseline ที่ยืนยันแล้ว:
+
+- Go และ Windows Server 2022 แบบ single-node Windows Service
+- IIS รับ `wss://sip-gateway.uniga.app/gateway/v1` และ reverse proxy ไปยัง gateway
+- Pion WebRTC v4 และ Pion TURN v5 แบบฝังใน executable เดียว
+- Issabel/Asterisk ผ่าน SIP UDP/TCP รองรับทั้ง inbound และ outbound
+- PCMU/PCMA passthrough และ RFC 4733 DTMF โดยไม่มี transcoding
+- SQLite WAL และ Windows DPAPI สำหรับ state/key material ที่ต้องคงอยู่
+- เป้าหมาย 250 registered sessions และ 200 concurrent calls บน private/VPN network
+
+P1 ยังเก็บ `sip-windows-agent` เดิมไว้เป็น rollback path ผ่านการตั้งค่า `runtimeMode`
+ระดับ Collection และไม่มี automatic fallback ระหว่าง runtime
+
+## การเชื่อมต่อ
+
+```text
+Browser ──HTTPS──> Web API       (authorize และออก encrypted capability)
+Browser ───WSS───> SIP Gateway   (relay capability + call control)
+Browser <─WebRTC─> SIP Gateway <─SIP/RTP─> Issabel/Asterisk
+```
+
+ไม่มี connection จาก SIP Gateway ไป Web API ทั้งใน configuration และ implementation; browser เป็นผู้
+relay capability และ call event เหมือน boundary ของ Desktop Agent เดิม
+
+## Resource profile
+
+ภาระหลักขึ้นกับ concurrent calls: ICE/DTLS/SRTP และ TURN relay ใช้ CPU มากที่สุด ส่วน
+PeerConnection/RTP buffers และ unacknowledged outbox ใช้ memory หลัก P1 ใช้ PCMU/PCMA passthrough
+โดยไม่ transcode เพื่อลด CPU ค่า production target คือ 250 sessions / 200 concurrent calls;
+ตัวเลขนี้เป็น hard-limit และ load-test target ไม่ใช่ sizing guarantee จนกว่าจะผ่าน soak บน Windows Server จริง;
+ต้อง benchmark บน Windows Server จริงก่อนกำหนด production capacity
+
+## สิ่งที่ implement แล้ว
+
+- Windows Service executable, strict YAML configuration, IIS reverse-proxy template, Authenticode-ready
+  PowerShell packaging, CycloneDX SBOM และ sanitized diagnostics bundle
+- exact-Origin WSS protocol V1, one-time authentication, lease/reconnect, takeover protection และ bounded queues
+- SQLite WAL command journal, per-agent monotonic event sequence, durable session outbox, ACK/replay และ
+  deterministic restart terminalization
+- bounded rotating JSON operational logs, Prometheus dashboard/alerts และ allowlisted diagnostics
+- Pion WebRTC/ICE, embedded TURN UDP/TCP, G.711 RTP mapping, RFC 4733 DTMF และ browser audio controls
+- SIPGo REGISTER/INVITE lifecycle หลัง `sip.spikeApproved` gate พร้อม inbound/outbound call state
+- local AES-256-GCM session/call capability verification โดย Gateway ไม่เชื่อม Web API
+- browser-relayed capability contracts และ Collection `runtimeMode`
+- Portal `SipGatewayAdapter` สำหรับ WSS/WebRTC โดย legacy `desktop_agent` ยังเป็นค่าเริ่มต้น
+
+## Gate ที่ยังต้องผ่านก่อน pilot
+
+- SIPp และ Issabel/Asterisk จริงทั้ง UDP/TCP, PCMU/PCMA, late-200/CANCEL และ retransmission matrix
+- Windows Server 2022 + IIS + CNG/DPAPI clean-VM validation
+- DPAPI capability-key provisioning/rotation บน Windows และ secret-manager rotation ฝั่ง Web API
+- RTCP interoperability, Edge/Chrome device matrix, 250-session/200-call load test และ 2-hour soak
+- production certificate signing, SBOM/license/security review และ operational approval
+
+Gateway จะตอบ readiness เป็น `503` เมื่อ `sip.spikeApproved: false` เพื่อป้องกันการเปิดใช้ก่อนผ่าน
+interoperability gate และไม่มีการสลับกลับไป Desktop Agent อัตโนมัติ

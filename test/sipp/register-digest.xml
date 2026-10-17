@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<scenario name="REGISTER digest challenge and unregister">
+  <recv request="REGISTER" crlf="true" />
+  <send><![CDATA[
+SIP/2.0 401 Unauthorized
+[last_Via:]
+[last_From:]
+[last_To:];tag=sipp-register
+[last_Call-ID:]
+[last_CSeq:]
+WWW-Authenticate: Digest realm="debt-flow-sipp", nonce="0123456789abcdef", algorithm=MD5, qop="auth"
+Content-Length: 0
+
+]]></send>
+  <recv request="REGISTER" crlf="true">
+    <action>
+      <ereg regexp="Digest .+" search_in="hdr" header="Authorization:" check_it="true" />
+    </action>
+  </recv>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=sipp-register
+[last_Call-ID:]
+[last_CSeq:]
+[last_Contact:]
+Expires: 120
+Content-Length: 0
+
+]]></send>
+  <ResponseTimeRepartition value="10,20,30,50,100,150,500,1000" />
+</scenario>

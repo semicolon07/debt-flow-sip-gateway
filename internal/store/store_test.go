@@ -1,0 +1,411 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/debt-flow/sip-gateway/internal/call"
+)
+
+func openTestStore(t *testing.T, perSession, global int) *Store {
+	t.Helper()
+	store, err := Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"), Limits{
+		PerSession: perSession, Global: global, MaxBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+func TestCommandDeduplicationAndConflict(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, 10, 100)
+	now := time.Now().UTC()
+	first, err := store.BeginCommand(ctx, "command-1", []byte(`{"value":1}`), now)
+	if err != nil || first.Duplicate || first.Conflict {
+		t.Fatalf("unexpected first result: %+v %v", first, err)
+	}
+	duplicate, err := store.BeginCommand(ctx, "command-1", []byte(`{"value":1}`), now)
+	if err != nil || !duplicate.Duplicate || duplicate.Conflict {
+		t.Fatalf("unexpected duplicate: %+v %v", duplicate, err)
+	}
+	conflict, err := store.BeginCommand(ctx, "command-1", []byte(`{"value":2}`), now)
+	if err != nil || !conflict.Duplicate || !conflict.Conflict {
+		t.Fatalf("unexpected conflict: %+v %v", conflict, err)
+	}
+	if err := store.FinishCommand(ctx, "command-1", CommandCompleted, []byte(`{"ok":true}`), "", now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInterruptedCommandRecoveryIsTerminalAndIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, 10, 100)
+	now := time.Now().UTC()
+	if _, err := store.BeginCommand(ctx, "command-1", []byte(`{"value":1}`), now); err != nil {
+		t.Fatal(err)
+	}
+	count, err := store.RecoverInterruptedCommands(ctx, now.Add(time.Second))
+	if err != nil || count != 1 {
+		t.Fatalf("first command recovery: count=%d err=%v", count, err)
+	}
+	record, err := store.Command(ctx, "command-1")
+	if err != nil || record.Status != CommandFailed || record.ErrorCode != "gateway_restarted" {
+		t.Fatalf("unexpected recovered command: %+v err=%v", record, err)
+	}
+	count, err = store.RecoverInterruptedCommands(ctx, now.Add(2*time.Second))
+	if err != nil || count != 0 {
+		t.Fatalf("second command recovery: count=%d err=%v", count, err)
+	}
+}
+
+func TestOutboxSequenceAckAndLimit(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, 2, 3)
+	now := time.Now().UTC()
+	for i := 0; i < 2; i++ {
+		event, err := store.AppendEvent(ctx, "session-1", "agent-1", "", "call.state_changed", []byte(`{}`), now)
+		if err != nil || event.Sequence != uint64(i+1) {
+			t.Fatalf("append %d: %+v %v", i, event, err)
+		}
+	}
+	if _, err := store.AppendEvent(ctx, "session-1", "agent-1", "", "call.ended", []byte(`{}`), now); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("expected capacity error, got %v", err)
+	}
+	if err := store.Acknowledge(ctx, "session-1", 1, now); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.PendingEvents(ctx, "session-1", 0, 10)
+	if err != nil || len(events) != 1 || events[0].Sequence != 2 {
+		t.Fatalf("unexpected pending events: %+v %v", events, err)
+	}
+}
+
+func TestOutboxSequenceDoesNotResetAfterAcknowledgedRowsArePurged(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, 10, 100)
+	now := time.Now().UTC()
+	first, err := store.AppendEvent(
+		ctx, "session-1", "agent-1", "first", "call.state_changed", []byte(`{}`), now.Add(-2*time.Hour),
+	)
+	if err != nil || first.Sequence != 1 {
+		t.Fatalf("first append: event=%+v err=%v", first, err)
+	}
+	if err := store.Acknowledge(ctx, "session-1", first.Sequence, now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := store.Maintain(ctx, now.Add(-time.Hour), now); err != nil || result.PurgedRows == 0 {
+		t.Fatalf("purge acknowledged event: result=%+v err=%v", result, err)
+	}
+	var rows int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM outbox WHERE session_id=?`, "session-1").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("purged outbox still has %d rows", rows)
+	}
+	second, err := store.AppendEvent(ctx, "session-1", "agent-1", "second", "call.state_changed", []byte(`{}`), now)
+	if err != nil || second.Sequence != 2 {
+		t.Fatalf("sequence reset after purge: event=%+v err=%v", second, err)
+	}
+}
+
+func TestOutboxSequenceIsMonotonicAcrossSessionsForTheSameAgent(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, 10, 100)
+	now := time.Now().UTC()
+	first, err := store.AppendEvent(ctx, "session-1", "agent-1", "first", "call.state_changed", []byte(`{}`), now)
+	if err != nil || first.Sequence != 1 {
+		t.Fatalf("first append: event=%+v err=%v", first, err)
+	}
+	second, err := store.AppendEvent(ctx, "session-2", "agent-1", "second", "call.state_changed", []byte(`{}`), now)
+	if err != nil || second.Sequence != 2 {
+		t.Fatalf("second session reused agent sequence: event=%+v err=%v", second, err)
+	}
+	otherAgent, err := store.AppendEvent(ctx, "session-3", "agent-2", "third", "call.state_changed", []byte(`{}`), now)
+	if err != nil || otherAgent.Sequence != 1 {
+		t.Fatalf("independent agent sequence: event=%+v err=%v", otherAgent, err)
+	}
+}
+
+func TestAgentSequenceCursorCanBeRebuiltFromTheOutbox(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	store, err := Open(ctx, path, Limits{PerSession: 10, Global: 100, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := store.AppendEvent(ctx, "session-1", "agent-1", "first", "call.state_changed", []byte(`{}`), now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM agent_sequences WHERE agent_instance_id='agent-1'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(ctx, path, Limits{PerSession: 10, Global: 100, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	second, err := store.AppendEvent(ctx, "session-2", "agent-1", "second", "call.state_changed", []byte(`{}`), now)
+	if err != nil || second.Sequence != 2 {
+		t.Fatalf("rebuilt cursor: event=%+v err=%v", second, err)
+	}
+}
+
+func TestMigrationBackfillsSequenceCursorFromAVersionOneOutbox(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	database, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = database.ExecContext(ctx, `
+CREATE TABLE schema_info (version INTEGER NOT NULL);
+INSERT INTO schema_info(version) VALUES(1);
+CREATE TABLE outbox (
+    session_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    event_key TEXT,
+    event_type TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    created_at_utc TEXT NOT NULL,
+    acked_at_utc TEXT,
+    PRIMARY KEY(session_id, sequence),
+    UNIQUE(event_key)
+);
+INSERT INTO outbox(session_id, sequence, event_key, event_type, payload, created_at_utc)
+VALUES('session-1', 7, 'legacy-event', 'call.state_changed', X'7B7D', '2026-10-17T00:00:00Z');`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(ctx, path, Limits{PerSession: 10, Global: 100, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	event, err := store.AppendEvent(ctx, "session-1", "session-1", "new-event", "call.state_changed", []byte(`{}`), time.Now())
+	if err != nil || event.Sequence != 8 {
+		t.Fatalf("migration did not preserve sequence: event=%+v err=%v", event, err)
+	}
+	var version int
+	if err := store.db.QueryRowContext(ctx, `SELECT version FROM schema_info LIMIT 1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 4 {
+		t.Fatalf("schema version=%d, want 4", version)
+	}
+}
+
+func TestMigrationAddsAgentScopeToVersionTwoCalls(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	database, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = database.ExecContext(ctx, `
+CREATE TABLE schema_info (version INTEGER NOT NULL);
+INSERT INTO schema_info(version) VALUES(2);
+CREATE TABLE calls (
+    call_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    snapshot_json BLOB NOT NULL,
+    active INTEGER NOT NULL,
+    restart_terminalized INTEGER NOT NULL DEFAULT 0,
+    updated_at_utc TEXT NOT NULL
+);
+INSERT INTO calls(call_id, session_id, snapshot_json, active, updated_at_utc)
+VALUES('call-legacy', 'session-legacy', X'7B7D', 0, '2026-10-17T00:00:00Z');`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(ctx, path, Limits{PerSession: 10, Global: 100, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var agentInstanceID string
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT agent_instance_id FROM calls WHERE call_id='call-legacy'`).Scan(&agentInstanceID); err != nil {
+		t.Fatal(err)
+	}
+	if agentInstanceID != "session-legacy" {
+		t.Fatalf("legacy agent scope=%q, want session fallback", agentInstanceID)
+	}
+	var version int
+	if err := store.db.QueryRowContext(ctx, `SELECT version FROM schema_info LIMIT 1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 4 {
+		t.Fatalf("schema version=%d, want 4", version)
+	}
+}
+
+func TestRestartTerminalEventIsCreatedOnce(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, 10, 100)
+	now := time.Now().UTC()
+	machine, _ := call.NewInbound("call-1", now)
+	if err := store.SaveCall(ctx, "session-1", "agent-1", machine.Snapshot(), now); err != nil {
+		t.Fatal(err)
+	}
+	count, err := store.RecoverRestartedCalls(ctx, now.Add(time.Second))
+	if err != nil || count != 1 {
+		t.Fatalf("first recovery: count=%d err=%v", count, err)
+	}
+	count, err = store.RecoverRestartedCalls(ctx, now.Add(2*time.Second))
+	if err != nil || count != 0 {
+		t.Fatalf("second recovery: count=%d err=%v", count, err)
+	}
+	events, err := store.PendingEvents(ctx, "session-1", 0, 10)
+	if err != nil || len(events) != 1 || events[0].Type != "call.ended" {
+		t.Fatalf("unexpected restart events: %+v %v", events, err)
+	}
+}
+
+func TestRestartTerminalEventContinuesThePersistedAgentSequence(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, 10, 100)
+	now := time.Now().UTC()
+	if _, err := store.AppendEvent(ctx, "session-before", "agent-1", "before", "call.state_changed", []byte(`{}`), now); err != nil {
+		t.Fatal(err)
+	}
+	machine, _ := call.NewInbound("call-2", now)
+	if err := store.SaveCall(ctx, "session-active", "agent-1", machine.Snapshot(), now); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := store.RecoverRestartedCalls(ctx, now.Add(time.Second)); err != nil || count != 1 {
+		t.Fatalf("recovery: count=%d err=%v", count, err)
+	}
+	events, err := store.PendingEvents(ctx, "session-active", 0, 10)
+	if err != nil || len(events) != 1 || events[0].Sequence != 2 {
+		t.Fatalf("restart event did not continue agent sequence: events=%+v err=%v", events, err)
+	}
+}
+
+func TestStoredCallRecoveryRejectsIdentityMismatch(t *testing.T) {
+	now := time.Now().UTC()
+	machine, _ := call.NewInbound("call-other", now)
+	raw, err := json.Marshal(machine.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restoreStoredCall(raw, "call-expected"); err == nil {
+		t.Fatal("expected stored call identity mismatch")
+	}
+}
+
+func TestCapabilityCanOnlyBeConsumedOnce(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, 10, 100)
+	now := time.Now().UTC()
+	consumed, err := store.ConsumeCapability(ctx, "capability-1", now.Add(time.Minute), now)
+	if err != nil || !consumed {
+		t.Fatalf("first consume: consumed=%v err=%v", consumed, err)
+	}
+	consumed, err = store.ConsumeCapability(ctx, "capability-1", now.Add(time.Minute), now)
+	if err != nil || consumed {
+		t.Fatalf("replay consume: consumed=%v err=%v", consumed, err)
+	}
+}
+
+func TestTerminalEventUsesReservedOutboxCapacity(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, 10, 10)
+	now := time.Now().UTC()
+	for index := 0; index < 9; index++ {
+		if _, err := store.AppendEvent(ctx, "session-1", "agent-1", "", "call.state_changed", []byte(`{}`), now); err != nil {
+			t.Fatalf("append event %d: %v", index, err)
+		}
+	}
+	if allowed, err := store.CanStartCall(ctx, "session-1"); err != nil || allowed {
+		t.Fatalf("expected new calls to be blocked at reserve threshold: allowed=%v err=%v", allowed, err)
+	}
+	if _, err := store.AppendEvent(ctx, "session-1", "agent-1", "", "call.state_changed", []byte(`{}`), now); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("expected non-terminal event to preserve reserve, got %v", err)
+	}
+	if _, err := store.AppendEvent(ctx, "session-1", "agent-1", "terminal", "call.ended", []byte(`{}`), now); err != nil {
+		t.Fatalf("terminal event did not use reserve: %v", err)
+	}
+}
+
+func TestByteReserveThresholdRoundsUpToNinetyPercent(t *testing.T) {
+	for _, test := range []struct {
+		value int64
+		limit int64
+		want  bool
+	}{
+		{value: 17, limit: 19, want: false},
+		{value: 18, limit: 19, want: true},
+		{value: 8, limit: 9, want: false},
+		{value: 9, limit: 9, want: true},
+	} {
+		if got := atOrAboveReserve64(test.value, test.limit); got != test.want {
+			t.Errorf("atOrAboveReserve64(%d, %d)=%v, want %v", test.value, test.limit, got, test.want)
+		}
+	}
+}
+
+func TestStatsTrackHighestPerSessionOutboxPressure(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, 10, 100)
+	now := time.Now().UTC()
+	for _, sessionID := range []string{"session-1", "session-1", "session-1", "session-2", "session-2"} {
+		if _, err := store.AppendEvent(ctx, sessionID, "agent-1", "", "call.state_changed", []byte(`{}`), now); err != nil {
+			t.Fatalf("append event for %s: %v", sessionID, err)
+		}
+	}
+	stats, err := store.Stats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.PendingEvents != 5 || stats.MaxSessionPendingEvents != 3 {
+		t.Fatalf("unexpected outbox stats: %+v", stats)
+	}
+}
+
+func TestIntegrityStatsAndMaintenance(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, 10, 100)
+	now := time.Now().UTC()
+	if err := store.CheckIntegrity(ctx); err != nil {
+		t.Fatal(err)
+	}
+	event, err := store.AppendEvent(ctx, "session-1", "agent-1", "", "call.state_changed", []byte(`{}`), now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Acknowledge(ctx, "session-1", event.Sequence, now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if consumed, err := store.ConsumeCapability(ctx, "expired-capability", now.Add(time.Minute), now); err != nil || !consumed {
+		t.Fatalf("consume capability: consumed=%v err=%v", consumed, err)
+	}
+	stats, err := store.Stats(ctx)
+	if err != nil || stats.PendingEvents != 0 || stats.DatabaseBytes <= 0 {
+		t.Fatalf("unexpected store stats: %+v err=%v", stats, err)
+	}
+	result, err := store.Maintain(ctx, now, now.Add(2*time.Minute))
+	if err != nil || result.PurgedRows < 2 {
+		t.Fatalf("unexpected maintenance result: %+v err=%v", result, err)
+	}
+}

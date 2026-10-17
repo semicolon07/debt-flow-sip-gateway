@@ -1,0 +1,71 @@
+groups:
+  - name: debt-flow-sip-gateway
+    rules:
+      - alert: DebtFlowSipGatewayMetricsMissing
+        expr: absent(debt_flow_sip_gateway_sessions)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Debt Flow SIP Gateway metrics are unavailable
+          runbook: docs/incident-runbook.md#gateway-or-metrics-unavailable
+
+      - alert: DebtFlowSipGatewayOutboxHigh
+        expr: debt_flow_sip_gateway_outbox_capacity_ratio >= 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: SIP Gateway durable outbox or storage has reached 80 percent of a configured limit
+          runbook: docs/incident-runbook.md#event-outbox-backlog
+
+      - alert: DebtFlowSipGatewayOutboxCritical
+        expr: debt_flow_sip_gateway_outbox_capacity_ratio >= 0.9
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: SIP Gateway durable outbox or storage is blocking new calls
+          runbook: docs/incident-runbook.md#event-outbox-backlog
+
+      - alert: DebtFlowSipGatewayTURNQuotaHigh
+        expr: debt_flow_sip_gateway_turn_allocation_quota_ratio > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Embedded TURN allocation quota is above 80 percent
+          runbook: docs/incident-runbook.md#turn-pressure-or-denials
+
+      - alert: DebtFlowSipGatewayTURNBandwidthDrops
+        expr: increase(debt_flow_sip_gateway_turn_denials_total{reason="bandwidth_quota"}[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Embedded TURN dropped traffic at the configured bandwidth limit
+          runbook: docs/incident-runbook.md#turn-pressure-or-denials
+
+      - alert: DebtFlowSipGatewayRTPBridgeErrors
+        expr: increase(debt_flow_sip_gateway_rtp_bridge_errors_total[5m]) > 5
+        labels:
+          severity: warning
+        annotations:
+          summary: SIP Gateway media bridge errors increased
+          runbook: docs/incident-runbook.md#media-quality-or-bridge-errors
+
+      - alert: DebtFlowSipGatewaySQLiteCheckpointBusy
+        expr: debt_flow_sip_gateway_sqlite_checkpoint_busy == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: SIP Gateway SQLite checkpoint remains busy
+          runbook: docs/incident-runbook.md#sqlite-or-disk-pressure
+
+      - alert: DebtFlowSipGatewaySQLiteFailure
+        expr: increase(debt_flow_sip_gateway_sqlite_failures_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: SIP Gateway SQLite maintenance or statistics operation failed
+          runbook: docs/incident-runbook.md#sqlite-or-disk-pressure

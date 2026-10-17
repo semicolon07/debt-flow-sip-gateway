@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Debt Flow SIP Gateway POC</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; background: #0b1020; color: #e8edf7; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px; }
+    main { max-width: 1180px; margin: auto; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    h2 { margin: 0 0 16px; font-size: 18px; }
+    p { color: #aebbd0; line-height: 1.5; }
+    .warning { border: 1px solid #684e16; background: #2b230f; color: #f9d77e; padding: 12px; border-radius: 10px; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 16px; }
+    .card { border: 1px solid #24324c; border-radius: 14px; padding: 18px; background: #11192b; }
+    .wide { grid-column: 1 / -1; }
+    .fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .full { grid-column: 1 / -1; }
+    label { display: grid; gap: 6px; color: #cbd5e6; font-size: 13px; }
+    input, textarea, select, button { font: inherit; }
+    input, textarea, select { width: 100%; border: 1px solid #34435f; border-radius: 8px; padding: 9px 10px; color: #f4f7fb; background: #0b1220; }
+    textarea { min-height: 68px; resize: vertical; }
+    button { border: 1px solid #3a4b6a; border-radius: 8px; padding: 9px 13px; color: #edf4ff; background: #1c2a44; cursor: pointer; }
+    button:hover { background: #273957; }
+    button.primary { background: #185bd7; border-color: #2f73f0; }
+    button.danger { background: #7f2430; border-color: #a63846; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+    .status { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 0; }
+    .pill { border: 1px solid #34435f; border-radius: 999px; padding: 5px 9px; color: #b8c5d9; font-size: 12px; }
+    .pill.good { border-color: #267957; color: #75dfb1; }
+    .pill.bad { border-color: #9d3a49; color: #ff95a4; }
+    .check { display: flex; align-items: center; gap: 8px; }
+    .check input { width: auto; }
+    .dtmf { display: grid; grid-template-columns: repeat(4, 44px); gap: 7px; margin-top: 12px; }
+    .dtmf button { padding: 8px 0; }
+    audio { width: 100%; margin-top: 12px; }
+    pre { min-height: 240px; max-height: 520px; overflow: auto; white-space: pre-wrap; word-break: break-word; background: #080d17; border-radius: 9px; padding: 12px; color: #b9c9df; }
+    code { color: #90bcff; }
+    small { color: #8291a8; }
+    details { margin-top: 16px; border-top: 1px solid #24324c; padding-top: 14px; }
+    summary { cursor: pointer; color: #d7e5fa; margin-bottom: 12px; }
+    details .warning { margin-bottom: 12px; }
+    @media (max-width: 820px) { .grid, .fields { grid-template-columns: 1fr; } .wide, .full { grid-column: auto; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Debt Flow SIP Gateway POC</h1>
+  <p>ทดสอบ WSS protocol v1, WebRTC audio, SIP registration และ call control โดยไม่ผ่าน Angular UI</p>
+  <div class="warning">
+    ใช้กับ development environment เท่านั้น ข้อมูล capability และ bearer token อยู่ใน memory ของ tab นี้
+    และจะไม่ถูกเขียนลง browser storage หรือ event log
+  </div>
+
+  <div class="grid">
+    <section class="card wide">
+      <h2>1. Gateway session</h2>
+      <div class="fields">
+        <label>API base URL รวม <code>/v1</code>
+          <input id="apiBase" placeholder="https://localhost:5001/v1">
+        </label>
+        <label>Bearer token (ไม่บันทึก/ไม่ log)
+          <input id="bearerToken" type="password" autocomplete="off" placeholder="เว้นว่างเพื่อใช้ auth cookie">
+        </label>
+        <label>Collection ID
+          <input id="collectionId" autocomplete="off" placeholder="collection object id">
+        </label>
+        <label>Collection binding ID
+          <input id="collectionBindingId" autocomplete="off" placeholder="API จะกรอกให้อัตโนมัติ">
+        </label>
+        <label>Agent instance ID
+          <input id="agentInstanceId" autocomplete="off">
+        </label>
+        <label>Agent session / Gateway session ID
+          <input id="agentSessionId" autocomplete="off">
+        </label>
+        <label>Gateway WebSocket URL
+          <input id="gatewayUrl" value="ws://127.0.0.1:8080/gateway/v1" autocomplete="off">
+        </label>
+        <label>ICE policy
+          <select id="icePolicy"><option value="all">Direct + TURN</option><option value="relay">Force TURN relay</option></select>
+        </label>
+        <label class="full">Session capability (ค่าจะถูกล้างหลัง authenticate/renew)
+          <textarea id="sessionCapability" autocomplete="off" spellcheck="false"></textarea>
+        </label>
+      </div>
+      <div class="actions">
+        <button id="newIdentity">สร้าง identity ใหม่</button>
+        <button id="requestSession">ขอ capability จาก API</button>
+        <button id="connect" class="primary">Connect + WebRTC</button>
+        <button id="renew">Renew session</button>
+        <button id="disconnect" class="danger">Disconnect</button>
+      </div>
+      <div class="status">
+        <span id="wsStatus" class="pill">WSS: disconnected</span>
+        <span id="peerStatus" class="pill">WebRTC: idle</span>
+        <span id="registrationStatus" class="pill">SIP: unknown</span>
+        <span id="callStatus" class="pill">Call: idle</span>
+      </div>
+      <div class="actions">
+        <label class="check"><input id="autoRenew" type="checkbox" checked> renew capability ทุก 45 วินาที</label>
+        <label class="check"><input id="autoAck" type="checkbox" checked> ACK durable events อัตโนมัติ</label>
+      </div>
+      <details open>
+        <summary>Standalone POC: Browser → Gateway โดยไม่ใช้ Web API</summary>
+        <div class="warning">
+          Development เท่านั้น: browser จะสร้าง encrypted capability จาก key ด้านล่าง
+          โดย SIP password และ key อยู่เฉพาะใน memory ของ tab และไม่ถูก log
+        </div>
+        <div class="fields">
+          <label>PBX IP / Host
+            <input id="sipHost" autocomplete="off" placeholder="เช่น 10.0.0.20">
+          </label>
+          <label>Port
+            <input id="sipPort" type="number" min="1" max="65535" value="5060">
+          </label>
+          <label>Username / Extension
+            <input id="sipUsername" autocomplete="off" placeholder="เช่น 1001">
+          </label>
+          <label>Password
+            <input id="sipPassword" type="password" autocomplete="new-password">
+          </label>
+        </div>
+        <details>
+          <summary>Advanced: transport, realm และ capability key</summary>
+          <div class="fields">
+            <label>SIP transport
+              <select id="sipTransport"><option value="udp">UDP</option><option value="tcp">TCP</option></select>
+            </label>
+            <label>SIP realm (ปกติเว้นว่างได้)
+              <input id="sipRealm" autocomplete="off" placeholder="เช่น asterisk หรือ pbx.local">
+            </label>
+            <label>Gateway ID
+              <input id="standaloneGatewayId" value="sip-gateway-windows-poc" autocomplete="off">
+            </label>
+            <label>Capability key ID
+              <input id="standaloneKeyId" value="poc-2026-10" autocomplete="off">
+            </label>
+            <label class="full">POC capability key (ต้องตรงกับ config.windows-poc.yaml)
+              <input id="standaloneKey" type="password" autocomplete="off" value="8gJPq2L33fJ7P9UI5/8UHC+wRH0qy4u8qwAKXmGiBu4=">
+            </label>
+          </div>
+        </details>
+        <div class="actions">
+          <button id="generateSession">Configure SIP + สร้าง capability</button>
+        </div>
+      </details>
+    </section>
+
+    <section class="card">
+      <h2>2. Audio / WebRTC</h2>
+      <div class="fields">
+        <label class="full">Microphone
+          <select id="inputDevice"><option value="">Default microphone</option></select>
+        </label>
+        <label class="full">Speaker
+          <select id="outputDevice"><option value="">Default speaker</option></select>
+        </label>
+      </div>
+      <div class="actions">
+        <button id="refreshDevices">Refresh devices</button>
+        <button id="replaceMic">Switch microphone</button>
+        <label class="check"><input id="mute" type="checkbox"> Mute microphone</label>
+        <label class="check"><input id="useSilentAudio" type="checkbox"> No microphone / Silent audio</label>
+        <label class="check"><input id="enableCallTones" type="checkbox" checked> Local ringtone / ringback</label>
+      </div>
+      <p><small>Silent audio ใช้ทดสอบ REGISTER, call signaling และ media negotiation โดยไม่จับเสียงจากเครื่อง ส่วนเสียง ringtone/ringback สร้างใน browser และออกทาง default speaker</small></p>
+      <audio id="remoteAudio" autoplay controls></audio>
+      <p><small id="iceRoute">Selected ICE route: —</small></p>
+    </section>
+
+    <section class="card">
+      <h2>3. SIP registration</h2>
+      <div class="actions">
+        <button id="register" class="primary">REGISTER</button>
+        <button id="unregister">UNREGISTER</button>
+        <button id="getState">Refresh snapshot</button>
+      </div>
+      <p><small>โหมด API ใช้ SIP bootstrap ใน capability; โหมด Standalone ใช้ค่าที่กรอกในส่วน 1 เพื่อสร้าง capability ใน browser</small></p>
+    </section>
+
+    <section class="card wide">
+      <h2>4. Call control</h2>
+      <div class="fields">
+        <label>Destination
+          <input id="destination" autocomplete="off" placeholder="เช่น +6621234567">
+        </label>
+        <label>Call ID
+          <input id="callId" autocomplete="off">
+        </label>
+        <label>Call context ID
+          <input id="callContextId" autocomplete="off">
+        </label>
+        <label>Current inbound/outbound call
+          <input id="activeCallId" readonly>
+        </label>
+        <label>Inbound caller
+          <input id="remoteParty" readonly placeholder="จะแสดงเมื่อมีสายเข้า">
+        </label>
+        <label class="full">Gateway call capability (ล้างหลัง call.start)
+          <textarea id="callCapability" autocomplete="off" spellcheck="false"></textarea>
+        </label>
+      </div>
+      <div class="actions">
+        <button id="requestCall">ขอ call capability จาก API</button>
+        <button id="generateCall">สร้าง call capability แบบ Standalone (optional)</button>
+        <button id="startCall" class="primary">Start outbound call</button>
+        <button id="answer" disabled>Answer inbound</button>
+        <button id="reject" disabled>Reject inbound</button>
+        <button id="hangup" class="danger" disabled>Hangup</button>
+      </div>
+      <p><small>Inbound รองรับ: PBX ต้อง route extension มาที่ Contact ของ Gateway; เมื่อ INVITE เข้า POC จะแสดงหมายเลข, เล่น ringtone และเปิดปุ่ม Answer/Reject อัตโนมัติ</small></p>
+      <div class="dtmf" id="dtmfPad"></div>
+    </section>
+
+    <section class="card wide">
+      <h2>5. Sanitized event log</h2>
+      <div class="actions"><button id="clearLog">Clear log</button></div>
+      <pre id="log" aria-live="polite"></pre>
+    </section>
+  </div>
+</main>
+<script src="./sip-gateway-poc.js"></script>
+</body>
+</html>

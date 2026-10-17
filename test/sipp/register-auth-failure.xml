@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<scenario name="REGISTER digest credential rejected">
+  <recv request="REGISTER" crlf="true" />
+  <send><![CDATA[
+SIP/2.0 401 Unauthorized
+[last_Via:]
+[last_From:]
+[last_To:];tag=sipp-register-reject
+[last_Call-ID:]
+[last_CSeq:]
+WWW-Authenticate: Digest realm="debt-flow-sipp", nonce="fedcba9876543210", algorithm=MD5, qop="auth"
+Content-Length: 0
+
+]]></send>
+  <recv request="REGISTER" crlf="true">
+    <action>
+      <ereg regexp="Digest .+" search_in="hdr" header="Authorization:" check_it="true" />
+    </action>
+  </recv>
+  <send><![CDATA[
+SIP/2.0 403 Forbidden
+[last_Via:]
+[last_From:]
+[last_To:];tag=sipp-register-reject
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]></send>
+</scenario>
