@@ -30,6 +30,12 @@ func TestAsteriskSDPIsG711AndRFC4733Only(t *testing.T) {
 
 func TestAsteriskFailureNormalization(t *testing.T) {
 	profile := AsteriskProfile{}
+	if got := profile.NormalizeFailure(401); got != "authentication_failed" {
+		t.Fatalf("expected authentication failure, got %s", got)
+	}
+	if got := profile.NormalizeFailure(403); got != "forbidden" {
+		t.Fatalf("expected forbidden, got %s", got)
+	}
 	if got := profile.NormalizeFailure(486); got != "busy" {
 		t.Fatalf("expected busy, got %s", got)
 	}

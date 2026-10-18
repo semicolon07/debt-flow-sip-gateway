@@ -271,9 +271,20 @@ func (r *SIPGoRuntime) StartCall(ctx context.Context, sessionID, callID, destina
 		return err
 	}
 	setURITransport(&recipient, session.configuration.Transport)
+	fromParams := sipmessage.NewParams()
+	fromParams.Add("tag", sipmessage.GenerateTagN(16))
+	from := &sipmessage.FromHeader{
+		Address: sipmessage.Uri{
+			Scheme: "sip",
+			User:   session.configuration.Username,
+			Host:   session.configuration.Host,
+		},
+		Params: fromParams,
+	}
 	callCtx, cancel := context.WithCancelCause(context.Background())
 	dialog, err := session.clientDialogs.Invite(ctx, recipient, localSDP,
 		sipmessage.NewHeader("Content-Type", "application/sdp"),
+		from,
 	)
 	if err != nil {
 		cancel(err)

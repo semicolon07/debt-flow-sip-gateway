@@ -126,6 +126,67 @@ func TestOutboundRecipientRejectsNonCanonicalDestination(t *testing.T) {
 	}
 }
 
+func TestOutboundInviteUsesRegisteredSIPUsernameAsFromIdentity(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	if err := runtime.StartCall(context.Background(), "session-1", "outbound-identity", "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatal(err)
+	}
+	invite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	from := headerValue(invite, "From")
+	if !strings.Contains(from, "<sip:1129@127.0.0.1>") {
+		t.Fatalf("outbound From identity = %q, want registered SIP username", from)
+	}
+	if !strings.Contains(strings.ToLower(from), ";tag=") {
+		t.Fatalf("outbound From identity is missing dialog tag: %q", from)
+	}
+	if strings.Contains(from, "DebtFlowSipGateway") {
+		t.Fatalf("outbound From identity leaked user-agent product name: %q", from)
+	}
+
+	writeSIPResponse(t, peer, gateway, invite, 603, "Decline", "identity-test")
+	_, _ = readSIPRequestFromContaining(t, peer, "ACK ")
+	failed := readRuntimeEvent(t, runtime, EventFailed)
+	if failed.StatusCode != 603 || failed.Reason != "rejected" {
+		t.Fatalf("terminal event=%+v", failed)
+	}
+}
+
+func TestOutboundInviteDigestRetryKeepsSessionIdentityAndClassifiesForbidden(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	if err := runtime.StartCall(context.Background(), "session-1", "outbound-auth", "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatal(err)
+	}
+	invite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	challenge := strings.Replace(
+		buildResponseForRequest(invite, 401, "Unauthorized"),
+		"Content-Length: 0\r\n",
+		"WWW-Authenticate: Digest realm=\"asterisk\", nonce=\"test-nonce\", algorithm=MD5\r\nContent-Length: 0\r\n",
+		1,
+	)
+	if _, err := peer.WriteTo([]byte(challenge), gateway); err != nil {
+		t.Fatal(err)
+	}
+	authenticatedInvite, authenticatedGateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	if from := headerValue(authenticatedInvite, "From"); !strings.Contains(from, "<sip:1129@127.0.0.1>") {
+		t.Fatalf("authenticated outbound From identity = %q", from)
+	}
+	authorization := headerValue(authenticatedInvite, "Authorization")
+	if !strings.Contains(authorization, `username="1129"`) || !strings.Contains(authorization, `realm="asterisk"`) {
+		t.Fatalf("authenticated outbound INVITE has unexpected digest identity: %q", authorization)
+	}
+	if headerValue(authenticatedInvite, "CSeq") == headerValue(invite, "CSeq") {
+		t.Fatalf("authenticated outbound INVITE did not advance CSeq: initial=%q authenticated=%q",
+			headerValue(invite, "CSeq"), headerValue(authenticatedInvite, "CSeq"))
+	}
+
+	writeSIPResponse(t, peer, authenticatedGateway, authenticatedInvite, 403, "Forbidden", "auth-forbidden")
+	_, _ = readSIPRequestFromContaining(t, peer, "ACK ")
+	failed := readRuntimeEvent(t, runtime, EventFailed)
+	if failed.StatusCode != 403 || failed.Reason != "forbidden" {
+		t.Fatalf("terminal event=%+v", failed)
+	}
+}
+
 func TestOutboundHangupWaitsForCancelCompletionAndAllowsImmediateRedial(t *testing.T) {
 	runtime, peer := newOutboundSIPTestRuntime(t)
 	const firstCallID = "outbound-cancel-1"
@@ -182,6 +243,7 @@ func TestOutboundFinalResponsesEndRingingAndAllowImmediateRedial(t *testing.T) {
 		reason string
 	}{
 		{404, "Not Found", "invalid_destination"},
+		{403, "Forbidden", "forbidden"},
 		{408, "Request Timeout", "no_answer"},
 		{480, "Temporarily Unavailable", "no_answer"},
 		{486, "Busy Here", "busy"},

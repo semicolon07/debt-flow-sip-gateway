@@ -76,8 +76,10 @@ func (AsteriskProfile) BuildSDP(media MediaDescription) ([]byte, error) {
 
 func (AsteriskProfile) NormalizeFailure(status int) string {
 	switch status {
-	case 401, 403, 407:
+	case 401, 407:
 		return "authentication_failed"
+	case 403:
+		return "forbidden"
 	case 404, 484:
 		return "invalid_destination"
 	case 480, 408:
