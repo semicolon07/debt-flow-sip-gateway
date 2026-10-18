@@ -1,6 +1,7 @@
 package deployment
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -245,6 +246,102 @@ func TestMediaQualityAlertsAndDashboardAreConfigured(t *testing.T) {
 		if !strings.Contains(string(dashboard), required) {
 			t.Fatalf("Grafana media dashboard is missing %q", required)
 		}
+	}
+}
+
+func TestLocalMonitoringIsLoopbackOnlyAndProvisioned(t *testing.T) {
+	root := moduleRoot(t)
+	compose, err := os.ReadFile(filepath.Join(root, "deploy", "monitoring", "docker-compose.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var composeDocument map[string]any
+	if err := yaml.Unmarshal(compose, &composeDocument); err != nil {
+		t.Fatalf("monitoring compose is invalid YAML: %v", err)
+	}
+	value := string(compose)
+	for _, required := range []string{
+		"127.0.0.1:3000:3000", "127.0.0.1:9091:9090", "127.0.0.1:9093:9093",
+		"mem_limit:", "cpus:", "GRAFANA_ADMIN_PASSWORD",
+	} {
+		if !strings.Contains(value, required) {
+			t.Fatalf("local monitoring compose is missing %q", required)
+		}
+	}
+	prometheusConfig, err := os.ReadFile(filepath.Join(root, "deploy", "monitoring", "prometheus.docker.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(prometheusConfig), "host.docker.internal:9090") {
+		t.Fatal("Docker Prometheus must scrape the loopback-only Gateway through its host bridge")
+	}
+
+	for _, relative := range []string{
+		"deploy/monitoring/prometheus.docker.yml",
+		"deploy/monitoring/alertmanager.yml",
+		"deploy/monitoring/grafana/provisioning/datasources/prometheus.yml",
+		"deploy/monitoring/grafana/provisioning/dashboards/sip-gateway.yml",
+	} {
+		raw, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relative)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var document any
+		if err := yaml.Unmarshal(raw, &document); err != nil {
+			t.Fatalf("%s is invalid YAML: %v", relative, err)
+		}
+	}
+}
+
+func TestMonitoringDashboardIncludesCapacityCPUAndMemory(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(moduleRoot(t), "deploy", "grafana", "sip-gateway-dashboard.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dashboard map[string]any
+	if err := json.Unmarshal(raw, &dashboard); err != nil {
+		t.Fatalf("Grafana dashboard is invalid JSON: %v", err)
+	}
+	for _, required := range []string{
+		"Gateway readiness", "Session capacity", "Call capacity", "Process CPU", "Process memory",
+		"debt_flow_sip_gateway_ready", "process_cpu_seconds_total", "go_sched_gomaxprocs_threads",
+		"process_resident_memory_bytes",
+	} {
+		if !strings.Contains(string(raw), required) {
+			t.Fatalf("Grafana operations dashboard is missing %q", required)
+		}
+	}
+}
+
+func TestMonitoringRulesCoverProcessCPUAndMemory(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(moduleRoot(t), "deploy", "prometheus", "sip-gateway.rules.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"DebtFlowSipGatewayCPUHigh", "go_sched_gomaxprocs_threads",
+		"DebtFlowSipGatewayMemoryHigh", "process_resident_memory_bytes",
+	} {
+		if !strings.Contains(string(raw), required) {
+			t.Fatalf("monitoring rules are missing %q", required)
+		}
+	}
+}
+
+func TestLocalMonitoringScriptsKeepComponentsSeparateFromGateway(t *testing.T) {
+	start := readScript(t, "start-local-monitoring.ps1")
+	for _, required := range []string{
+		"GF_SECURITY_ADMIN_PASSWORD", "--web.listen-address=127.0.0.1:9091",
+		"--web.listen-address=127.0.0.1:9093", "processes.json", "prometheus.exe",
+		"alertmanager.exe", "grafana-server.exe",
+	} {
+		if !strings.Contains(start, required) {
+			t.Fatalf("local monitoring start script is missing %q", required)
+		}
+	}
+	stop := readScript(t, "stop-local-monitoring.ps1")
+	if !strings.Contains(stop, `$allowedNames = @("prometheus", "alertmanager", "grafana-server")`) {
+		t.Fatal("stop script must only stop the monitoring processes it recognizes")
 	}
 }
 

@@ -1670,6 +1670,20 @@ func TestCoordinatorPreservesNormalizedOutboundFailureReason(t *testing.T) {
 	}
 }
 
+func TestCoordinatorMapsOutboundTerminalReasonsToAgentContract(t *testing.T) {
+	for reason, expected := range map[string]call.EndReason{
+		"busy":      call.EndBusy,
+		"no_answer": call.EndNoAnswer,
+		"cancelled": call.EndCancelled,
+		"rejected":  call.EndRejected,
+		"unknown":   call.EndSIPFailed,
+	} {
+		if actual := failedEndReason(reason); actual != expected {
+			t.Fatalf("failedEndReason(%q)=%q, want %q", reason, actual, expected)
+		}
+	}
+}
+
 func TestCoordinatorUsesCanonicalAuthorizedDestinationAndDeduplicates(t *testing.T) {
 	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
 	sipRuntime := newFakeSIP()

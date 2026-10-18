@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="th">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Debt Flow SIP Gateway Diagnostics</title>
+    <link rel="stylesheet" href="/diagnostics/styles.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">DEBT FLOW OPERATIONS</p>
+          <h1>SIP Gateway Diagnostics</h1>
+          <p id="identity" class="muted">กำลังโหลดสถานะ…</p>
+        </div>
+        <div class="header-actions">
+          <span id="freshness" class="muted"></span>
+          <span id="status" class="badge neutral">กำลังเชื่อมต่อ</span>
+        </div>
+      </header>
+
+      <section id="error" class="notice hidden" role="alert"></section>
+
+      <section class="cards" aria-label="Gateway overview">
+        <article class="card"><span>Sessions</span><strong id="sessions">—</strong><small id="sessions-detail">—</small></article>
+        <article class="card"><span>Active calls</span><strong id="calls">—</strong><small id="calls-detail">—</small></article>
+        <article class="card"><span>SIP registered</span><strong id="registered">—</strong><small id="registration-detail">—</small></article>
+        <article class="card"><span>PeerConnections</span><strong id="peers">—</strong><small id="wss-detail">—</small></article>
+        <article class="card"><span>TURN allocation</span><strong id="turn">—</strong><small id="turn-detail">—</small></article>
+        <article class="card"><span>Pending events</span><strong id="outbox">—</strong><small id="storage-detail">—</small></article>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <h2>Capacity</h2>
+          <div class="meter-row"><span>Sessions</span><progress id="sessions-meter" max="100" value="0"></progress><b id="sessions-percent">0%</b></div>
+          <div class="meter-row"><span>Calls</span><progress id="calls-meter" max="100" value="0"></progress><b id="calls-percent">0%</b></div>
+          <div class="meter-row"><span>TURN</span><progress id="turn-meter" max="100" value="0"></progress><b id="turn-percent">0%</b></div>
+        </article>
+
+        <article class="panel">
+          <h2>Process</h2>
+          <dl>
+            <div><dt>Process CPU</dt><dd id="cpu">กำลังวัด…</dd></div>
+            <div><dt>Working set (RSS)</dt><dd id="rss">—</dd></div>
+            <div><dt>Go heap</dt><dd id="heap">—</dd></div>
+            <div><dt>Heap in use</dt><dd id="heap-in-use">—</dd></div>
+            <div><dt>System memory</dt><dd id="system-memory">—</dd></div>
+            <div><dt>Virtual memory</dt><dd id="virtual-memory">—</dd></div>
+            <div><dt>Goroutines</dt><dd id="goroutines">—</dd></div>
+            <div><dt>GC count</dt><dd id="gc-count">—</dd></div>
+          </dl>
+        </article>
+
+        <article class="panel">
+          <h2>Calls by state</h2>
+          <table><thead><tr><th>Direction</th><th>State</th><th>Count</th></tr></thead><tbody id="call-rows"></tbody></table>
+        </article>
+
+        <article class="panel">
+          <h2>ICE routes</h2>
+          <table><thead><tr><th>Route</th><th>Connections</th></tr></thead><tbody id="ice-rows"></tbody></table>
+        </article>
+      </section>
+
+      <footer>Read-only local diagnostics · refresh ทุก 5 วินาที · ไม่มีหมายเลขโทรศัพท์หรือ credential</footer>
+    </main>
+    <script src="/diagnostics/app.js" defer></script>
+  </body>
+</html>

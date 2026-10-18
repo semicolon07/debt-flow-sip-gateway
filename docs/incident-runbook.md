@@ -47,6 +47,43 @@ Gateway รุ่นที่แก้แล้วต้องไม่แสด
 - restart จะ terminalize call ที่ค้างด้วย `gateway_restarted`; ตรวจว่า browser relay event ไป API เพียงครั้งเดียว
 - readiness 503 พร้อม gate message เป็น behavior ที่ตั้งใจไว้เมื่อ `sip.spikeApproved=false`
 
+## SIP registration unavailable
+
+- ตรวจ registration state ใน `http://127.0.0.1:9090/diagnostics/` และ operational log ที่ sanitize แล้ว
+- ถ้ามี authenticated session แต่ registered เป็นศูนย์ ให้ตรวจ PBX reachability, SIP transport, credential,
+  realm และ firewall โดยห้ามพิมพ์ password หรือ Authorization header ลง ticket
+- ตรวจว่า SIP username ไม่มี session owner ซ้ำ และ browser session ยัง renew lease ตามปกติ
+- ทดสอบ REGISTER หนึ่ง account หลังแก้ และรอให้ alert resolve ก่อนเปิด Collection เพิ่ม
+
+## Capacity pressure
+
+- session warning/critical อยู่ที่ 80/90% ของ `maxSessions`; call warning/critical อยู่ที่ 80/90% ของ `maxCalls`
+- ห้ามเพิ่ม limit ระหว่าง incident ก่อนตรวจ CPU, working set, goroutines, UDP ports, TURN allocation และ outbox
+- หยุดเปิด Collection ใหม่และ drain call หาก pressure ยังเพิ่มต่อเนื่อง
+- เก็บ capacity sample ก่อน/ระหว่าง/หลัง incident เพื่อยืนยันว่า memory และ goroutines กลับ baseline
+
+## Call command failures
+
+- alert ทำงานเมื่อมีอย่างน้อย 10 call commands ใน 5 นาทีและ failure ratio มากกว่า 10% ต่อเนื่อง 3 นาที
+- แยก command type และ error code จาก sanitized log แล้วตรวจ capability, media readiness, SIP response และ outbox
+- เปรียบเทียบ inbound/outbound, direct/TURN และ PBX response ก่อน restart เพื่อไม่ทำลายหลักฐาน
+
+## WSS disconnect spike
+
+- alert ตัด `client_closed` และ `runtime_closed` ปกติออก แล้วตรวจ network/heartbeat/writer overflow reasons ที่เหลือ
+- ตรวจ IIS WebSocket timeout, Cloudflare/VPN path, browser network และ WSS writer queue
+- ถ้าเกิดพร้อม CPU/memory/call-capacity สูง ให้แก้ capacity pressure ก่อนเพิ่ม reconnect rate
+
+## Process resource pressure
+
+- `DebtFlowSipGatewayCPUHigh` คิด CPU แบบ normalized ด้วยจำนวน processor ที่ Go runtime ใช้งานได้; ตรวจคู่กับ
+  call/session capacity, TURN relay traffic, RTP errors และ call setup latency
+- `DebtFlowSipGatewayMemoryHigh` ใช้ working set 1.5 GiB เป็นค่าเริ่มต้นสำหรับ pilot เท่านั้น ต้องปรับ rule
+  ให้สัมพันธ์กับ RAM และ baseline จาก load test ของ Windows Server จริงก่อน production
+- ตรวจ working set, Go heap/system memory, goroutines และ GC เทียบกับก่อนเริ่มสายและหลังวางสายอย่างน้อย
+  10 นาที ถ้า call count กลับศูนย์แต่ค่าเพิ่มต่อเนื่องให้เก็บ heap/goroutine profile เพื่อตรวจ leak
+- ห้ามแก้ incident ด้วยการเพิ่ม call/session limit จนกว่าจะยืนยัน CPU, RAM, UDP port และ TURN headroom
+
 ## Event outbox backlog
 
 - ตรวจ WSS connected sessions และ disconnect reason; backlog มักเกิดจาก browser ปิดหรือ relay event เข้า API ไม่สำเร็จ

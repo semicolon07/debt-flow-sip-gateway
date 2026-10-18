@@ -84,6 +84,8 @@ func (AsteriskProfile) NormalizeFailure(status int) string {
 		return "no_answer"
 	case 486, 600:
 		return "busy"
+	case 603:
+		return "rejected"
 	case 487:
 		return "cancelled"
 	case 488, 415:

@@ -10,6 +10,105 @@ groups:
           summary: Debt Flow SIP Gateway metrics are unavailable
           runbook: docs/incident-runbook.md#gateway-or-metrics-unavailable
 
+      - alert: DebtFlowSipGatewayNotReady
+        expr: debt_flow_sip_gateway_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: SIP Gateway is running but not ready to serve calls
+          runbook: docs/incident-runbook.md#gateway-or-metrics-unavailable
+
+      - alert: DebtFlowSipGatewaySIPRegistrationUnavailable
+        expr: |
+          debt_flow_sip_gateway_sessions > 0
+          and on() sum(debt_flow_sip_gateway_registrations{state="registered"}) < 1
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: SIP Gateway has authenticated sessions but no registered SIP account
+          runbook: docs/incident-runbook.md#sip-registration-unavailable
+
+      - alert: DebtFlowSipGatewaySessionCapacityHigh
+        expr: debt_flow_sip_gateway_session_capacity_ratio >= 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: SIP Gateway session capacity is at or above 80 percent
+          runbook: docs/incident-runbook.md#capacity-pressure
+
+      - alert: DebtFlowSipGatewaySessionCapacityCritical
+        expr: debt_flow_sip_gateway_session_capacity_ratio >= 0.9
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: SIP Gateway session capacity is at or above 90 percent
+          runbook: docs/incident-runbook.md#capacity-pressure
+
+      - alert: DebtFlowSipGatewayCallCapacityHigh
+        expr: debt_flow_sip_gateway_call_capacity_ratio >= 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: SIP Gateway concurrent-call capacity is at or above 80 percent
+          runbook: docs/incident-runbook.md#capacity-pressure
+
+      - alert: DebtFlowSipGatewayCallCapacityCritical
+        expr: debt_flow_sip_gateway_call_capacity_ratio >= 0.9
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: SIP Gateway concurrent-call capacity is at or above 90 percent
+          runbook: docs/incident-runbook.md#capacity-pressure
+
+      - alert: DebtFlowSipGatewayCallCommandFailureRateHigh
+        expr: |
+          (
+            sum(increase(debt_flow_sip_gateway_commands_total{type=~"call\\..+",outcome="failed"}[5m]))
+            /
+            clamp_min(sum(increase(debt_flow_sip_gateway_commands_total{type=~"call\\..+"}[5m])), 1)
+          ) > 0.1
+          and
+          sum(increase(debt_flow_sip_gateway_commands_total{type=~"call\\..+"}[5m])) >= 10
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: More than 10 percent of call commands are failing
+          runbook: docs/incident-runbook.md#call-command-failures
+
+      - alert: DebtFlowSipGatewayWSSDisconnectSpike
+        expr: increase(debt_flow_sip_gateway_wss_disconnects_total{reason!~"client_closed|runtime_closed"}[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: SIP Gateway WSS disconnects increased unexpectedly
+          runbook: docs/incident-runbook.md#wss-disconnect-spike
+
+      - alert: DebtFlowSipGatewayCPUHigh
+        expr: rate(process_cpu_seconds_total[5m]) / go_sched_gomaxprocs_threads >= 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: SIP Gateway process CPU is at or above 80 percent of its available processors
+          runbook: docs/incident-runbook.md#process-resource-pressure
+
+      - alert: DebtFlowSipGatewayMemoryHigh
+        expr: process_resident_memory_bytes >= 1610612736
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: SIP Gateway process working set is at or above 1.5 GiB
+          runbook: docs/incident-runbook.md#process-resource-pressure
+
       - alert: DebtFlowSipGatewayOutboxHigh
         expr: debt_flow_sip_gateway_outbox_capacity_ratio >= 0.8
         for: 5m

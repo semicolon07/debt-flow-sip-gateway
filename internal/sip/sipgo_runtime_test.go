@@ -126,6 +126,219 @@ func TestOutboundRecipientRejectsNonCanonicalDestination(t *testing.T) {
 	}
 }
 
+func TestOutboundHangupWaitsForCancelCompletionAndAllowsImmediateRedial(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	const firstCallID = "outbound-cancel-1"
+	if err := runtime.StartCall(context.Background(), "session-1", firstCallID, "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatal(err)
+	}
+	invite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	writeSIPResponse(t, peer, gateway, invite, 180, "Ringing", "remote-cancel")
+	if event := readRuntimeEvent(t, runtime, EventRinging); event.CallID != firstCallID {
+		t.Fatalf("ringing event=%+v", event)
+	}
+
+	hangupResult := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		hangupResult <- runtime.Hangup(ctx, "session-1", firstCallID)
+	}()
+	cancelRequest, gateway := readSIPRequestFromContaining(t, peer, "CANCEL ")
+	select {
+	case err := <-hangupResult:
+		t.Fatalf("Hangup returned before CANCEL transaction completed: %v", err)
+	default:
+	}
+	writeSIPResponse(t, peer, gateway, cancelRequest, 200, "OK", "remote-cancel")
+	writeSIPResponse(t, peer, gateway, invite, 487, "Request Terminated", "remote-cancel")
+	select {
+	case err := <-hangupResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Hangup did not finish after SIP 200/487 cancellation handshake")
+	}
+	ended := readRuntimeEvent(t, runtime, EventEnded)
+	if ended.CallID != firstCallID || ended.Reason != "cancelled" {
+		t.Fatalf("ended event=%+v", ended)
+	}
+	waitForCallRemoval(t, runtime, "session-1", firstCallID)
+
+	if err := runtime.StartCall(context.Background(), "session-1", "outbound-cancel-2", "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatalf("immediate redial failed: %v", err)
+	}
+	secondInvite, _ := readSIPRequestFromContaining(t, peer, "INVITE ")
+	if headerValue(secondInvite, "Call-ID") == headerValue(invite, "Call-ID") {
+		t.Fatal("immediate redial reused the completed SIP Call-ID")
+	}
+}
+
+func TestOutboundFinalResponsesEndRingingAndAllowImmediateRedial(t *testing.T) {
+	tests := []struct {
+		status int
+		phrase string
+		reason string
+	}{
+		{404, "Not Found", "invalid_destination"},
+		{408, "Request Timeout", "no_answer"},
+		{480, "Temporarily Unavailable", "no_answer"},
+		{486, "Busy Here", "busy"},
+		{487, "Request Terminated", "cancelled"},
+		{488, "Not Acceptable Here", "codec_not_supported"},
+		{500, "Server Internal Error", "provider_unavailable"},
+		{503, "Service Unavailable", "provider_unavailable"},
+		{600, "Busy Everywhere", "busy"},
+		{603, "Decline", "rejected"},
+	}
+	for _, test := range tests {
+		t.Run(strconv.Itoa(test.status), func(t *testing.T) {
+			runtime, peer := newOutboundSIPTestRuntime(t)
+			firstCallID := fmt.Sprintf("outbound-final-%d-1", test.status)
+			if err := runtime.StartCall(context.Background(), "session-1", firstCallID, "9001", []byte(testInboundSDP)); err != nil {
+				t.Fatal(err)
+			}
+			invite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+			remoteTag := fmt.Sprintf("remote-final-%d", test.status)
+			writeSIPResponse(t, peer, gateway, invite, 180, "Ringing", remoteTag)
+			if event := readRuntimeEvent(t, runtime, EventRinging); event.CallID != firstCallID {
+				t.Fatalf("ringing event=%+v", event)
+			}
+			writeSIPResponse(t, peer, gateway, invite, test.status, test.phrase, remoteTag)
+			ack, _ := readSIPRequestFromContaining(t, peer, "ACK ")
+			if headerValue(ack, "Call-ID") != headerValue(invite, "Call-ID") {
+				t.Fatalf("non-2xx ACK does not match INVITE: %q", ack)
+			}
+			failed := readRuntimeEvent(t, runtime, EventFailed)
+			if failed.CallID != firstCallID || failed.StatusCode != test.status || failed.Reason != test.reason {
+				t.Fatalf("terminal event=%+v", failed)
+			}
+			waitForCallRemoval(t, runtime, "session-1", firstCallID)
+			assertImmediateOutboundRedial(t, runtime, peer,
+				fmt.Sprintf("outbound-final-%d-2", test.status))
+		})
+	}
+}
+
+func TestOutboundTransactionFailuresUseStableEndReasons(t *testing.T) {
+	for _, test := range []struct {
+		err  error
+		want string
+	}{
+		{err: sipmessage.ErrTransactionTimeout, want: "no_answer"},
+		{err: sipmessage.ErrTransactionTransport, want: "provider_unavailable"},
+		{err: sipmessage.ErrTransactionCanceled, want: "cancelled"},
+		{err: sipmessage.ErrTransactionTerminated, want: "sip_failed"},
+	} {
+		if got := outboundFailureReason(0, test.err); got != test.want {
+			t.Fatalf("outboundFailureReason(%v)=%q, want %q", test.err, got, test.want)
+		}
+	}
+}
+
+func TestOutboundConnectedLocalHangupWaitsForByeAndAllowsImmediateRedial(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	const firstCallID = "outbound-local-bye-1"
+	_, _, _ = establishOutboundTestCall(t, runtime, peer, firstCallID, "remote-local-bye")
+
+	hangupResult := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		hangupResult <- runtime.Hangup(ctx, "session-1", firstCallID)
+	}()
+	bye, gateway := readSIPRequestFromContaining(t, peer, "BYE ")
+	select {
+	case err := <-hangupResult:
+		t.Fatalf("Hangup returned before BYE received a final response: %v", err)
+	default:
+	}
+	writeSIPResponse(t, peer, gateway, bye, 200, "OK", "remote-local-bye")
+	select {
+	case err := <-hangupResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Hangup did not finish after BYE 200 OK")
+	}
+	waitForCallRemoval(t, runtime, "session-1", firstCallID)
+	assertImmediateOutboundRedial(t, runtime, peer, "outbound-local-bye-2")
+}
+
+func TestOutboundConnectedRemoteByeEndsCallAndAllowsImmediateRedial(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	const firstCallID = "outbound-remote-bye-1"
+	_, ack, gateway := establishOutboundTestCall(t, runtime, peer, firstCallID, "remote-bye")
+	peerHost, peerPortText, err := net.SplitHostPort(peer.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteBye := fmt.Sprintf("BYE sip:1129@%s SIP/2.0\r\n"+
+		"Via: SIP/2.0/UDP %s;branch=z9hG4bK-remote-bye;rport\r\n"+
+		"Max-Forwards: 70\r\n"+
+		"From: %s\r\n"+
+		"To: %s\r\n"+
+		"Call-ID: %s\r\n"+
+		"CSeq: 2 BYE\r\n"+
+		"Contact: <sip:9001@%s>\r\n"+
+		"Content-Length: 0\r\n\r\n",
+		gateway.String(), net.JoinHostPort(peerHost, peerPortText), headerValue(ack, "To"),
+		headerValue(ack, "From"), headerValue(ack, "Call-ID"), net.JoinHostPort(peerHost, peerPortText))
+	if _, err := peer.WriteTo([]byte(remoteBye), gateway); err != nil {
+		t.Fatal(err)
+	}
+	response := readSIPResponseContaining(t, peer, "200 OK")
+	if headerValue(response, "CSeq") != "2 BYE" {
+		t.Fatalf("remote BYE response=%q", response)
+	}
+	ended := readRuntimeEvent(t, runtime, EventEnded)
+	if ended.CallID != firstCallID || ended.Reason != "remote_hangup" {
+		t.Fatalf("ended event=%+v", ended)
+	}
+	waitForCallRemoval(t, runtime, "session-1", firstCallID)
+	assertImmediateOutboundRedial(t, runtime, peer, "outbound-remote-bye-2")
+}
+
+func TestOutboundLateAnswerAfterCancelIsAckedAndEndedWithByeBeforeRedial(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	const firstCallID = "outbound-late-answer-1"
+	if err := runtime.StartCall(context.Background(), "session-1", firstCallID, "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatal(err)
+	}
+	invite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	writeSIPResponse(t, peer, gateway, invite, 180, "Ringing", "remote-late-answer")
+	_ = readRuntimeEvent(t, runtime, EventRinging)
+
+	hangupResult := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		hangupResult <- runtime.Hangup(ctx, "session-1", firstCallID)
+	}()
+	cancelRequest, gateway := readSIPRequestFromContaining(t, peer, "CANCEL ")
+	writeSIPResponse(t, peer, gateway, cancelRequest, 200, "OK", "remote-late-answer")
+	writeSIPResponseWithBody(t, peer, gateway, invite, 200, "OK", "remote-late-answer", testInboundSDP)
+	_, _ = readSIPRequestFromContaining(t, peer, "ACK ")
+	bye, gateway := readSIPRequestFromContaining(t, peer, "BYE ")
+	writeSIPResponse(t, peer, gateway, bye, 200, "OK", "remote-late-answer")
+	select {
+	case err := <-hangupResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Hangup did not wait for late-answer ACK/BYE cleanup")
+	}
+	ended := readRuntimeEvent(t, runtime, EventEnded)
+	if ended.CallID != firstCallID || ended.Reason != "cancelled" {
+		t.Fatalf("ended event=%+v", ended)
+	}
+	waitForCallRemoval(t, runtime, "session-1", firstCallID)
+	assertImmediateOutboundRedial(t, runtime, peer, "outbound-late-answer-2")
+}
+
 func TestRegistrationRetryDelayIsExponentiallyBounded(t *testing.T) {
 	for failures, expected := range map[int]time.Duration{
 		0: time.Second, 1: time.Second, 2: 2 * time.Second, 3: 4 * time.Second,
@@ -602,6 +815,44 @@ func newInboundSIPTestRuntime(t *testing.T) (*SIPGoRuntime, net.PacketConn, *net
 	return runtime, peer, serverUDP, mustPort(t, udpAddress), peerPort
 }
 
+func newOutboundSIPTestRuntime(t *testing.T) (*SIPGoRuntime, net.PacketConn) {
+	t.Helper()
+	runtime, peer, _, _, _ := newInboundSIPTestRuntime(t)
+	return runtime, peer
+}
+
+func establishOutboundTestCall(
+	t *testing.T,
+	runtime *SIPGoRuntime,
+	peer net.PacketConn,
+	callID string,
+	remoteTag string,
+) (string, string, net.Addr) {
+	t.Helper()
+	if err := runtime.StartCall(context.Background(), "session-1", callID, "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatal(err)
+	}
+	invite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	writeSIPResponse(t, peer, gateway, invite, 180, "Ringing", remoteTag)
+	if event := readRuntimeEvent(t, runtime, EventRinging); event.CallID != callID {
+		t.Fatalf("ringing event=%+v", event)
+	}
+	writeSIPResponseWithBody(t, peer, gateway, invite, 200, "OK", remoteTag, testInboundSDP)
+	ack, _ := readSIPRequestFromContaining(t, peer, "ACK ")
+	if event := readRuntimeEvent(t, runtime, EventConnected); event.CallID != callID {
+		t.Fatalf("connected event=%+v", event)
+	}
+	return invite, ack, gateway
+}
+
+func assertImmediateOutboundRedial(t *testing.T, runtime *SIPGoRuntime, peer net.PacketConn, callID string) {
+	t.Helper()
+	if err := runtime.StartCall(context.Background(), "session-1", callID, "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatalf("immediate redial failed: %v", err)
+	}
+	_, _ = readSIPRequestFromContaining(t, peer, "INVITE ")
+}
+
 func buildInboundRequest(method string, serverPort, peerPort int, fromTag, toValue, callID, branch, cseq, body string) string {
 	if toValue == "" {
 		toValue = fmt.Sprintf("<sip:1129@127.0.0.1:%d>", serverPort)
@@ -702,6 +953,76 @@ func readSIPRequestContaining(t *testing.T, peer net.PacketConn, marker string) 
 	}
 	t.Fatalf("timed out waiting for SIP request %q", marker)
 	return ""
+}
+
+func readSIPRequestFromContaining(t *testing.T, peer net.PacketConn, marker string) (string, net.Addr) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	buffer := make([]byte, 4096)
+	for time.Now().Before(deadline) {
+		if err := peer.SetReadDeadline(deadline); err != nil {
+			t.Fatal(err)
+		}
+		count, source, err := peer.ReadFrom(buffer)
+		if err != nil {
+			t.Fatalf("read SIP request %q: %v", marker, err)
+		}
+		request := string(buffer[:count])
+		if strings.Contains(request, marker) {
+			return request, source
+		}
+	}
+	t.Fatalf("timed out waiting for SIP request %q", marker)
+	return "", nil
+}
+
+func writeSIPResponse(
+	t *testing.T,
+	peer net.PacketConn,
+	target net.Addr,
+	request string,
+	status int,
+	reason string,
+	toTag string,
+) {
+	writeSIPResponseWithBody(t, peer, target, request, status, reason, toTag, "")
+}
+
+func writeSIPResponseWithBody(
+	t *testing.T,
+	peer net.PacketConn,
+	target net.Addr,
+	request string,
+	status int,
+	reason string,
+	toTag string,
+	body string,
+) {
+	t.Helper()
+	to := headerValue(request, "To")
+	if toTag != "" && !strings.Contains(strings.ToLower(to), ";tag=") {
+		to += ";tag=" + toTag
+	}
+	extraHeaders := ""
+	if status >= 180 && status < 300 {
+		extraHeaders += fmt.Sprintf("Contact: <sip:9001@%s;transport=udp>\r\n", peer.LocalAddr().String())
+	}
+	if body != "" {
+		extraHeaders += "Content-Type: application/sdp\r\n"
+	}
+	response := fmt.Sprintf("SIP/2.0 %d %s\r\n"+
+		"Via: %s\r\n"+
+		"From: %s\r\n"+
+		"To: %s\r\n"+
+		"Call-ID: %s\r\n"+
+		"CSeq: %s\r\n"+
+		"%sContent-Length: %d\r\n\r\n%s",
+		status, reason, headerValue(request, "Via"), headerValue(request, "From"),
+		to, headerValue(request, "Call-ID"), headerValue(request, "CSeq"),
+		extraHeaders, len(body), body)
+	if _, err := peer.WriteTo([]byte(response), target); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func readSIPResponsesContaining(t *testing.T, peer net.PacketConn, markers ...string) map[string]string {

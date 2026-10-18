@@ -14,6 +14,8 @@ Debt Flow SIP Windows Agent ที่เครื่องผู้ใช้
 - [Incident runbook](docs/incident-runbook.md)
 - [Pilot acceptance matrix](docs/pilot-acceptance-matrix.md)
 - [Performance and capacity testing](docs/performance-testing.md)
+- [Local monitoring and embedded diagnostics](docs/local-monitoring.md)
+- [Monitoring dashboard implementation result](docs/2026-10-18-monitoring-dashboard-result.md)
 - [Local browser POC](test/poc/README.md)
 
 P1 baseline ที่ยืนยันแล้ว:
@@ -62,6 +64,8 @@ PeerConnection/RTP buffers และ unacknowledged outbox ใช้ memory ห�
   deterministic restart terminalization
 - bounded rotating JSON operational logs พร้อม production `info`/sanitized diagnostic `debug`,
   Prometheus dashboard/alerts และ allowlisted diagnostics
+- read-only embedded diagnostics ที่ `127.0.0.1:9090/diagnostics/` พร้อม CPU, working set, Go memory,
+  sessions/calls, SIP registration, ICE/TURN, outbox และ SQLite snapshot
 - Pion WebRTC/ICE, embedded TURN UDP/TCP, G.711 RTP mapping, RFC 4733 DTMF และ browser audio controls
 - SIPGo REGISTER/INVITE lifecycle หลัง `sip.spikeApproved` gate พร้อม inbound/outbound call state
 - local AES-256-GCM session/call capability verification โดย Gateway ไม่เชื่อม Web API

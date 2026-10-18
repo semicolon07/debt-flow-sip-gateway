@@ -10,6 +10,7 @@ func TestMetricsExposeRuntimeAndInfrastructureState(t *testing.T) {
 	metrics.SetRuntime(3, 2, map[string]int{"registered": 2, "idle": 1}, []CallGauge{{
 		State: "connected", Direction: "outbound", Count: 1,
 	}})
+	metrics.SetCapacity(true, 3, 4, 1, 2)
 	metrics.SetInfrastructure(2, 2, 4)
 	metrics.SetICERoutes(map[string]int{"direct": 1, "relay": 1})
 	metrics.SetTURN(TURNStats{
@@ -46,6 +47,9 @@ func TestMetricsExposeRuntimeAndInfrastructureState(t *testing.T) {
 	for name, expected := range map[string]float64{
 		"debt_flow_sip_gateway_sessions":                    3,
 		"debt_flow_sip_gateway_connected_sessions":          2,
+		"debt_flow_sip_gateway_session_capacity_ratio":      0.75,
+		"debt_flow_sip_gateway_call_capacity_ratio":         0.5,
+		"debt_flow_sip_gateway_ready":                       1,
 		"debt_flow_sip_gateway_peer_connections":            2,
 		"debt_flow_sip_gateway_turn_allocations":            1,
 		"debt_flow_sip_gateway_turn_allocation_quota_ratio": 0.25,
@@ -106,4 +110,15 @@ func TestStorageCapacityRatioUsesHighestConfiguredBound(t *testing.T) {
 		}
 	}
 	t.Fatal("missing outbox capacity ratio metric")
+}
+
+func TestProcessStatsExposeCPUAndMemory(t *testing.T) {
+	metrics := NewMetrics()
+	value, err := metrics.ProcessStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.CPUCores <= 0 || value.ResidentMemoryBytes <= 0 || value.VirtualMemoryBytes <= 0 {
+		t.Fatalf("unexpected process metrics: %+v", value)
+	}
 }

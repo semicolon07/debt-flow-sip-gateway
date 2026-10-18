@@ -49,7 +49,7 @@ func main() {
 		return
 	}
 	if err := service.Run("DebtFlowSipGateway", func(ctx context.Context) error {
-		return gateway.Run(ctx, cfg)
+		return gateway.RunWithVersion(ctx, cfg, version)
 	}); err != nil {
 		log.Printf("gateway stopped with error: %v", err)
 		os.Exit(1)

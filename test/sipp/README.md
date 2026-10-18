@@ -9,6 +9,7 @@
 - `outbound-answer-bye`: outbound provisional/answer/ACK และ remote BYE
 - `outbound-answer-bye-pcma`: flow เดียวกันโดยบังคับ SDP PCMA; browser offer ต้องเลือก PCMA
 - `outbound-busy`: outbound INVITE ได้ 486 และ Gateway ส่ง ACK
+- `outbound-decline`: outbound ได้ 180 ก่อนปลายทางตอบ 603 Decline; Gateway ต้องส่ง ACK และจบ ringing ทันที
 - `outbound-no-answer`: outbound ringing, local CANCEL, 200/487 และ ACK
 - `inbound-answer-bye`: inbound INVITE ให้ browser รับสาย แล้ว remote BYE
 - `inbound-answer-bye-pcma`: inbound flow เดียวกันด้วย PCMA payload type 8

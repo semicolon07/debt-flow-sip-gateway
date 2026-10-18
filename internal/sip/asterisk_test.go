@@ -36,6 +36,9 @@ func TestAsteriskFailureNormalization(t *testing.T) {
 	if got := profile.NormalizeFailure(488); got != "codec_not_supported" {
 		t.Fatalf("expected codec failure, got %s", got)
 	}
+	if got := profile.NormalizeFailure(603); got != "rejected" {
+		t.Fatalf("expected rejected, got %s", got)
+	}
 }
 
 func TestNormalizeRemoteParty(t *testing.T) {

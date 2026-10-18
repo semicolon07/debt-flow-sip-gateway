@@ -8,6 +8,7 @@ param(
         "outbound-answer-bye",
         "outbound-answer-bye-pcma",
         "outbound-busy",
+        "outbound-decline",
         "outbound-no-answer",
         "inbound-answer-bye",
         "inbound-answer-bye-pcma",

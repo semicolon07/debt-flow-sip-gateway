@@ -131,6 +131,21 @@ Regression tests ครอบคลุม outbound lifecycle ทั้งเส�
 legacy API ingest, exact Gateway inbound answer lifecycle ที่ Web App/Web API, idempotent re-ingest และ
 Gateway-to-existing-durable-contract normalization
 
+## Outbound terminal cleanup corrective fix (2026-10-18)
+
+- `call.hangup` ระหว่าง dialing/ringing รอ SIP `CANCEL → 200` และ final INVITE response (`487` หรือ
+  late `200`) จบจริงก่อนคืนผลสำเร็จ; late `200` ถูก ACK แล้ว BYE ก่อนปล่อย call slot
+- connected local hangup รอ final response ของ BYE; remote BYE และ outbound final response ปล่อย dialog,
+  call map และ SIP Call-ID index ก่อนรับสายใหม่ ทำให้โทรเบอร์เดิมซ้ำได้ทันทีโดยไม่พึ่ง cooldown
+- outbound `404/408/480/486/487/488/500/503/600/603` ถูก ACK, แปลง end reason แบบ canonical และ
+  terminalize ringing เพียงครั้งเดียว; transaction timeout เป็น `no_answer` และ transport failure เป็น
+  `provider_unavailable`
+- เพิ่ม real UDP integration regression สำหรับ local CANCEL, local/remote BYE, late answer หลัง CANCEL,
+  final-response matrix และ immediate same-destination redial; เพิ่ม SIPp `outbound-decline` สำหรับ
+  `180 → 603 → ACK`
+- Web App Gateway adapter regression 77 tests และ Web API `PortalPhoneAgentStoreTests` 28 tests ผ่าน
+  เพื่อยืนยันว่า terminal event/outcome ใหม่ยังเข้ากับ lifecycle contract เดิม
+
 ## Local verification
 
 - `go test -race ./...` ผ่านทุก package รวม UDP/TCP inbound transaction lifecycle และพบ/ปิด race จาก

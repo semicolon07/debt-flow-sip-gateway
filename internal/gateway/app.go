@@ -13,6 +13,7 @@ import (
 
 	"github.com/debt-flow/sip-gateway/internal/capability"
 	"github.com/debt-flow/sip-gateway/internal/config"
+	"github.com/debt-flow/sip-gateway/internal/diagnostics"
 	"github.com/debt-flow/sip-gateway/internal/media"
 	"github.com/debt-flow/sip-gateway/internal/observability"
 	"github.com/debt-flow/sip-gateway/internal/security"
@@ -26,6 +27,10 @@ import (
 )
 
 func Run(ctx context.Context, cfg config.Config) error {
+	return RunWithVersion(ctx, cfg, "dev")
+}
+
+func RunWithVersion(ctx context.Context, cfg config.Config, version string) error {
 	logger, logCloser, err := observability.NewLogger(
 		cfg.Logging.Path, cfg.Logging.MaxBytes, cfg.Logging.MaxBackups, cfg.Logging.Level,
 	)
@@ -232,18 +237,35 @@ func Run(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 	wss.SetObserver(metrics)
+	var live atomic.Bool
+	live.Store(true)
+	sipReady := func() bool {
+		value, ok := sipRuntime.(interface{ Ready() bool })
+		return cfg.SIP.SpikeApproved && ok && value.Ready()
+	}
+	var diagnosticsSnapshot atomic.Value
 
 	updateMetrics := func() {
 		runtimeStats := coordinator.Stats()
 		callGauges := make([]observability.CallGauge, 0, len(runtimeStats.Calls))
+		diagnosticCalls := make([]diagnostics.Call, 0, len(runtimeStats.Calls))
+		activeCalls := 0
 		for _, value := range runtimeStats.Calls {
+			activeCalls += value.Count
 			callGauges = append(callGauges, observability.CallGauge{
+				State: value.State, Direction: value.Direction, Count: value.Count,
+			})
+			diagnosticCalls = append(diagnosticCalls, diagnostics.Call{
 				State: value.State, Direction: value.Direction, Count: value.Count,
 			})
 		}
 		metrics.SetRuntime(
 			runtimeStats.AuthenticatedSessions, runtimeStats.ConnectedSessions,
 			runtimeStats.Registrations, callGauges,
+		)
+		metrics.SetCapacity(
+			sipReady(), runtimeStats.AuthenticatedSessions, cfg.Limits.MaxSessions,
+			activeCalls, cfg.Limits.MaxCalls,
 		)
 		serverStats := wss.Stats()
 		webrtcStats := rtcEngine.Stats()
@@ -259,12 +281,49 @@ func Run(ctx context.Context, cfg config.Config) error {
 			PeerToClientBytes: turnStats.PeerToClientBytes,
 			ClientToPeerBytes: turnStats.ClientToPeerBytes,
 		})
-		if stats, statsErr := database.Stats(ctx); statsErr == nil {
-			setStorageMetrics(metrics, cfg, stats)
+		storageStats, statsErr := database.Stats(ctx)
+		storageHealthy := statsErr == nil
+		if storageHealthy {
+			setStorageMetrics(metrics, cfg, storageStats)
 		} else {
 			metrics.ObserveSQLiteFailure("stats")
 			logger.Warn("read gateway database metrics failed", "error", statsErr)
 		}
+		turnQuotaRatio := 0.0
+		if turnStats.AllocationLimit > 0 {
+			turnQuotaRatio = float64(turnStats.Allocations) / float64(turnStats.AllocationLimit)
+		}
+		processStats, processStatsErr := metrics.ProcessStats()
+		if processStatsErr != nil {
+			logger.Warn("read process metrics failed", "error", processStatsErr)
+		}
+		diagnosticsSnapshot.Store(diagnostics.Snapshot{
+			GeneratedAtUTC: time.Now().UTC(), NodeID: cfg.NodeID, Version: version, Ready: sipReady(),
+			Limits: diagnostics.WebLimits{Sessions: cfg.Limits.MaxSessions, Calls: cfg.Limits.MaxCalls},
+			Runtime: diagnostics.WebRuntime{
+				AuthenticatedSessions: runtimeStats.AuthenticatedSessions,
+				ConnectedSessions:     runtimeStats.ConnectedSessions,
+				Registrations:         runtimeStats.Registrations, Calls: diagnosticCalls,
+			},
+			Infrastructure: diagnostics.Infrastructure{
+				PeerConnections: webrtcStats.Sessions, WSSConnections: serverStats.Connections,
+				WSSWriterQueue: serverStats.WriterQueueDepth, ICERoutes: webrtcStats.ICERoutes,
+			},
+			TURN: diagnostics.WebTURN{
+				Allocations: turnStats.Allocations, AllocationLimit: turnStats.AllocationLimit,
+				QuotaRatio: turnQuotaRatio,
+			},
+			Storage: diagnostics.WebStorage{
+				Healthy: storageHealthy, PendingEvents: storageStats.PendingEvents,
+				MaxSessionPendingEvents: storageStats.MaxSessionPendingEvents,
+				DatabaseBytes:           storageStats.DatabaseBytes, WALBytes: storageStats.WALBytes,
+			},
+			Process: diagnostics.Process{
+				CPUSeconds: processStats.CPUSeconds, CPUCores: processStats.CPUCores,
+				ResidentMemoryBytes: processStats.ResidentMemoryBytes,
+				VirtualMemoryBytes:  processStats.VirtualMemoryBytes,
+			},
+		})
 	}
 	updateMetrics()
 	go func() {
@@ -279,12 +338,6 @@ func Run(ctx context.Context, cfg config.Config) error {
 			}
 		}
 	}()
-	var live atomic.Bool
-	live.Store(true)
-	sipReady := func() bool {
-		value, ok := sipRuntime.(interface{ Ready() bool })
-		return cfg.SIP.SpikeApproved && ok && value.Ready()
-	}
 	mainMux := http.NewServeMux()
 	mainMux.Handle("/gateway/v1", wss.Handler())
 	mainMux.HandleFunc("/healthz", func(writer http.ResponseWriter, _ *http.Request) {
@@ -309,6 +362,16 @@ func Run(ctx context.Context, cfg config.Config) error {
 	}
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", metrics.Handler())
+	diagnosticsHandler := diagnostics.NewWebHandler(func() diagnostics.Snapshot {
+		value, ok := diagnosticsSnapshot.Load().(diagnostics.Snapshot)
+		if !ok {
+			return diagnostics.Snapshot{NodeID: cfg.NodeID, Version: version, Ready: sipReady()}
+		}
+		value.Ready = sipReady()
+		return value
+	})
+	metricsMux.Handle("/diagnostics", diagnosticsHandler)
+	metricsMux.Handle("/diagnostics/", diagnosticsHandler)
 	metricsServer := &http.Server{
 		Addr: cfg.HTTP.MetricsListen, Handler: metricsMux,
 		ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second,

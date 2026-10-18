@@ -67,6 +67,8 @@ type sipgoCall struct {
 	mu                   sync.RWMutex
 	inviteDone           chan struct{}
 	inviteDoneOnce       sync.Once
+	outboundDone         chan struct{}
+	outboundDoneOnce     sync.Once
 	sessionID            string
 	callID               string
 	sipCallID            string
@@ -281,7 +283,7 @@ func (r *SIPGoRuntime) StartCall(ctx context.Context, sessionID, callID, destina
 	}
 	callValue := &sipgoCall{
 		sessionID: sessionID, callID: callID, sipCallID: sipCallID,
-		outbound: dialog, cancel: cancel,
+		outbound: dialog, cancel: cancel, outboundDone: make(chan struct{}),
 	}
 	r.mu.Lock()
 	r.calls[callID] = callValue
@@ -393,8 +395,16 @@ func (r *SIPGoRuntime) Hangup(ctx context.Context, sessionID, callID string) err
 	if callValue.outbound != nil {
 		if callValue.isConnected() {
 			err = callValue.outbound.Bye(ctx)
+			r.removeCallIfCurrent(callValue)
+			callValue.completeOutbound()
 		} else {
 			callValue.cancel(errors.New("local hangup"))
+			select {
+			case <-callValue.outboundDone:
+				return nil
+			case <-ctx.Done():
+				return fmt.Errorf("wait for outbound SIP cancellation: %w", ctx.Err())
+			}
 		}
 	} else if callValue.inbound != nil {
 		if callValue.isConnected() {
@@ -408,7 +418,9 @@ func (r *SIPGoRuntime) Hangup(ctx context.Context, sessionID, callID string) err
 			return nil
 		}
 	}
-	r.removeCall(callID)
+	if callValue.outbound == nil {
+		r.removeCall(callID)
+	}
 	return err
 }
 
@@ -650,6 +662,7 @@ func (r *SIPGoRuntime) onBye(request *sipmessage.Request, tx sipmessage.ServerTr
 			"reason", "remote_hangup")
 	}
 	r.removeCall(callValue.callID)
+	callValue.completeOutbound()
 }
 
 func (r *SIPGoRuntime) logInboundRejection(callRef, reason string, status int) {
@@ -710,8 +723,8 @@ func (r *SIPGoRuntime) waitOutbound(ctx context.Context, callValue *sipgoCall, c
 				_ = callValue.outbound.Bye(cleanupCtx)
 				cleanupCancel()
 			}
-			r.emit(Event{Type: EventEnded, SessionID: callValue.sessionID, CallID: callValue.callID, Reason: "cancelled"})
-			r.removeCall(callValue.callID)
+			r.finishOutbound(callValue, Event{Type: EventEnded, SessionID: callValue.sessionID,
+				CallID: callValue.callID, Reason: "cancelled"})
 			return
 		}
 		status := 0
@@ -719,24 +732,25 @@ func (r *SIPGoRuntime) waitOutbound(ctx context.Context, callValue *sipgoCall, c
 		if errors.As(err, &responseError) && responseError.Res != nil {
 			status = responseError.Res.StatusCode
 		}
-		r.emit(Event{Type: EventFailed, SessionID: callValue.sessionID, CallID: callValue.callID, StatusCode: status, Reason: (AsteriskProfile{}).NormalizeFailure(status)})
-		r.removeCall(callValue.callID)
+		r.finishOutbound(callValue, Event{Type: EventFailed, SessionID: callValue.sessionID,
+			CallID: callValue.callID, StatusCode: status,
+			Reason: outboundFailureReason(status, err)})
 		return
 	}
 	ackCtx, ackCancel := context.WithTimeout(context.Background(), sipOperationTimeout)
 	err = callValue.outbound.Ack(ackCtx)
 	ackCancel()
 	if err != nil {
-		r.emit(Event{Type: EventFailed, SessionID: callValue.sessionID, CallID: callValue.callID, Reason: "ack_failed"})
-		r.removeCall(callValue.callID)
+		r.finishOutbound(callValue, Event{Type: EventFailed, SessionID: callValue.sessionID,
+			CallID: callValue.callID, Reason: "ack_failed"})
 		return
 	}
 	if context.Cause(ctx) != nil {
 		byeCtx, byeCancel := context.WithTimeout(context.Background(), sipOperationTimeout)
 		_ = callValue.outbound.Bye(byeCtx)
 		byeCancel()
-		r.emit(Event{Type: EventEnded, SessionID: callValue.sessionID, CallID: callValue.callID, Reason: "cancelled"})
-		r.removeCall(callValue.callID)
+		r.finishOutbound(callValue, Event{Type: EventEnded, SessionID: callValue.sessionID,
+			CallID: callValue.callID, Reason: "cancelled"})
 		return
 	}
 	callValue.setConnected()
@@ -745,6 +759,35 @@ func (r *SIPGoRuntime) waitOutbound(ctx context.Context, callValue *sipgoCall, c
 		StatusCode: callValue.outbound.InviteResponse.StatusCode,
 		RemoteSDP:  append([]byte(nil), callValue.outbound.InviteResponse.Body()...),
 	})
+}
+
+func outboundFailureReason(status int, err error) string {
+	if status != 0 {
+		return (AsteriskProfile{}).NormalizeFailure(status)
+	}
+	switch sipTransactionFailureKind(err) {
+	case "timeout":
+		return "no_answer"
+	case "transport":
+		return "provider_unavailable"
+	case "cancelled":
+		return "cancelled"
+	default:
+		return "sip_failed"
+	}
+}
+
+func (r *SIPGoRuntime) finishOutbound(callValue *sipgoCall, event Event) {
+	r.removeCallIfCurrent(callValue)
+	if callValue.outbound != nil {
+		_ = callValue.outbound.Close()
+	}
+	callValue.completeOutbound()
+	// Releasing the SIP dialog and unblocking a local hangup must not depend on
+	// the event consumer keeping up. The terminal event remains durable at the
+	// coordinator boundary, but a temporarily full runtime queue cannot retain
+	// a completed transaction or prevent an immediate redial.
+	r.emit(event)
 }
 
 func (r *SIPGoRuntime) registerOnce(ctx context.Context, session *sipgoSession, expires uint32) error {
@@ -1049,6 +1092,13 @@ func (c *sipgoCall) setConnected() {
 	c.mu.Lock()
 	c.connected = true
 	c.mu.Unlock()
+}
+
+func (c *sipgoCall) completeOutbound() {
+	if c.outboundDone == nil {
+		return
+	}
+	c.outboundDoneOnce.Do(func() { close(c.outboundDone) })
 }
 
 func (c *sipgoCall) completeInvite() {

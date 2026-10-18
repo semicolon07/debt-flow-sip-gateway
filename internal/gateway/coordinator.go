@@ -1650,6 +1650,8 @@ func failedEndReason(reason string) call.EndReason {
 		return call.EndCancelled
 	case "busy":
 		return call.EndBusy
+	case "rejected":
+		return call.EndRejected
 	case "no_answer":
 		return call.EndNoAnswer
 	default:

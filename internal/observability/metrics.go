@@ -2,6 +2,7 @@ package observability
 
 import (
 	"net/http"
+	"runtime"
 	"sync"
 	"time"
 
@@ -13,8 +14,11 @@ type Metrics struct {
 	Registry             *prometheus.Registry
 	Sessions             prometheus.Gauge
 	ConnectedSessions    prometheus.Gauge
+	SessionCapacityRatio prometheus.Gauge
 	Registrations        *prometheus.GaugeVec
 	Calls                *prometheus.GaugeVec
+	CallCapacityRatio    prometheus.Gauge
+	Ready                prometheus.Gauge
 	CallsEnded           *prometheus.CounterVec
 	CallSetupLatency     *prometheus.HistogramVec
 	Commands             *prometheus.CounterVec
@@ -73,6 +77,13 @@ type StorageStats struct {
 	MaxBytes                int64
 }
 
+type ProcessStats struct {
+	CPUSeconds          float64
+	ResidentMemoryBytes float64
+	VirtualMemoryBytes  float64
+	CPUCores            int
+}
+
 func NewMetrics() *Metrics {
 	registry := prometheus.NewRegistry()
 	metrics := &Metrics{
@@ -85,6 +96,10 @@ func NewMetrics() *Metrics {
 			Namespace: "debt_flow", Subsystem: "sip_gateway", Name: "connected_sessions",
 			Help: "Current gateway sessions with an attached WSS client.",
 		}),
+		SessionCapacityRatio: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "debt_flow", Subsystem: "sip_gateway", Name: "session_capacity_ratio",
+			Help: "Fraction of the configured authenticated-session limit currently in use.",
+		}),
 		Registrations: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: "debt_flow", Subsystem: "sip_gateway", Name: "registrations",
 			Help: "Current SIP registrations by bounded state.",
@@ -93,6 +108,14 @@ func NewMetrics() *Metrics {
 			Namespace: "debt_flow", Subsystem: "sip_gateway", Name: "calls",
 			Help: "Current calls by bounded state and direction.",
 		}, []string{"state", "direction"}),
+		CallCapacityRatio: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "debt_flow", Subsystem: "sip_gateway", Name: "call_capacity_ratio",
+			Help: "Fraction of the configured concurrent-call limit currently in use.",
+		}),
+		Ready: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "debt_flow", Subsystem: "sip_gateway", Name: "ready",
+			Help: "Whether the SIP Gateway runtime is ready to serve calls.",
+		}),
 		CallsEnded: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "debt_flow", Subsystem: "sip_gateway", Name: "calls_ended_total",
 			Help: "Terminal calls by bounded direction and normalized outcome.",
@@ -197,7 +220,8 @@ func NewMetrics() *Metrics {
 		}, []string{"operation"}),
 	}
 	registry.MustRegister(
-		metrics.Sessions, metrics.ConnectedSessions, metrics.Registrations, metrics.Calls,
+		metrics.Sessions, metrics.ConnectedSessions, metrics.SessionCapacityRatio,
+		metrics.Registrations, metrics.Calls, metrics.CallCapacityRatio, metrics.Ready,
 		metrics.CallsEnded, metrics.CallSetupLatency, metrics.Commands, metrics.Capabilities,
 		metrics.PeerConnections, metrics.ICERoutes, metrics.TURNAllocations, metrics.TURNQuotaUse,
 		metrics.TURNDenials, metrics.TURNBytes, metrics.WSSConnections, metrics.WSSWriterQueueDepth,
@@ -277,6 +301,12 @@ func (m *Metrics) SetRuntime(authenticated, connected int, registrations map[str
 	}
 }
 
+func (m *Metrics) SetCapacity(ready bool, sessions, maxSessions, calls, maxCalls int) {
+	m.Ready.Set(boolValue(ready))
+	m.SessionCapacityRatio.Set(ratio(int64(sessions), int64(maxSessions)))
+	m.CallCapacityRatio.Set(ratio(int64(calls), int64(maxCalls)))
+}
+
 func (m *Metrics) SetInfrastructure(peerConnections, wssConnections, writerQueue int) {
 	m.PeerConnections.Set(float64(peerConnections))
 	m.WSSConnections.Set(float64(wssConnections))
@@ -352,9 +382,39 @@ func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{})
 }
 
+func (m *Metrics) ProcessStats() (ProcessStats, error) {
+	result := ProcessStats{CPUCores: runtime.NumCPU()}
+	families, err := m.Registry.Gather()
+	if err != nil {
+		return result, err
+	}
+	for _, family := range families {
+		if len(family.Metric) == 0 {
+			continue
+		}
+		metric := family.Metric[0]
+		switch family.GetName() {
+		case "process_cpu_seconds_total":
+			result.CPUSeconds = metric.GetCounter().GetValue()
+		case "process_resident_memory_bytes":
+			result.ResidentMemoryBytes = metric.GetGauge().GetValue()
+		case "process_virtual_memory_bytes":
+			result.VirtualMemoryBytes = metric.GetGauge().GetValue()
+		}
+	}
+	return result, nil
+}
+
 func delta(current, previous uint64) float64 {
 	if current >= previous {
 		return float64(current - previous)
 	}
 	return float64(current)
+}
+
+func boolValue(value bool) float64 {
+	if value {
+		return 1
+	}
+	return 0
 }

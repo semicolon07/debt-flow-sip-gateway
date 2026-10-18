@@ -91,6 +91,76 @@
         "refId": "A"
       }],
       "gridPos": { "h": 8, "w": 10, "x": 14, "y": 24 }
+    },
+    {
+      "type": "stat",
+      "title": "Gateway readiness",
+      "fieldConfig": { "defaults": { "mappings": [{ "type": "value", "options": { "0": { "text": "NOT READY", "color": "red" }, "1": { "text": "READY", "color": "green" } } }], "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } } },
+      "targets": [{ "expr": "debt_flow_sip_gateway_ready", "refId": "A" }],
+      "gridPos": { "h": 6, "w": 4, "x": 0, "y": 32 }
+    },
+    {
+      "type": "stat",
+      "title": "Session capacity",
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 0.8 }, { "color": "red", "value": 0.9 }] } } },
+      "targets": [{ "expr": "debt_flow_sip_gateway_session_capacity_ratio", "refId": "A" }],
+      "gridPos": { "h": 6, "w": 4, "x": 4, "y": 32 }
+    },
+    {
+      "type": "stat",
+      "title": "Call capacity",
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 0.8 }, { "color": "red", "value": 0.9 }] } } },
+      "targets": [{ "expr": "debt_flow_sip_gateway_call_capacity_ratio", "refId": "A" }],
+      "gridPos": { "h": 6, "w": 4, "x": 8, "y": 32 }
+    },
+    {
+      "type": "timeseries",
+      "title": "SIP registrations",
+      "targets": [{ "expr": "debt_flow_sip_gateway_registrations", "legendFormat": "{{state}}", "refId": "A" }],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Process CPU",
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0 } },
+      "targets": [{ "expr": "rate(process_cpu_seconds_total[5m]) / go_sched_gomaxprocs_threads", "legendFormat": "CPU", "refId": "A" }],
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 40 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Process memory",
+      "fieldConfig": { "defaults": { "unit": "bytes", "min": 0 } },
+      "targets": [
+        { "expr": "process_resident_memory_bytes", "legendFormat": "working set", "refId": "A" },
+        { "expr": "go_memstats_heap_alloc_bytes", "legendFormat": "Go heap", "refId": "B" },
+        { "expr": "go_memstats_sys_bytes", "legendFormat": "Go system", "refId": "C" }
+      ],
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 40 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Call outcomes",
+      "targets": [{ "expr": "sum by (direction, outcome) (rate(debt_flow_sip_gateway_calls_ended_total[5m]))", "legendFormat": "{{direction}} {{outcome}}", "refId": "A" }],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 }
+    },
+    {
+      "type": "timeseries",
+      "title": "WSS disconnects and failed commands",
+      "targets": [
+        { "expr": "sum by (reason) (rate(debt_flow_sip_gateway_wss_disconnects_total[5m]))", "legendFormat": "WSS {{reason}}", "refId": "A" },
+        { "expr": "sum by (type) (rate(debt_flow_sip_gateway_commands_total{outcome=\"failed\"}[5m]))", "legendFormat": "command {{type}}", "refId": "B" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 }
+    },
+    {
+      "type": "timeseries",
+      "title": "SQLite and durable outbox storage",
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "targets": [
+        { "expr": "debt_flow_sip_gateway_sqlite_database_bytes", "legendFormat": "database", "refId": "A" },
+        { "expr": "debt_flow_sip_gateway_sqlite_wal_bytes", "legendFormat": "WAL", "refId": "B" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 }
     }
   ],
   "schemaVersion": 39,
@@ -100,5 +170,5 @@
   "timezone": "browser",
   "title": "Debt Flow SIP Gateway",
   "uid": "debt-flow-sip-gateway",
-  "version": 1
+  "version": 2
 }
