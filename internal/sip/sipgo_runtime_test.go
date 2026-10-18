@@ -236,6 +236,157 @@ func TestOutboundHangupWaitsForCancelCompletionAndAllowsImmediateRedial(t *testi
 	}
 }
 
+func TestOutboundRingingWithoutFinalResponseTimesOutAndAllowsImmediateRedial(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	runtime.cfg.OutboundTimeout = 50 * time.Millisecond
+
+	const firstCallID = "outbound-timeout-1"
+	if err := runtime.StartCall(context.Background(), "session-1", firstCallID, "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatal(err)
+	}
+	invite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	writeSIPResponse(t, peer, gateway, invite, 180, "Ringing", "timeout-test")
+	if event := readRuntimeEvent(t, runtime, EventRinging); event.CallID != firstCallID {
+		t.Fatalf("ringing event=%+v", event)
+	}
+
+	failed := readRuntimeEvent(t, runtime, EventFailed)
+	if failed.CallID != firstCallID || failed.Reason != "no_answer" {
+		t.Fatalf("timeout event=%+v", failed)
+	}
+	if _, err := runtime.call("session-1", firstCallID); err == nil {
+		t.Fatal("timed-out outbound call still retained the session call slot")
+	}
+
+	// A missing final response must not retain an application-level call lock,
+	// even while the old SIP transaction completes its CANCEL handshake.
+	const secondCallID = "outbound-timeout-2"
+	if err := runtime.StartCall(context.Background(), "session-1", secondCallID, "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatalf("immediate redial after timeout failed: %v", err)
+	}
+	secondInvite, secondGateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	writeSIPResponse(t, peer, secondGateway, secondInvite, 603, "Decline", "timeout-redial")
+	_, _ = readSIPRequestFromContaining(t, peer, "ACK ")
+	secondFailed := readRuntimeEvent(t, runtime, EventFailed)
+	if secondFailed.CallID != secondCallID || secondFailed.Reason != "rejected" {
+		t.Fatalf("redial terminal event=%+v", secondFailed)
+	}
+}
+
+func TestOutboundLateAnswerAfterTimeoutIsAckedAndEndedWithBye(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	runtime.cfg.OutboundTimeout = 50 * time.Millisecond
+
+	const callID = "outbound-timeout-late-answer"
+	if err := runtime.StartCall(context.Background(), "session-1", callID, "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatal(err)
+	}
+	callValue, err := runtime.call("session-1", callID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	writeSIPResponse(t, peer, gateway, invite, 180, "Ringing", "timeout-late-answer")
+	_ = readRuntimeEvent(t, runtime, EventRinging)
+	failed := readRuntimeEvent(t, runtime, EventFailed)
+	if failed.CallID != callID || failed.Reason != "no_answer" {
+		t.Fatalf("timeout event=%+v", failed)
+	}
+
+	cancelRequest, gateway := readSIPRequestFromContaining(t, peer, "CANCEL ")
+	writeSIPResponse(t, peer, gateway, cancelRequest, 200, "OK", "timeout-late-answer")
+	writeSIPResponseWithBody(t, peer, gateway, invite, 200, "OK", "timeout-late-answer", testInboundSDP)
+	_, _ = readSIPRequestFromContaining(t, peer, "ACK ")
+	bye, gateway := readSIPRequestFromContaining(t, peer, "BYE ")
+	writeSIPResponse(t, peer, gateway, bye, 200, "OK", "timeout-late-answer")
+	select {
+	case <-callValue.outboundDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("late answer after timeout did not complete ACK/BYE cleanup")
+	}
+	select {
+	case event := <-runtime.Events():
+		if event.Type == EventConnected {
+			t.Fatalf("late answer resurrected timed-out call: %+v", event)
+		}
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestOutboundFinalResponseAndTimeoutAreIsolatedAcrossSessions(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	runtime.cfg.OutboundTimeout = 100 * time.Millisecond
+	peerPort := peer.LocalAddr().(*net.UDPAddr).Port
+	if err := runtime.Configure(context.Background(), "session-2", Configuration{
+		Host: "127.0.0.1", Port: uint16(peerPort), Transport: TransportUDP,
+		Username: "1130", Password: "secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.setRegistered("session-2", true)
+
+	if err := runtime.StartCall(context.Background(), "session-1", "session-1-timeout", "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatal(err)
+	}
+	firstInvite, firstGateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	writeSIPResponse(t, peer, firstGateway, firstInvite, 180, "Ringing", "session-one")
+	if event := readRuntimeEvent(t, runtime, EventRinging); event.CallID != "session-1-timeout" {
+		t.Fatalf("session 1 ringing event=%+v", event)
+	}
+
+	if err := runtime.StartCall(context.Background(), "session-2", "session-2-decline", "9002", []byte(testInboundSDP)); err != nil {
+		t.Fatal(err)
+	}
+	secondInvite, secondGateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	writeSIPResponse(t, peer, secondGateway, secondInvite, 180, "Ringing", "session-two")
+	if event := readRuntimeEvent(t, runtime, EventRinging); event.CallID != "session-2-decline" {
+		t.Fatalf("session 2 ringing event=%+v", event)
+	}
+	writeSIPResponse(t, peer, secondGateway, secondInvite, 603, "Decline", "session-two")
+	_, _ = readSIPRequestFromContaining(t, peer, "ACK ")
+	declined := readRuntimeEvent(t, runtime, EventFailed)
+	if declined.SessionID != "session-2" || declined.CallID != "session-2-decline" || declined.Reason != "rejected" {
+		t.Fatalf("session 2 terminal event=%+v", declined)
+	}
+
+	timedOut := readRuntimeEvent(t, runtime, EventFailed)
+	if timedOut.SessionID != "session-1" || timedOut.CallID != "session-1-timeout" || timedOut.Reason != "no_answer" {
+		t.Fatalf("session 1 terminal event=%+v", timedOut)
+	}
+}
+
+func TestTransportLevelFinalResponseFallbackEndsCallWhenTransactionDoesNotMatch(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	runtime.cfg.OutboundTimeout = 2 * time.Second
+
+	const callID = "outbound-unmatched-final"
+	if err := runtime.StartCall(context.Background(), "session-1", callID, "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatal(err)
+	}
+	invite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	writeSIPResponse(t, peer, gateway, invite, 180, "Ringing", "unmatched-final")
+	if event := readRuntimeEvent(t, runtime, EventRinging); event.CallID != callID {
+		t.Fatalf("ringing event=%+v", event)
+	}
+
+	// Preserve Call-ID/CSeq but deliberately change the Via branch. sipgo's
+	// transaction layer cannot match this response, while the transport-level
+	// fallback can still safely correlate it to this exact active call.
+	response := buildResponseForRequest(invite, 603, "Decline")
+	response = strings.Replace(response,
+		"Via: "+headerValue(invite, "Via")+"\r\n",
+		"Via: SIP/2.0/UDP 127.0.0.1:9;branch=z9hG4bK-unmatched-final;rport\r\n", 1)
+	if _, err := peer.WriteTo([]byte(response), gateway); err != nil {
+		t.Fatal(err)
+	}
+
+	failed := readRuntimeEvent(t, runtime, EventFailed)
+	if failed.CallID != callID || failed.StatusCode != 603 || failed.Reason != "rejected" {
+		t.Fatalf("transport fallback event=%+v", failed)
+	}
+	waitForCallRemoval(t, runtime, "session-1", callID)
+}
+
 func TestOutboundFinalResponsesEndRingingAndAllowImmediateRedial(t *testing.T) {
 	tests := []struct {
 		status int

@@ -140,6 +140,12 @@ Gateway-to-existing-durable-contract normalization
 - outbound `404/408/480/486/487/488/500/503/600/603` ถูก ACK, แปลง end reason แบบ canonical และ
   terminalize ringing เพียงครั้งเดียว; transaction timeout เป็น `no_answer` และ transport failure เป็น
   `provider_unavailable`
+- เพิ่ม application answer deadline 60 วินาที เพราะ SIP INVITE Timer B ของ library หยุดหลังได้รับ provisional
+  response; เมื่อ final response สูญหาย Gateway จะ terminalize เป็น `no_answer`, ปล่อย call slot ทันที และทำ
+  CANCEL cleanup ต่อเบื้องหลัง พร้อม correlation log `sessionId + callId + callRef` โดยไม่เก็บ PII/raw SIP
+- เทียบ Desktop Agent แล้วเพิ่ม transport-level final-response fallback สำหรับ INVITE `4xx-6xx` (ยกเว้น
+  digest challenge `401/407`) เพื่อจบสายได้แม้ response เข้าถึง socket แต่ transaction callback ไม่ทำงาน;
+  fallback จับคู่ exact SIP Call-ID และแยก state/timeout ต่อ session โดยไม่ block transport read loop
 - เพิ่ม real UDP integration regression สำหรับ local CANCEL, local/remote BYE, late answer หลัง CANCEL,
   final-response matrix และ immediate same-destination redial; เพิ่ม SIPp `outbound-decline` สำหรับ
   `180 → 603 → ACK`

@@ -26,6 +26,7 @@ type SIPGoConfig struct {
 	AdvertisedIP      string
 	UserAgent         string
 	EventBuffer       int
+	OutboundTimeout   time.Duration
 	CanAcceptIncoming func(sessionID string) bool
 	Logger            *slog.Logger
 	Debug             bool
@@ -68,9 +69,12 @@ type sipgoCall struct {
 	inviteDoneOnce       sync.Once
 	outboundDone         chan struct{}
 	outboundDoneOnce     sync.Once
+	outboundResolveOnce  sync.Once
+	outboundTerminalOnce sync.Once
 	sessionID            string
 	callID               string
 	sipCallID            string
+	outboundContext      context.Context
 	outbound             *sipgo.DialogClientSession
 	inbound              *sipgo.DialogServerSession
 	cancel               context.CancelCauseFunc
@@ -81,9 +85,12 @@ type sipgoCall struct {
 }
 
 const (
-	sipOperationTimeout  = 10 * time.Second
-	inboundInviteTimeout = 2 * time.Minute
+	sipOperationTimeout   = 10 * time.Second
+	outboundAnswerTimeout = 60 * time.Second
+	inboundInviteTimeout  = 2 * time.Minute
 )
+
+var errOutboundAnswerTimeout = errors.New("outbound answer timeout")
 
 func NewSIPGoRuntime(cfg SIPGoConfig) (*SIPGoRuntime, error) {
 	if cfg.ListenUDP == "" || cfg.ListenTCP == "" || net.ParseIP(cfg.AdvertisedIP) == nil {
@@ -94,6 +101,9 @@ func NewSIPGoRuntime(cfg SIPGoConfig) (*SIPGoRuntime, error) {
 	}
 	if cfg.EventBuffer <= 0 {
 		cfg.EventBuffer = 1024
+	}
+	if cfg.OutboundTimeout <= 0 {
+		cfg.OutboundTimeout = outboundAnswerTimeout
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -174,6 +184,12 @@ func NewSIPGoRuntime(cfg SIPGoConfig) (*SIPGoRuntime, error) {
 		udpConn: udpConn, tcpListen: tcpListener,
 		logger: cfg.Logger,
 	}
+	// Observe parsed transport messages after the transaction layer. This is a
+	// safety net for a final INVITE response that reaches the socket but is not
+	// delivered to DialogClientSession.WaitAnswer (for example, an upstream Via
+	// rewrite that prevents transaction matching). The desktop Agent has the
+	// same transport-level lifecycle fallback.
+	ua.TransportLayer().OnMessage(runtime.observeTransportMessage)
 	runtime.installHandlers()
 	runtime.ready.Store(true)
 	go runtime.serveUDP()
@@ -296,7 +312,8 @@ func (r *SIPGoRuntime) StartCall(ctx context.Context, sessionID, callID, destina
 	}
 	callValue := &sipgoCall{
 		sessionID: sessionID, callID: callID, sipCallID: sipCallID,
-		outbound: dialog, cancel: cancel, outboundDone: make(chan struct{}),
+		outboundContext: callCtx, outbound: dialog, cancel: cancel,
+		outboundDone: make(chan struct{}),
 	}
 	r.mu.Lock()
 	r.calls[callID] = callValue
@@ -304,6 +321,9 @@ func (r *SIPGoRuntime) StartCall(ctx context.Context, sessionID, callID, destina
 		r.sipCallID[sipCallID] = callID
 	}
 	r.mu.Unlock()
+	r.logger.Info("outbound SIP call started",
+		"sessionId", sessionID, "callId", callID,
+		"callRef", shortSIPCallRef(sipCallID))
 	go r.runOutbound(callCtx, callValue, session.configuration)
 	return nil
 }
@@ -313,6 +333,27 @@ func (r *SIPGoRuntime) runOutbound(
 	callValue *sipgoCall,
 	configuration Configuration,
 ) {
+	callRef := shortSIPCallRef(callValue.sipCallID)
+	answerTimer := time.AfterFunc(r.cfg.OutboundTimeout, func() {
+		// A SIP INVITE transaction stops its built-in Timer B after the first
+		// provisional response. Without an application deadline, a lost final
+		// response after 180 Ringing can therefore retain the call forever.
+		if context.Cause(ctx) != nil || !callValue.claimOutboundResolution() {
+			return
+		}
+		callValue.cancel(errOutboundAnswerTimeout)
+		r.logger.Warn("outbound SIP call timed out while ringing",
+			"sessionId", callValue.sessionID, "callId", callValue.callID,
+			"callRef", callRef, "timeout", r.cfg.OutboundTimeout,
+			"reason", "no_answer")
+		// Publish and release the application call immediately. WaitAnswer may
+		// remain alive briefly to complete the RFC 3261 CANCEL/487 handshake;
+		// it performs the physical dialog cleanup when that wait finishes.
+		r.terminalizeOutbound(callValue, Event{Type: EventFailed,
+			SessionID: callValue.sessionID, CallID: callValue.callID,
+			Reason: "no_answer"})
+	})
+	defer answerTimer.Stop()
 	defer func() {
 		if recover() == nil {
 			return
@@ -321,7 +362,9 @@ func (r *SIPGoRuntime) runOutbound(
 		// never the entire Windows service. Do not log the recovered value because
 		// third-party parser panics can contain raw SIP headers or credentials.
 		r.logger.Error("outbound SIP transaction recovered from panic",
-			"callId", callValue.callID, "reason", "sip_transaction_panic")
+			"sessionId", callValue.sessionID, "callId", callValue.callID,
+			"callRef", callRef, "reason", "sip_transaction_panic")
+		callValue.claimOutboundResolution()
 		r.finishOutbound(callValue, Event{Type: EventFailed, SessionID: callValue.sessionID,
 			CallID: callValue.callID, Reason: "sip_failed"})
 	}()
@@ -511,6 +554,44 @@ func (r *SIPGoRuntime) installHandlers() {
 	r.server.OnNoRoute(func(request *sipmessage.Request, tx sipmessage.ServerTransaction) {
 		_ = tx.Respond(sipmessage.NewResponseFromRequest(request, sipmessage.StatusMethodNotAllowed, "Method Not Allowed", nil))
 	})
+}
+
+func (r *SIPGoRuntime) observeTransportMessage(message sipmessage.Message) {
+	response, ok := message.(*sipmessage.Response)
+	if !ok || response == nil || response.StatusCode < 400 || response.StatusCode > 699 ||
+		response.StatusCode == sipmessage.StatusUnauthorized ||
+		response.StatusCode == sipmessage.StatusProxyAuthRequired {
+		return
+	}
+	cseq := response.CSeq()
+	if cseq == nil || cseq.MethodName != sipmessage.INVITE {
+		return
+	}
+	callValue := r.callBySIPMessage(response)
+	if callValue == nil || callValue.outbound == nil {
+		return
+	}
+	callRef := sipMessageRef(response)
+	// TransportLayer invokes observers synchronously. Never persist/publish from
+	// its read loop or one slow consumer could stall SIP traffic for all sessions.
+	go r.handleTransportFinalResponse(callValue, response.StatusCode, callRef)
+}
+
+func (r *SIPGoRuntime) handleTransportFinalResponse(callValue *sipgoCall, statusCode int, callRef string) {
+	if callValue.outboundContext != nil && context.Cause(callValue.outboundContext) != nil ||
+		!callValue.claimOutboundResolution() {
+		return
+	}
+	reason := outboundFailureReason(statusCode, nil)
+	r.logger.Info("transport-level outbound SIP final response received",
+		"sessionId", callValue.sessionID, "callId", callValue.callID,
+		"callRef", callRef, "sipStatusCode", statusCode,
+		"reason", reason)
+	// terminalizeOutbound removes the Call-ID mapping before cancelling the
+	// waiter, so retransmissions cannot affect a subsequent call/session.
+	r.terminalizeOutbound(callValue, Event{Type: EventFailed,
+		SessionID: callValue.sessionID, CallID: callValue.callID,
+		StatusCode: statusCode, Reason: reason})
 }
 
 func (r *SIPGoRuntime) onInvite(request *sipmessage.Request, tx sipmessage.ServerTransaction) {
@@ -733,6 +814,7 @@ func sipTransactionFailureKind(err error) string {
 }
 
 func (r *SIPGoRuntime) waitOutbound(ctx context.Context, callValue *sipgoCall, configuration Configuration) {
+	callRef := shortSIPCallRef(callValue.sipCallID)
 	err := callValue.outbound.WaitAnswer(ctx, sipgo.AnswerOptions{
 		Username: configuration.Username, Password: configuration.Password,
 		OnResponse: func(response *sipmessage.Response) error {
@@ -741,22 +823,41 @@ func (r *SIPGoRuntime) waitOutbound(ctx context.Context, callValue *sipgoCall, c
 			}
 			switch response.StatusCode {
 			case sipmessage.StatusTrying:
-				r.logger.Debug("outbound SIP provisional response", "callId", callValue.callID,
+				r.logger.Debug("outbound SIP provisional response",
+					"sessionId", callValue.sessionID, "callId", callValue.callID,
+					"callRef", callRef,
 					"sipStatusCode", response.StatusCode)
 				r.emit(Event{Type: EventTrying, SessionID: callValue.sessionID, CallID: callValue.callID, StatusCode: response.StatusCode})
 			case sipmessage.StatusRinging, sipmessage.StatusSessionInProgress:
-				r.logger.Debug("outbound SIP provisional response", "callId", callValue.callID,
+				r.logger.Info("outbound SIP call is progressing",
+					"sessionId", callValue.sessionID, "callId", callValue.callID,
+					"callRef", callRef,
 					"sipStatusCode", response.StatusCode)
 				r.emit(Event{Type: EventRinging, SessionID: callValue.sessionID, CallID: callValue.callID, StatusCode: response.StatusCode})
 			default:
 				if !response.IsProvisional() {
-					r.logger.Info("outbound SIP final response received", "callId", callValue.callID,
+					r.logger.Info("outbound SIP final response received",
+						"sessionId", callValue.sessionID, "callId", callValue.callID,
+						"callRef", callRef,
 						"sipStatusCode", response.StatusCode)
 				}
 			}
 			return nil
 		},
 	})
+	if !callValue.claimOutboundResolution() {
+		// The application timeout already released this call. A success response
+		// racing that deadline still needs ACK + BYE so the PBX cannot retain a
+		// half-open dialog, but it must not resurrect the browser call state.
+		if callValue.outbound.InviteResponse != nil && callValue.outbound.InviteResponse.IsSuccess() {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), sipOperationTimeout)
+			_ = callValue.outbound.Ack(cleanupCtx)
+			_ = callValue.outbound.Bye(cleanupCtx)
+			cleanupCancel()
+		}
+		r.cleanupOutbound(callValue)
+		return
+	}
 	if err != nil {
 		if context.Cause(ctx) != nil {
 			// RFC 3261 requires a late 2xx response after local CANCEL to be
@@ -777,7 +878,9 @@ func (r *SIPGoRuntime) waitOutbound(ctx context.Context, callValue *sipgoCall, c
 			status = responseError.Res.StatusCode
 		}
 		reason := outboundFailureReason(status, err)
-		r.logger.Info("outbound SIP call ended before answer", "callId", callValue.callID,
+		r.logger.Info("outbound SIP call ended before answer",
+			"sessionId", callValue.sessionID, "callId", callValue.callID,
+			"callRef", callRef,
 			"sipStatusCode", status, "reason", reason,
 			"failureKind", sipTransactionFailureKind(err))
 		r.finishOutbound(callValue, Event{Type: EventFailed, SessionID: callValue.sessionID,
@@ -802,7 +905,9 @@ func (r *SIPGoRuntime) waitOutbound(ctx context.Context, callValue *sipgoCall, c
 		return
 	}
 	callValue.setConnected()
-	r.logger.Info("outbound SIP call answered", "callId", callValue.callID,
+	r.logger.Info("outbound SIP call answered",
+		"sessionId", callValue.sessionID, "callId", callValue.callID,
+		"callRef", callRef,
 		"sipStatusCode", callValue.outbound.InviteResponse.StatusCode)
 	r.emit(Event{
 		Type: EventConnected, SessionID: callValue.sessionID, CallID: callValue.callID,
@@ -828,16 +933,24 @@ func outboundFailureReason(status int, err error) string {
 }
 
 func (r *SIPGoRuntime) finishOutbound(callValue *sipgoCall, event Event) {
-	r.removeCallIfCurrent(callValue)
+	r.terminalizeOutbound(callValue, event)
+	r.cleanupOutbound(callValue)
+}
+
+func (r *SIPGoRuntime) terminalizeOutbound(callValue *sipgoCall, event Event) {
+	callValue.outboundTerminalOnce.Do(func() {
+		r.removeCallIfCurrent(callValue)
+		// Releasing the application call must not depend on the event consumer
+		// keeping up. The coordinator persists the terminal event durably.
+		r.emit(event)
+	})
+}
+
+func (r *SIPGoRuntime) cleanupOutbound(callValue *sipgoCall) {
 	if callValue.outbound != nil {
 		_ = callValue.outbound.Close()
 	}
 	callValue.completeOutbound()
-	// Releasing the SIP dialog and unblocking a local hangup must not depend on
-	// the event consumer keeping up. The terminal event remains durable at the
-	// coordinator boundary, but a temporarily full runtime queue cannot retain
-	// a completed transaction or prevent an immediate redial.
-	r.emit(event)
 }
 
 func (r *SIPGoRuntime) registerOnce(ctx context.Context, session *sipgoSession, expires uint32) error {
@@ -1087,7 +1200,14 @@ func (r *SIPGoRuntime) call(sessionID, callID string) (*sipgoCall, error) {
 }
 
 func (r *SIPGoRuntime) callBySIPRequest(request *sipmessage.Request) *sipgoCall {
-	header := request.CallID()
+	return r.callBySIPMessage(request)
+}
+
+func (r *SIPGoRuntime) callBySIPMessage(message sipmessage.Message) *sipgoCall {
+	if message == nil {
+		return nil
+	}
+	header := message.CallID()
 	if header == nil {
 		return nil
 	}
@@ -1149,6 +1269,12 @@ func (c *sipgoCall) completeOutbound() {
 		return
 	}
 	c.outboundDoneOnce.Do(func() { close(c.outboundDone) })
+}
+
+func (c *sipgoCall) claimOutboundResolution() bool {
+	claimed := false
+	c.outboundResolveOnce.Do(func() { claimed = true })
+	return claimed
 }
 
 func (c *sipgoCall) completeInvite() {

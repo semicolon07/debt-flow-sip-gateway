@@ -68,6 +68,20 @@ Gateway รุ่นที่แก้แล้วต้องไม่แสด
 - แยก command type และ error code จาก sanitized log แล้วตรวจ capability, media readiness, SIP response และ outbox
 - เปรียบเทียบ inbound/outbound, direct/TURN และ PBX response ก่อน restart เพื่อไม่ทำลายหลักฐาน
 
+## Outbound ค้างที่ ringing หลังปลายทางวางสาย
+
+- ที่ระดับ `info` ให้จับคู่ `sessionId`, `callId` และ `callRef` ตั้งแต่ `outbound SIP call started`,
+  `outbound SIP call is progressing` จนถึง final response หรือ timeout; `callRef` เป็น hash และไม่มีเบอร์โทร
+- ถ้ามี `outbound SIP final response received` หรือ `transport-level outbound SIP final response received`
+  ระบบต้องตามด้วย terminal event และปล่อย call slot ทันที
+- ถ้าไม่มี final response หลัง provisional response ระบบจะจบเป็น `no_answer` ภายใน 60 วินาทีและปล่อยให้
+  โทรซ้ำได้ โดย transaction เดิมจะทำ SIP CANCEL cleanup ต่อเบื้องหลัง
+- ถ้าผู้ใช้กดตัดที่ปลายทางแต่ต้องรอ timeout ให้เปิด `logging.level: "debug"` ชั่วคราว แล้วค้น
+  `SIP wire message` ด้วย `callRef`: ไม่มี response ขาเข้าให้ตรวจ PBX/NAT/firewall; มี response ขาเข้าแต่ไม่มี
+  application final-response log ให้เก็บ diagnostics เพื่อวิเคราะห์ transaction matching
+- ห้ามเปิด raw SIP logging ใน production เพราะอาจมีหมายเลข, SDP และ Authorization; หลัง reproduce ให้คืน
+  `logging.level: "info"`
+
 ## WSS disconnect spike
 
 - alert ตัด `client_closed` และ `runtime_closed` ปกติออก แล้วตรวจ network/heartbeat/writer overflow reasons ที่เหลือ
