@@ -101,8 +101,9 @@ identity หรือ active key ตั้งค่าไม่ครบ/ไม�
 
 Operational JSON logs ออกทั้ง console และ rotating file ตาม `logging.path` ให้ใช้
 `logging.level: "info"` ใน production และเปลี่ยนเป็น `"debug"` ชั่วคราวเฉพาะตอน reproduce ปัญหา
-inbound จากนั้นคืนเป็น `"info"` แล้ว restart service ระดับ debug เพิ่มเฉพาะ sanitized decision events;
-Gateway จะไม่เขียน raw SIP, Authorization, SDP, capability/SIP credential, ICE/TURN credential,
+inbound/outbound จากนั้นคืนเป็น `"info"` แล้ว restart service ระดับ debug เพิ่ม sanitized SIP transaction
+metadata เช่นทิศทาง, method, status, CSeq และ hashed Call-ID เท่านั้น Gateway จะไม่เขียน raw SIP,
+ต้นทาง/ปลายทาง, URI/เบอร์โทร, Authorization, SDP, capability/SIP credential, ICE/TURN credential,
 DTMF หรือ media content
 
 รันจาก elevated PowerShell เมื่อต้องส่งข้อมูลให้ทีม support:

@@ -2,8 +2,6 @@ package sip
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -30,6 +28,7 @@ type SIPGoConfig struct {
 	EventBuffer       int
 	CanAcceptIncoming func(sessionID string) bool
 	Logger            *slog.Logger
+	Debug             bool
 }
 
 type SIPGoRuntime struct {
@@ -110,7 +109,10 @@ func NewSIPGoRuntime(cfg SIPGoConfig) (*SIPGoRuntime, error) {
 	}
 	silent := slog.New(slog.NewTextHandler(io.Discard, nil))
 	configureSIPGoLoggingOnce.Do(func() {
-		sipmessage.SIPDebug = false
+		sipmessage.SIPDebug = cfg.Debug
+		if cfg.Debug {
+			sipmessage.SIPDebugTracer(&sanitizedSIPTracer{logger: cfg.Logger})
+		}
 		sipmessage.SetDefaultLogger(silent)
 	})
 	ua, err := sipgo.NewUA(
@@ -291,8 +293,28 @@ func (r *SIPGoRuntime) StartCall(ctx context.Context, sessionID, callID, destina
 		r.sipCallID[sipCallID] = callID
 	}
 	r.mu.Unlock()
-	go r.waitOutbound(callCtx, callValue, session.configuration)
+	go r.runOutbound(callCtx, callValue, session.configuration)
 	return nil
+}
+
+func (r *SIPGoRuntime) runOutbound(
+	ctx context.Context,
+	callValue *sipgoCall,
+	configuration Configuration,
+) {
+	defer func() {
+		if recover() == nil {
+			return
+		}
+		// A malformed or unexpectedly closed transaction must fail only this call,
+		// never the entire Windows service. Do not log the recovered value because
+		// third-party parser panics can contain raw SIP headers or credentials.
+		r.logger.Error("outbound SIP transaction recovered from panic",
+			"callId", callValue.callID, "reason", "sip_transaction_panic")
+		r.finishOutbound(callValue, Event{Type: EventFailed, SessionID: callValue.sessionID,
+			CallID: callValue.callID, Reason: "sip_failed"})
+	}()
+	r.waitOutbound(ctx, callValue, configuration)
 }
 
 func (r *SIPGoRuntime) Answer(_ context.Context, sessionID, callID string, localSDP []byte) error {
@@ -675,8 +697,7 @@ func sipRequestRef(request *sipmessage.Request) string {
 	if header == nil || header.Value() == "" {
 		return "unavailable"
 	}
-	sum := sha256.Sum256([]byte(header.Value()))
-	return hex.EncodeToString(sum[:6])
+	return shortSIPCallRef(header.Value())
 }
 
 func sipTransactionFailureKind(err error) string {
@@ -704,11 +725,23 @@ func (r *SIPGoRuntime) waitOutbound(ctx context.Context, callValue *sipgoCall, c
 	err := callValue.outbound.WaitAnswer(ctx, sipgo.AnswerOptions{
 		Username: configuration.Username, Password: configuration.Password,
 		OnResponse: func(response *sipmessage.Response) error {
+			if response == nil {
+				return errors.New("SIP transaction returned an empty response")
+			}
 			switch response.StatusCode {
 			case sipmessage.StatusTrying:
+				r.logger.Debug("outbound SIP provisional response", "callId", callValue.callID,
+					"sipStatusCode", response.StatusCode)
 				r.emit(Event{Type: EventTrying, SessionID: callValue.sessionID, CallID: callValue.callID, StatusCode: response.StatusCode})
 			case sipmessage.StatusRinging, sipmessage.StatusSessionInProgress:
+				r.logger.Debug("outbound SIP provisional response", "callId", callValue.callID,
+					"sipStatusCode", response.StatusCode)
 				r.emit(Event{Type: EventRinging, SessionID: callValue.sessionID, CallID: callValue.callID, StatusCode: response.StatusCode})
+			default:
+				if !response.IsProvisional() {
+					r.logger.Info("outbound SIP final response received", "callId", callValue.callID,
+						"sipStatusCode", response.StatusCode)
+				}
 			}
 			return nil
 		},
@@ -732,9 +765,13 @@ func (r *SIPGoRuntime) waitOutbound(ctx context.Context, callValue *sipgoCall, c
 		if errors.As(err, &responseError) && responseError.Res != nil {
 			status = responseError.Res.StatusCode
 		}
+		reason := outboundFailureReason(status, err)
+		r.logger.Info("outbound SIP call ended before answer", "callId", callValue.callID,
+			"sipStatusCode", status, "reason", reason,
+			"failureKind", sipTransactionFailureKind(err))
 		r.finishOutbound(callValue, Event{Type: EventFailed, SessionID: callValue.sessionID,
 			CallID: callValue.callID, StatusCode: status,
-			Reason: outboundFailureReason(status, err)})
+			Reason: reason})
 		return
 	}
 	ackCtx, ackCancel := context.WithTimeout(context.Background(), sipOperationTimeout)
@@ -754,6 +791,8 @@ func (r *SIPGoRuntime) waitOutbound(ctx context.Context, callValue *sipgoCall, c
 		return
 	}
 	callValue.setConnected()
+	r.logger.Info("outbound SIP call answered", "callId", callValue.callID,
+		"sipStatusCode", callValue.outbound.InviteResponse.StatusCode)
 	r.emit(Event{
 		Type: EventConnected, SessionID: callValue.sessionID, CallID: callValue.callID,
 		StatusCode: callValue.outbound.InviteResponse.StatusCode,

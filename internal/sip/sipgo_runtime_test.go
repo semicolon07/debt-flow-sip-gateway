@@ -221,6 +221,39 @@ func TestOutboundFinalResponsesEndRingingAndAllowImmediateRedial(t *testing.T) {
 	}
 }
 
+func TestOutboundDeclineDoesNotBlockImmediateCallFromAnotherSession(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	peerPort := peer.LocalAddr().(*net.UDPAddr).Port
+	if err := runtime.Configure(context.Background(), "session-2", Configuration{
+		Host: "127.0.0.1", Port: uint16(peerPort), Transport: TransportUDP,
+		Username: "1130", Password: "secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.setRegistered("session-2", true)
+
+	if err := runtime.StartCall(context.Background(), "session-1", "cross-session-1", "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatal(err)
+	}
+	invite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	writeSIPResponse(t, peer, gateway, invite, 180, "Ringing", "cross-session-decline")
+	_ = readRuntimeEvent(t, runtime, EventRinging)
+	writeSIPResponse(t, peer, gateway, invite, 603, "Decline", "cross-session-decline")
+	_, _ = readSIPRequestFromContaining(t, peer, "ACK ")
+	failed := readRuntimeEvent(t, runtime, EventFailed)
+	if failed.StatusCode != 603 || failed.Reason != "rejected" {
+		t.Fatalf("terminal event=%+v", failed)
+	}
+
+	if err := runtime.StartCall(context.Background(), "session-2", "cross-session-2", "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatalf("cross-session immediate call failed: %v", err)
+	}
+	secondInvite, _ := readSIPRequestFromContaining(t, peer, "INVITE ")
+	if headerValue(secondInvite, "Call-ID") == headerValue(invite, "Call-ID") {
+		t.Fatal("cross-session call reused completed SIP Call-ID")
+	}
+}
+
 func TestOutboundTransactionFailuresUseStableEndReasons(t *testing.T) {
 	for _, test := range []struct {
 		err  error

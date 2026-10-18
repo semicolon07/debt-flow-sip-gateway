@@ -205,7 +205,7 @@ func RunWithVersion(ctx context.Context, cfg config.Config, version string) erro
 		sipRuntime, err = sip.NewSIPGoRuntime(sip.SIPGoConfig{
 			ListenUDP: cfg.SIP.ListenUDP, ListenTCP: cfg.SIP.ListenTCP,
 			AdvertisedIP: cfg.SIP.RTPAdvertisedIP, UserAgent: "DebtFlowSipGateway/1",
-			Logger: logger,
+			Logger: logger, Debug: cfg.Logging.Level == "debug",
 			CanAcceptIncoming: func(sessionID string) bool {
 				return coordinator != nil && coordinator.CanAcceptIncoming(sessionID)
 			},
