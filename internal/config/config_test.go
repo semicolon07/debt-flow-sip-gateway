@@ -40,6 +40,27 @@ func TestValidateRejectsPublicHTTPListener(t *testing.T) {
 	}
 }
 
+func TestValidateLoggingLevels(t *testing.T) {
+	for _, level := range []string{"debug", "info", "warn", "error"} {
+		t.Run(level, func(t *testing.T) {
+			cfg := Default()
+			makeCapabilityValid(&cfg)
+			cfg.TURN.AdvertisedIP = "10.0.0.10"
+			cfg.Logging.Level = level
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("valid logging level %q: %v", level, err)
+			}
+		})
+	}
+	cfg := Default()
+	makeCapabilityValid(&cfg)
+	cfg.TURN.AdvertisedIP = "10.0.0.10"
+	cfg.Logging.Level = "trace"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "logging.level") {
+		t.Fatalf("expected invalid logging level error, got %v", err)
+	}
+}
+
 func TestValidateAllowsExplicitDevelopmentLoopbackOrigin(t *testing.T) {
 	cfg := Default()
 	makeCapabilityValid(&cfg)
@@ -164,6 +185,34 @@ func TestValidateRequiresPortCapacityForCallsAndTURNAllocations(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "RTP/RTCP pair") ||
 		!strings.Contains(err.Error(), "one port per maximum allocation") {
 		t.Fatalf("expected RTP and TURN capacity errors, got %v", err)
+	}
+}
+
+func TestValidateDoesNotCountAnUnpairedEvenPortAsRTPCallCapacity(t *testing.T) {
+	cfg := Default()
+	makeCapabilityValid(&cfg)
+	cfg.TURN.AdvertisedIP = "10.0.0.10"
+	cfg.Limits.MaxCalls = 1
+	cfg.SIP.RTPMinPort = 20001
+	cfg.SIP.RTPMaxPort = 20002
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "RTP/RTCP pair") {
+		t.Fatalf("expected an unpaired RTP boundary to fail capacity validation, got %v", err)
+	}
+}
+
+func TestValidateRejectsIPv6AdvertisedAddressesForIPv4MediaRuntime(t *testing.T) {
+	for _, mutate := range []func(*Config){
+		func(cfg *Config) { cfg.TURN.AdvertisedIP = "2001:db8::1" },
+		func(cfg *Config) { cfg.SIP.RTPAdvertisedIP = "2001:db8::2" },
+		func(cfg *Config) { cfg.ICE.AdvertisedIP = "2001:db8::3" },
+	} {
+		cfg := Default()
+		makeCapabilityValid(&cfg)
+		cfg.TURN.AdvertisedIP = "10.0.0.10"
+		mutate(&cfg)
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "IPv4") {
+			t.Fatalf("expected IPv6 advertised address to fail P1 validation, got %v", err)
+		}
 	}
 }
 

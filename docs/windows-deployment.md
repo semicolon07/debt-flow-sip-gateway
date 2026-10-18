@@ -39,13 +39,14 @@ identity หรือ active key ตั้งค่าไม่ครบ/ไม�
 1. Build release พร้อม release manifest, CycloneDX SBOM, checksums และ Authenticode signature:
 
    ```powershell
-   .\scripts\build.ps1 -Version 1.0.0 `
+   .\scripts\build.ps1 -Version 1.0.0 -OutputDirectory .\dist\release\1.0.0 `
      -CodeSigningCertificateThumbprint <certificate-thumbprint> -RequireSignature
    ```
 
    Development build สามารถไม่ส่ง certificate ได้ แต่ห้ามใช้เป็น pilot/release artifact
    Signed build จะปฏิเสธ source ที่ยังไม่ commit หรือ worktree ไม่ clean และ preflight จะเทียบ version ที่
-   executable รายงานกับ `release-manifest.json` รวมทั้ง commit/target/dirty state
+   executable รายงานกับ `release-manifest.json` รวมทั้ง commit/target/dirty state นอกจากนี้ output directory
+   ของ signed build ต้องเป็น directory ใหม่หรือว่าง เพื่อไม่ให้ไฟล์ค้างจาก release ก่อนหน้าปะปนใน checksum
 
 2. สร้าง key 32 bytes ใน secret manager ของผู้ดูแลและตั้งค่าฝั่ง Web API เป็น base64 จากนั้นเปิด
    elevated PowerShell บน Gateway แล้ว provision ค่าเดียวกันเข้า DPAPI LocalMachine โดยไม่ใส่ key
@@ -66,12 +67,15 @@ identity หรือ active key ตั้งค่าไม่ครบ/ไม�
 4. Install service และ firewall จาก elevated PowerShell:
 
    ```powershell
-   .\scripts\install-service.ps1 -BinaryPath .\sip-gateway.exe
+   .\scripts\install-service.ps1 -BinaryPath .\sip-gateway.exe -RequireSignature `
+     -ExpectedSignerThumbprint <certificate-thumbprint>
    .\scripts\configure-firewall.ps1 -RemoteAddress 10.0.0.0/8
    ```
 
    installer จะหยุด service เดิมก่อน replace executable, ตั้ง service SID/ACL โดยให้เขียนได้เฉพาะ
    `data` และ `logs`, ให้ `keys` เป็น read-only แล้วรอจน service อยู่สถานะ `Running` ก่อนสำเร็จ
+   โดยจะตรวจ signature/strict config จาก staged binary ก่อนหยุด service และคืน binary เดิมพร้อม start
+   service กลับอัตโนมัติหาก replace, ACL, service configuration หรือ startup ขั้นใดล้มเหลว
 
 5. วาง `deploy\iis\web.config` ที่ IIS application root, bind hostname บน HTTPS 443 และห้าม expose
    Gateway ports 8080/9090 ออกนอก loopback
@@ -83,13 +87,23 @@ identity หรือ active key ตั้งค่าไม่ครบ/ไม�
 
    ```powershell
    .\scripts\test-pilot-preflight.ps1 -RequireReleaseEvidence `
-     -ForbiddenApiHost api-debt-flow.uniga.app
+     -ForbiddenApiHost api-debt-flow.uniga.app `
+     -ExpectedSignerThumbprint <certificate-thumbprint>
    ```
+
+   checksum gate ตรวจทุกไฟล์ที่ระบุใน `SHA256SUMS` และปฏิเสธ path ที่ออกนอก release directory,
+   duplicate/missing entry หรือ hash ไม่ตรง ไม่ได้ตรวจเพียง executable
 
 8. รัน SIPp matrix ทั้ง UDP/TCP และเก็บ artifacts ตาม
    `docs\pilot-acceptance-matrix.md`; ห้ามเปิด spike gate จากผล local unit test เพียงอย่างเดียว
 
 ## Sanitized diagnostics
+
+Operational JSON logs ออกทั้ง console และ rotating file ตาม `logging.path` ให้ใช้
+`logging.level: "info"` ใน production และเปลี่ยนเป็น `"debug"` ชั่วคราวเฉพาะตอน reproduce ปัญหา
+inbound จากนั้นคืนเป็น `"info"` แล้ว restart service ระดับ debug เพิ่มเฉพาะ sanitized decision events;
+Gateway จะไม่เขียน raw SIP, Authorization, SDP, capability/SIP credential, ICE/TURN credential,
+DTMF หรือ media content
 
 รันจาก elevated PowerShell เมื่อต้องส่งข้อมูลให้ทีม support:
 

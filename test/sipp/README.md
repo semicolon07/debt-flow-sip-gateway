@@ -12,6 +12,8 @@
 - `outbound-no-answer`: outbound ringing, local CANCEL, 200/487 และ ACK
 - `inbound-answer-bye`: inbound INVITE ให้ browser รับสาย แล้ว remote BYE
 - `inbound-answer-bye-pcma`: inbound flow เดียวกันด้วย PCMA payload type 8
+- `inbound-answer-bye-mixed-codecs`: PBX เสนอ PCMA ก่อน PCMU แต่ Gateway ต้องเลือก codec ที่ตรงกับ
+  WebRTC และคง negotiated RFC 4733 payload ใน SDP answer
 - `inbound-cancel`: inbound ringing แล้ว remote CANCEL/487/ACK
 - `inbound-unsupported-codec`: inbound offer ที่มีเฉพาะ Opus ต้องถูกปฏิเสธด้วย 488
 - `inbound-malformed-sdp`: inbound offer ที่ connection address/port ใช้ไม่ได้ต้องถูกปฏิเสธด้วย 488

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -410,6 +411,8 @@ type fakeRTC struct {
 	writes          []*rtp.Packet
 	rtcp            []rtcp.Packet
 	connectionState pion.PeerConnectionState
+	codec           gatewaywebrtc.CodecInfo
+	offerCodec      string
 }
 
 func (f *fakeRTC) WriteRTCP(_ string, packets []rtcp.Packet) error {
@@ -419,8 +422,13 @@ func (f *fakeRTC) WriteRTCP(_ string, packets []rtcp.Packet) error {
 	return nil
 }
 
-func (*fakeRTC) Open(string, gatewaywebrtc.TURNCredential) error  { return nil }
-func (*fakeRTC) AcceptOffer(string, string) (string, error)       { return "answer", nil }
+func (*fakeRTC) Open(string, gatewaywebrtc.TURNCredential) error { return nil }
+func (f *fakeRTC) AcceptOffer(_, _, preferredCodec string) (string, error) {
+	f.mu.Lock()
+	f.offerCodec = preferredCodec
+	f.mu.Unlock()
+	return "answer", nil
+}
 func (*fakeRTC) AddCandidate(string, pion.ICECandidateInit) error { return nil }
 func (f *fakeRTC) WriteRTP(_ string, packet *rtp.Packet) error {
 	f.mu.Lock()
@@ -428,7 +436,12 @@ func (f *fakeRTC) WriteRTP(_ string, packet *rtp.Packet) error {
 	f.mu.Unlock()
 	return nil
 }
-func (*fakeRTC) Codec(string) (gatewaywebrtc.CodecInfo, error) {
+func (f *fakeRTC) Codec(string) (gatewaywebrtc.CodecInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.codec.Name != "" {
+		return f.codec, nil
+	}
 	return gatewaywebrtc.CodecInfo{Name: "PCMU", AudioPayloadType: 0, DTMFPayloadType: 101}, nil
 }
 
@@ -482,22 +495,43 @@ func (f *fakeMedia) CloseCall(callID string) error {
 }
 
 type fakeSIP struct {
-	mu          sync.Mutex
-	events      chan sip.Event
-	destination string
-	starts      int
-	answers     int
-	hangups     int
-	rejects     []int
-	closed      []string
-	localSDP    []byte
+	mu                sync.Mutex
+	events            chan sip.Event
+	destination       string
+	starts            int
+	answers           int
+	hangups           int
+	rejects           []int
+	closed            []string
+	localSDP          []byte
+	answerEntered     chan struct{}
+	answerRelease     chan struct{}
+	hangupEntered     chan struct{}
+	hangupRelease     chan struct{}
+	unregisterEntered chan struct{}
+	unregisterRelease chan struct{}
 }
 
 func newFakeSIP() *fakeSIP                                                  { return &fakeSIP{events: make(chan sip.Event, 8)} }
 func (f *fakeSIP) Events() <-chan sip.Event                                 { return f.events }
 func (*fakeSIP) Configure(context.Context, string, sip.Configuration) error { return nil }
 func (*fakeSIP) Register(context.Context, string) error                     { return nil }
-func (*fakeSIP) Unregister(context.Context, string) error                   { return nil }
+func (f *fakeSIP) Unregister(context.Context, string) error {
+	f.mu.Lock()
+	entered := f.unregisterEntered
+	release := f.unregisterRelease
+	f.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if release != nil {
+		<-release
+	}
+	return nil
+}
 func (f *fakeSIP) StartCall(_ context.Context, _, _, destination string, localSDP []byte) error {
 	f.mu.Lock()
 	f.destination = destination
@@ -510,7 +544,18 @@ func (f *fakeSIP) Answer(_ context.Context, _, _ string, localSDP []byte) error 
 	f.mu.Lock()
 	f.answers++
 	f.localSDP = append([]byte(nil), localSDP...)
+	entered := f.answerEntered
+	release := f.answerRelease
 	f.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if release != nil {
+		<-release
+	}
 	return nil
 }
 func (f *fakeSIP) Reject(_ context.Context, _, _ string, status int) error {
@@ -522,7 +567,18 @@ func (f *fakeSIP) Reject(_ context.Context, _, _ string, status int) error {
 func (f *fakeSIP) Hangup(context.Context, string, string) error {
 	f.mu.Lock()
 	f.hangups++
+	entered := f.hangupEntered
+	release := f.hangupRelease
 	f.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if release != nil {
+		<-release
+	}
 	return nil
 }
 func (*fakeSIP) SendRTP(context.Context, string, string, *rtp.Packet) error { return nil }
@@ -597,6 +653,133 @@ func TestRegistrationStateChangesUseDurableOutbox(t *testing.T) {
 	}
 }
 
+func TestCoordinatorConfirmsDurableEventACKOnlyAfterStoreCommit(t *testing.T) {
+	verifier := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	coordinator, _, _, database := newTestCoordinatorWithStore(t, verifier, newFakeSIP())
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventRegistered, SessionID: claims.SessionID, StatusCode: 200,
+	})
+	commandID := uuid.NewString()
+	payload, err := json.Marshal(protocol.EventsACK{CommandID: commandID, Sequence: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := coordinator.Handle(context.Background(), claims, protocol.Envelope{
+		Type: "events.ack", Payload: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Type != "command_result" {
+		t.Fatalf("unexpected ACK result: %+v", events)
+	}
+	var result struct {
+		CommandID   string `json:"commandId"`
+		CommandType string `json:"commandType"`
+		Status      string `json:"status"`
+		Sequence    uint64 `json:"sequence"`
+	}
+	if err := json.Unmarshal(events[0].Payload, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.CommandID != commandID || result.CommandType != "events.ack" ||
+		result.Status != "completed" || result.Sequence != 1 {
+		t.Fatalf("unexpected ACK payload: %+v", result)
+	}
+	pending, err := database.PendingEvents(context.Background(), claims.SessionID, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("ACK result was returned before outbox commit: %+v", pending)
+	}
+	initial, _, err := coordinator.Connect(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var welcome struct {
+		AcknowledgedThrough uint64 `json:"acknowledgedThrough"`
+	}
+	if err := json.Unmarshal(initial[0].Payload, &welcome); err != nil {
+		t.Fatal(err)
+	}
+	if welcome.AcknowledgedThrough != 1 {
+		t.Fatalf("reconnect lost committed ACK cursor: %+v", welcome)
+	}
+}
+
+func TestCoordinatorPreservesActiveCallCodecDuringWebRTCReconnect(t *testing.T) {
+	verifier := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	coordinator, rtc, _ := newTestCoordinatorWithMedia(t, verifier, newFakeSIP())
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := coordinator.session(claims.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	session.activeMedia = &callMedia{codec: gatewaywebrtc.CodecInfo{Name: "PCMA"}}
+	session.mu.Unlock()
+	payload, err := json.Marshal(protocol.WebRTCOffer{SDP: "offer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := coordinator.Handle(context.Background(), claims, protocol.Envelope{
+		Type: "webrtc.offer", Payload: payload,
+	})
+	if err != nil || len(events) != 1 || events[0].Type != "webrtc.answer" {
+		t.Fatalf("unexpected WebRTC answer: events=%+v err=%v", events, err)
+	}
+	rtc.mu.Lock()
+	preferred := rtc.offerCodec
+	rtc.mu.Unlock()
+	if preferred != "PCMA" {
+		t.Fatalf("reconnect preferred codec=%q, want PCMA", preferred)
+	}
+}
+
+func TestCoordinatorAcceptsLegacyDurableEventACKWithoutResult(t *testing.T) {
+	verifier := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	coordinator := newTestCoordinator(t, verifier, newFakeSIP())
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := coordinator.store.AppendEvent(context.Background(), claims.SessionID,
+		claims.AgentInstanceID, "legacy-ack", "registration.state_changed", []byte(`{"state":"registered"}`), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(protocol.EventsACK{Sequence: stored.Sequence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := coordinator.Handle(context.Background(), claims, protocol.Envelope{
+		Type: "events.ack", Payload: payload,
+	})
+	if err != nil || len(events) != 0 {
+		t.Fatalf("legacy ACK changed behavior: events=%+v err=%v", events, err)
+	}
+}
+
 func TestCoordinatorBridgesRTPAndSendsDTMF(t *testing.T) {
 	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
 	sipRuntime := newFakeSIP()
@@ -652,6 +835,14 @@ func TestCoordinatorBridgesRTPAndSendsDTMF(t *testing.T) {
 		len(media.writes) != 8 || len(media.rtcp) != 1 {
 		t.Fatalf("unexpected PBX media state: remote=%v rtcp=%v writes=%d",
 			media.remote, media.remoteRTCP, len(media.writes))
+	}
+	if media.writes[0].SSRC == media.writes[1].SSRC {
+		t.Fatal("concurrent RFC 4733 events must use a separate SSRC from the audio stream")
+	}
+	for _, packet := range media.writes[1:] {
+		if packet.SSRC != media.writes[1].SSRC || packet.PayloadType != 101 {
+			t.Fatalf("inconsistent DTMF stream: %+v", packet.Header)
+		}
 	}
 	rtc.mu.Lock()
 	defer rtc.mu.Unlock()
@@ -766,6 +957,115 @@ func TestCoordinatorAcceptsInboundOnlyForHealthyPortal(t *testing.T) {
 	}
 }
 
+func TestCoordinatorSelectsInboundCodecIntersectionRegardlessOfOfferOrder(t *testing.T) {
+	tests := []struct {
+		name           string
+		browserCodec   gatewaywebrtc.CodecInfo
+		sipPayloads    string
+		sipAttributes  string
+		wantAnswerLine string
+		wantDTMF       uint8
+	}{
+		{
+			name: "browser PCMU with PBX preferring PCMA", browserCodec: gatewaywebrtc.CodecInfo{
+				Name: "PCMU", AudioPayloadType: 0, DTMFPayloadType: 101,
+			},
+			sipPayloads: "8 0 126", sipAttributes: "a=rtpmap:8 PCMA/8000\r\n" +
+				"a=rtpmap:0 PCMU/8000\r\na=rtpmap:126 telephone-event/8000\r\n",
+			wantAnswerLine: "RTP/AVP 0 126", wantDTMF: 126,
+		},
+		{
+			name: "browser PCMA with PBX preferring PCMU", browserCodec: gatewaywebrtc.CodecInfo{
+				Name: "PCMA", AudioPayloadType: 8, DTMFPayloadType: 110,
+			},
+			sipPayloads: "0 8 112", sipAttributes: "a=rtpmap:0 PCMU/8000\r\n" +
+				"a=rtpmap:8 PCMA/8000\r\na=rtpmap:112 telephone-event/8000\r\n",
+			wantAnswerLine: "RTP/AVP 8 112", wantDTMF: 112,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+			sipRuntime := newFakeSIP()
+			coordinator, rtc, _ := newTestCoordinatorWithMedia(t, api, sipRuntime)
+			rtc.codec = test.browserCodec
+			claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+				CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+				SupportedProtocolVersions: []int{1},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+				t.Fatal(err)
+			}
+			coordinator.applySIPEvent(sip.Event{Type: sip.EventRegistered, SessionID: claims.SessionID})
+
+			callID := uuid.NewString()
+			remoteSDP := []byte("v=0\r\nc=IN IP4 10.0.0.20\r\nm=audio 20500 RTP/AVP " +
+				test.sipPayloads + "\r\n" + test.sipAttributes)
+			coordinator.applySIPEvent(sip.Event{
+				Type: sip.EventIncoming, SessionID: claims.SessionID, CallID: callID, RemoteSDP: remoteSDP,
+			})
+			answerPayload, _ := json.Marshal(protocol.CallCommand{CommandID: uuid.NewString(), CallID: callID})
+			if _, err := coordinator.Handle(context.Background(), claims,
+				protocol.Envelope{Type: "call.answer", Payload: answerPayload}); err != nil {
+				t.Fatal(err)
+			}
+
+			sipRuntime.mu.Lock()
+			answerSDP := string(sipRuntime.localSDP)
+			rejects := append([]int(nil), sipRuntime.rejects...)
+			sipRuntime.mu.Unlock()
+			if len(rejects) != 0 {
+				t.Fatalf("compatible inbound offer was rejected: %v", rejects)
+			}
+			if !strings.Contains(answerSDP, test.wantAnswerLine) {
+				t.Fatalf("answer SDP %q does not contain %q", answerSDP, test.wantAnswerLine)
+			}
+			session, err := coordinator.session(claims.SessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			session.mu.Lock()
+			media := session.activeMedia
+			session.mu.Unlock()
+			if media == nil || media.sipDTMFPayload != test.wantDTMF {
+				t.Fatalf("SIP DTMF payload=%v, want %d", media, test.wantDTMF)
+			}
+		})
+	}
+}
+
+func TestCoordinatorRejectsInboundWithoutCodecIntersection(t *testing.T) {
+	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	sipRuntime := newFakeSIP()
+	coordinator, _, _ := newTestCoordinatorWithMedia(t, api, sipRuntime)
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventRegistered, SessionID: claims.SessionID})
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventIncoming, SessionID: claims.SessionID, CallID: uuid.NewString(),
+		RemoteSDP: []byte("v=0\r\nc=IN IP4 10.0.0.20\r\n" +
+			"m=audio 20500 RTP/AVP 8 101\r\na=rtpmap:8 PCMA/8000\r\n" +
+			"a=rtpmap:101 telephone-event/8000\r\n"),
+	})
+	sipRuntime.mu.Lock()
+	rejects := append([]int(nil), sipRuntime.rejects...)
+	sipRuntime.mu.Unlock()
+	if len(rejects) != 1 || rejects[0] != 488 {
+		t.Fatalf("inbound without codec intersection rejects=%v, want [488]", rejects)
+	}
+}
+
 func TestCoordinatorAnswersInboundWithExistingInviteMediaAndBridgesAudio(t *testing.T) {
 	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
 	sipRuntime := newFakeSIP()
@@ -868,6 +1168,297 @@ func TestCoordinatorAnswersInboundWithExistingInviteMediaAndBridgesAudio(t *test
 	if len(media.closed) != 1 || media.closed[0] != callID {
 		t.Fatalf("inbound media close=%v, want [%s]", media.closed, callID)
 	}
+}
+
+func TestCoordinatorSerializesRemoteCancelWithInboundAnswer(t *testing.T) {
+	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	sipRuntime := newFakeSIP()
+	sipRuntime.answerEntered = make(chan struct{}, 1)
+	sipRuntime.answerRelease = make(chan struct{})
+	coordinator, _, _, database := newTestCoordinatorWithStore(t, api, sipRuntime)
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventRegistered, SessionID: claims.SessionID})
+	callID := uuid.NewString()
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventIncoming, SessionID: claims.SessionID, CallID: callID,
+		RemoteSDP:   []byte("v=0\r\nc=IN IP4 10.0.0.20\r\nm=audio 20500 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n"),
+		RemoteParty: "0812345678",
+	})
+	answerPayload, _ := json.Marshal(protocol.CallCommand{CommandID: uuid.NewString(), CallID: callID})
+	answerDone := make(chan error, 1)
+	go func() {
+		_, handleErr := coordinator.Handle(context.Background(), claims,
+			protocol.Envelope{Type: "call.answer", Payload: answerPayload})
+		answerDone <- handleErr
+	}()
+	select {
+	case <-sipRuntime.answerEntered:
+	case <-time.After(time.Second):
+		t.Fatal("answer did not reach the SIP adapter")
+	}
+
+	cancelDone := make(chan struct{})
+	go func() {
+		coordinator.applySIPEvent(sip.Event{
+			Type: sip.EventEnded, SessionID: claims.SessionID, CallID: callID, Reason: "cancelled",
+		})
+		close(cancelDone)
+	}()
+	select {
+	case <-cancelDone:
+		t.Fatal("remote CANCEL mutated the call while answer persistence was still in progress")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(sipRuntime.answerRelease)
+	select {
+	case err := <-answerDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("answer command did not complete")
+	}
+	select {
+	case <-cancelDone:
+	case <-time.After(time.Second):
+		t.Fatal("remote CANCEL did not resume after answer persistence completed")
+	}
+
+	session, err := coordinator.session(claims.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	snapshot := session.activeCall.Snapshot()
+	session.mu.Unlock()
+	if snapshot.State != call.StateEnded || snapshot.EndReason != call.EndCancelled {
+		t.Fatalf("unexpected answer/CANCEL terminal state: %+v", snapshot)
+	}
+	events, err := database.PendingEvents(context.Background(), claims.SessionID, 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var states []call.State
+	for _, event := range events {
+		if event.Type != "call.state_changed" {
+			continue
+		}
+		var eventSnapshot call.Snapshot
+		if err := json.Unmarshal(event.Payload, &eventSnapshot); err != nil {
+			t.Fatal(err)
+		}
+		states = append(states, eventSnapshot.State)
+	}
+	want := []call.State{call.StateIncoming, call.StateAnswering, call.StateEnded}
+	if fmt.Sprint(states) != fmt.Sprint(want) {
+		t.Fatalf("answer/CANCEL lifecycle=%v, want %v", states, want)
+	}
+}
+
+func TestCoordinatorRemovesTerminatedSessionBeforeWaitingCommandCanRun(t *testing.T) {
+	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	sipRuntime := newFakeSIP()
+	sipRuntime.unregisterEntered = make(chan struct{}, 1)
+	sipRuntime.unregisterRelease = make(chan struct{})
+	coordinator := newTestCoordinator(t, api, sipRuntime)
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := coordinator.session(claims.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminated := make(chan struct{})
+	go func() {
+		coordinator.terminateSession(session, call.EndLeaseRevoked)
+		close(terminated)
+	}()
+	select {
+	case <-sipRuntime.unregisterEntered:
+	case <-time.After(time.Second):
+		t.Fatal("session termination did not reach SIP unregister")
+	}
+
+	payload, _ := json.Marshal(protocol.CommandIdentity{CommandID: uuid.NewString()})
+	commandDone := make(chan error, 1)
+	go func() {
+		_, handleErr := coordinator.Handle(context.Background(), claims,
+			protocol.Envelope{Type: "registration.start", Payload: payload})
+		commandDone <- handleErr
+	}()
+	select {
+	case err := <-commandDone:
+		t.Fatalf("command entered a terminating session: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(sipRuntime.unregisterRelease)
+	select {
+	case <-terminated:
+	case <-time.After(time.Second):
+		t.Fatal("session termination did not complete")
+	}
+	select {
+	case err := <-commandDone:
+		var commandFailure commandError
+		if !errors.As(err, &commandFailure) ||
+			(commandFailure.code != "session_not_found" && commandFailure.code != "session_connection_stale") {
+			t.Fatalf("waiting command error=%v, want stale/not found", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiting command did not leave after session removal")
+	}
+	if _, err := coordinator.session(claims.SessionID); err == nil {
+		t.Fatal("terminated session remains discoverable")
+	}
+}
+
+func TestCoordinatorEmitsOneTerminalEventWhenLocalAndRemoteHangupRace(t *testing.T) {
+	type fixture struct {
+		coordinator *Coordinator
+		claims      Claims
+		callID      string
+		sipRuntime  *fakeSIP
+		media       *fakeMedia
+		database    *store.Store
+	}
+	setup := func(t *testing.T, sipRuntime *fakeSIP) fixture {
+		t.Helper()
+		coordinator, _, media, database := newTestCoordinatorWithStore(
+			t, &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}, sipRuntime,
+		)
+		claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+			CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+			SupportedProtocolVersions: []int{1},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+			t.Fatal(err)
+		}
+		coordinator.applySIPEvent(sip.Event{Type: sip.EventRegistered, SessionID: claims.SessionID})
+		callID := uuid.NewString()
+		startPayload, _ := json.Marshal(protocol.StartCall{
+			CommandID: uuid.NewString(), CallID: callID, CallContextID: "context-1",
+			GatewayCapability: "call-capability",
+		})
+		if _, err := coordinator.Handle(context.Background(), claims,
+			protocol.Envelope{Type: "call.start", Payload: startPayload}); err != nil {
+			t.Fatal(err)
+		}
+		coordinator.applySIPEvent(sip.Event{
+			Type: sip.EventConnected, SessionID: claims.SessionID, CallID: callID,
+			RemoteSDP: []byte("v=0\r\nc=IN IP4 10.0.0.20\r\nm=audio 20500 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n"),
+		})
+		return fixture{coordinator, claims, callID, sipRuntime, media, database}
+	}
+	assertTerminalOnce := func(t *testing.T, value fixture, wantReason call.EndReason, wantSIPHangups int) {
+		t.Helper()
+		session, err := value.coordinator.session(value.claims.SessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		session.mu.Lock()
+		snapshot := session.activeCall.Snapshot()
+		session.mu.Unlock()
+		if snapshot.State != call.StateEnded || snapshot.EndReason != wantReason {
+			t.Fatalf("terminal snapshot=%+v, want ended/%s", snapshot, wantReason)
+		}
+		events, err := value.database.PendingEvents(context.Background(), value.claims.SessionID, 0, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ended := 0
+		for _, event := range events {
+			if event.Type == "call.ended" {
+				ended++
+			}
+		}
+		if ended != 1 {
+			t.Fatalf("call.ended count=%d, want 1", ended)
+		}
+		value.media.mu.Lock()
+		closed := append([]string(nil), value.media.closed...)
+		value.media.mu.Unlock()
+		if len(closed) != 1 || closed[0] != value.callID {
+			t.Fatalf("media closed=%v, want [%s]", closed, value.callID)
+		}
+		value.sipRuntime.mu.Lock()
+		hangups := value.sipRuntime.hangups
+		value.sipRuntime.mu.Unlock()
+		if hangups != wantSIPHangups {
+			t.Fatalf("SIP hangups=%d, want %d", hangups, wantSIPHangups)
+		}
+	}
+
+	t.Run("local hangup owns terminal transition", func(t *testing.T) {
+		sipRuntime := newFakeSIP()
+		sipRuntime.hangupEntered = make(chan struct{}, 1)
+		sipRuntime.hangupRelease = make(chan struct{})
+		value := setup(t, sipRuntime)
+		payload, _ := json.Marshal(protocol.CallCommand{CommandID: uuid.NewString(), CallID: value.callID})
+		localDone := make(chan error, 1)
+		go func() {
+			_, err := value.coordinator.Handle(context.Background(), value.claims,
+				protocol.Envelope{Type: "call.hangup", Payload: payload})
+			localDone <- err
+		}()
+		select {
+		case <-sipRuntime.hangupEntered:
+		case <-time.After(time.Second):
+			t.Fatal("local hangup did not reach SIP adapter")
+		}
+		remoteDone := make(chan struct{})
+		go func() {
+			value.coordinator.applySIPEvent(sip.Event{
+				Type: sip.EventEnded, SessionID: value.claims.SessionID,
+				CallID: value.callID, Reason: "remote_hangup",
+			})
+			close(remoteDone)
+		}()
+		select {
+		case <-remoteDone:
+			t.Fatal("remote BYE bypassed serialized local hangup")
+		case <-time.After(50 * time.Millisecond):
+		}
+		close(sipRuntime.hangupRelease)
+		if err := <-localDone; err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-remoteDone:
+		case <-time.After(time.Second):
+			t.Fatal("remote BYE did not resume")
+		}
+		assertTerminalOnce(t, value, call.EndLocalHangup, 1)
+	})
+
+	t.Run("remote hangup owns terminal transition", func(t *testing.T) {
+		value := setup(t, newFakeSIP())
+		value.coordinator.applySIPEvent(sip.Event{
+			Type: sip.EventEnded, SessionID: value.claims.SessionID,
+			CallID: value.callID, Reason: "remote_hangup",
+		})
+		payload, _ := json.Marshal(protocol.CallCommand{CommandID: uuid.NewString(), CallID: value.callID})
+		if _, err := value.coordinator.Handle(context.Background(), value.claims,
+			protocol.Envelope{Type: "call.hangup", Payload: payload}); err != nil {
+			t.Fatal(err)
+		}
+		assertTerminalOnce(t, value, call.EndRemoteHangup, 0)
+	})
 }
 
 func TestCoordinatorRejectsInboundAndClosesMedia(t *testing.T) {
@@ -982,6 +1573,10 @@ func TestCoordinatorEmitsDesktopAgentCompatibleOutboundLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	coordinator.applySIPEvent(sip.Event{Type: sip.EventTrying, SessionID: claims.SessionID, CallID: callID})
+	// Retransmitted provisional responses must not create duplicate lifecycle
+	// records; the desktop agent only emits when its state actually changes.
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventTrying, SessionID: claims.SessionID, CallID: callID})
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventRinging, SessionID: claims.SessionID, CallID: callID})
 	coordinator.applySIPEvent(sip.Event{Type: sip.EventRinging, SessionID: claims.SessionID, CallID: callID})
 	remoteSDP := []byte("v=0\r\nc=IN IP4 10.0.0.20\r\nm=audio 20500 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n")
 	coordinator.applySIPEvent(sip.Event{
@@ -1003,6 +1598,18 @@ func TestCoordinatorEmitsDesktopAgentCompatibleOutboundLifecycle(t *testing.T) {
 	if len(events) != len(wantTypes) {
 		t.Fatalf("got %d events, want %d: %+v", len(events), len(wantTypes), events)
 	}
+	var createdMetadata struct {
+		RemoteParty string `json:"remoteParty"`
+		CallContext string `json:"callContextId"`
+		CommandID   string `json:"commandId"`
+	}
+	if err := json.Unmarshal(events[1].Payload, &createdMetadata); err != nil {
+		t.Fatal(err)
+	}
+	if createdMetadata.RemoteParty != "sip:canonical@pbx.internal" ||
+		createdMetadata.CallContext != "context-1" || createdMetadata.CommandID == "" {
+		t.Fatalf("outbound replay metadata is incomplete: %+v", createdMetadata)
+	}
 	wantStates := []call.State{
 		call.StateCreated, call.StateDialing, call.StateTrying, call.StateRinging,
 		call.StateConnected, call.StateEnding, call.StateEnded, call.StateEnded,
@@ -1021,6 +1628,45 @@ func TestCoordinatorEmitsDesktopAgentCompatibleOutboundLifecycle(t *testing.T) {
 		if snapshot.State != wantStates[index-1] {
 			t.Fatalf("event %d state=%q, want %q", index, snapshot.State, wantStates[index-1])
 		}
+	}
+}
+
+func TestCoordinatorPreservesNormalizedOutboundFailureReason(t *testing.T) {
+	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	coordinator := newTestCoordinator(t, api, newFakeSIP())
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventRegistered, SessionID: claims.SessionID})
+	callID := uuid.NewString()
+	payload, _ := json.Marshal(protocol.StartCall{
+		CommandID: uuid.NewString(), CallID: callID, CallContextID: "context-1",
+		GatewayCapability: "call-capability",
+	})
+	if _, err := coordinator.Handle(context.Background(), claims,
+		protocol.Envelope{Type: "call.start", Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventFailed, SessionID: claims.SessionID, CallID: callID,
+		StatusCode: 486, Reason: "busy",
+	})
+	session, err := coordinator.session(claims.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	snapshot := session.activeCall.Snapshot()
+	session.mu.Unlock()
+	if snapshot.State != call.StateEnded || snapshot.EndReason != call.EndBusy {
+		t.Fatalf("outbound failure=%+v, want ended/busy", snapshot)
 	}
 }
 
@@ -1076,6 +1722,95 @@ func TestCoordinatorUsesCanonicalAuthorizedDestinationAndDeduplicates(t *testing
 	defer sipRuntime.mu.Unlock()
 	if sipRuntime.starts != 1 {
 		t.Fatalf("duplicate command started %d SIP calls", sipRuntime.starts)
+	}
+}
+
+func TestCoordinatorConnectReplaysDurableEventsBeforeAuthoritativeSnapshot(t *testing.T) {
+	coordinator, _, _, database := newTestCoordinatorWithStore(
+		t, &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}, newFakeSIP(),
+	)
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := database.AppendEvent(
+		context.Background(), claims.SessionID, claims.AgentInstanceID,
+		"replay-order", "call.state_changed", []byte(`{"callId":"old-call","state":"ringing"}`), time.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	initial, _, err := coordinator.Connect(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(initial) != 3 {
+		t.Fatalf("initial event count=%d, want 3", len(initial))
+	}
+	if initial[0].Type != "session.welcome" || initial[1].Type != "call.state_changed" ||
+		initial[2].Type != "gateway.snapshot" {
+		t.Fatalf("unexpected initial order: %q, %q, %q", initial[0].Type, initial[1].Type, initial[2].Type)
+	}
+	expectedReplay, err := replayEnvelope(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial[1].MessageID != expectedReplay.MessageID {
+		t.Fatalf("replayed message ID=%q, want %q", initial[1].MessageID, expectedReplay.MessageID)
+	}
+}
+
+func TestCoordinatorReplaysUncommittedEventsAfterBrowserSessionRefresh(t *testing.T) {
+	verifier := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	coordinator, _, _, database := newTestCoordinatorWithStore(t, verifier, newFakeSIP())
+	authentication := protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	}
+	first, err := coordinator.Redeem(context.Background(), authentication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := database.AppendEvent(context.Background(), first.SessionID,
+		first.AgentInstanceID, "refresh-replay", "call.state_changed",
+		[]byte(`{"callId":"old-call","state":"ringing"}`), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier.mu.Lock()
+	verifier.sessionID = "session-after-refresh"
+	verifier.mu.Unlock()
+	second, err := coordinator.Redeem(context.Background(), authentication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.SessionID == first.SessionID {
+		t.Fatal("refresh did not create a replacement logical session")
+	}
+	initial, _, err := coordinator.Connect(context.Background(), second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(initial) != 3 || initial[1].Type != "call.state_changed" {
+		t.Fatalf("uncommitted event was not replayed to replacement session: %+v", initial)
+	}
+	var payload struct {
+		Sequence            uint64 `json:"sequence"`
+		AgentSessionID      string `json:"agentSessionId"`
+		CollectionID        string `json:"collectionId"`
+		CollectionBindingID string `json:"collectionBindingId"`
+	}
+	if err := json.Unmarshal(initial[1].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Sequence != stored.Sequence || payload.AgentSessionID != first.SessionID ||
+		payload.CollectionID != first.CollectionID ||
+		payload.CollectionBindingID != first.CollectionBindingID {
+		t.Fatalf("replayed event lost original binding: %+v", payload)
 	}
 }
 

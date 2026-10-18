@@ -20,14 +20,14 @@ outbox append+ACK ตัวเลขนี้เหมาะกับ regression
 
 | benchmark | time/op | bytes/op | allocs/op |
 |---|---:|---:|---:|
-| decode + validate `call.start` | 2.542 us | 2,867 | 22 |
-| verify AES-GCM session capability | 3.818 us | 4,999 | 23 |
-| RTP header/payload translate | 63.75 ns | 304 | 2 |
-| RTP reusable-buffer translate (production hot path) | 19.98 ns | 0 | 0 |
-| RTP translate, 200 interleaved call streams | 64.28 ns | 304 | 2 |
-| RTP reusable-buffer translate, 200 interleaved call streams | 39.20 ns | 0 | 0 |
-| snapshot, 250 sessions / 200 active calls | 11.923 us | 2,352 | 4 |
-| SQLite outbox append + ACK | 731.145 us | 4,635 | 99 |
+| decode + validate `call.start` | 2.574–2.590 us | 2,867 | 22 |
+| verify AES-GCM session capability | 3.881–3.926 us | 4,998–4,999 | 23 |
+| RTP header/payload translate | 60.08–61.68 ns | 304 | 2 |
+| RTP reusable-buffer translate (production hot path) | 20.13–20.25 ns | 0 | 0 |
+| RTP translate, 200 interleaved call streams | 72.52–75.77 ns | 304 | 2 |
+| RTP reusable-buffer translate, 200 interleaved call streams | 32.75–38.21 ns | 0 | 0 |
+| snapshot, 250 sessions / 200 active calls | 10.892–10.976 us | 2,352 | 4 |
+| SQLite outbox append + cumulative ACK | 201.9–231.9 us | 5,711–5,725 | 129 |
 
 ผลนี้ยืนยันว่า benchmark harness ทำงานและใช้เป็นจุดอ้างอิงในการหา regression เท่านั้น ไม่รวม WSS/TLS,
 DTLS-SRTP, ICE/TURN, network I/O, SIP PBX I/O หรือ Windows scheduler จึงห้ามแปลงเป็นจำนวนสายต่อเครื่อง
@@ -40,8 +40,18 @@ DTLS-SRTP, ICE/TURN, network I/O, SIP PBX I/O หรือ Windows scheduler จ
 GC/allocation regression ไม่ใช่ค่าทดแทน live network measurement
 
 รอบ tuning 2026-10-18 ยังเพิ่ม reusable RTP marshal buffer ต่อ PBX, fast path สำหรับ symmetric-source ที่นิ่ง,
-cache Prometheus counter handle, ขยาย shared ICE UDP socket buffer และเพิ่ม partial SQLite indexes สำหรับ pending outbox
-โดยยังคง `synchronous=FULL` และ durable event semantics เดิม
+cache Prometheus counter handle, ขยาย shared ICE UDP socket buffer, ใช้ round-robin RTP/RTCP port cursor
+แทนการ bind-scan จากพอร์ตแรกแบบ O(n²) ตอน burst 200 calls และเพิ่ม partial SQLite indexes สำหรับ pending
+outbox โดยยังคง `synchronous=FULL` และ durable event semantics เดิม
+
+รอบ corrective audit เดียวกันแก้ cumulative ACK ให้ update เฉพาะแถวที่ยัง pending เดิม query จะย้อนแตะ
+แถวที่ ACK แล้วทั้งหมดทุกครั้ง ทำให้ latency/WAL โตแบบ O(n²) ตามจำนวน event สะสม ผล benchmark หลังแก้
+เร็วขึ้นจาก 3.70–4.18 ms/op เป็น 0.198–0.227 ms/op บนเครื่องเดียวกัน โดยยังใช้ `synchronous=FULL`
+
+หลังเพิ่ม cross-session replay query ใช้ index `(agent_instance_id, user_session_id, session_id)` และ ACK
+ทำใน transaction เดียวกับการคำนวณ confirmed cursor เพื่อลด round trip และปิด commit/response race;
+maintenance ลบ session binding เฉพาะเมื่อหมด retention และไม่มี outbox/call อ้างอิง ส่วน session ที่ renew
+จะ touch binding เพื่อไม่ให้ idle session ที่ยังใช้งานถูก purge
 
 ## 2. Live load/soak observation
 

@@ -50,6 +50,51 @@ func TestRTPManagerAcceptsConfiguredSource(t *testing.T) {
 	}
 }
 
+func TestRTPManagerAllocatesRoundRobinAndReusesReleasedPair(t *testing.T) {
+	basePort := findFreeUDPRange(t, 2)
+	manager, err := NewRTPManager(RTPConfig{
+		ListenIP: net.ParseIP("127.0.0.1"), AdvertisedIP: net.ParseIP("127.0.0.1"),
+		MinPort: uint16(basePort), MaxPort: uint16(basePort + 3),
+	}, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	first, err := manager.Allocate("call-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.Allocate("call-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Port != basePort || second.Port != basePort+2 {
+		t.Fatalf("unexpected round-robin allocation: first=%d second=%d base=%d", first.Port, second.Port, basePort)
+	}
+	if err := manager.CloseCall("call-1"); err != nil {
+		t.Fatal(err)
+	}
+	third, err := manager.Allocate("call-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Port != basePort {
+		t.Fatalf("released port=%d was not reused after cursor wrap; got %d", basePort, third.Port)
+	}
+}
+
+func TestNewRTPManagerRejectsRangeWithoutRTPRTCPPair(t *testing.T) {
+	for _, ports := range [][2]uint16{{30000, 30000}, {30001, 30001}, {30001, 30002}} {
+		_, err := NewRTPManager(RTPConfig{
+			ListenIP: net.ParseIP("127.0.0.1"), AdvertisedIP: net.ParseIP("127.0.0.1"),
+			MinPort: ports[0], MaxPort: ports[1],
+		}, nil, nil, nil)
+		if err == nil {
+			t.Fatalf("expected unusable RTP range %d-%d to fail fast", ports[0], ports[1])
+		}
+	}
+}
+
 func TestLearnSymmetricSourceRequiresExpectedIPAndMigratesStablePort(t *testing.T) {
 	remote := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 1000}
 	learned := false
@@ -210,4 +255,30 @@ func listenUDPPair(t *testing.T, minimum, maximum int) (*net.UDPConn, *net.UDPCo
 	}
 	t.Fatal("no consecutive UDP port pair available")
 	return nil, nil
+}
+
+func findFreeUDPRange(t *testing.T, pairs int) int {
+	t.Helper()
+	for base := 30000; base+(pairs*2)-1 <= 39000; base += 2 {
+		connections := make([]*net.UDPConn, 0, pairs*2)
+		available := true
+		for offset := 0; offset < pairs*2; offset++ {
+			connection, err := net.ListenUDP("udp4", &net.UDPAddr{
+				IP: net.ParseIP("127.0.0.1"), Port: base + offset,
+			})
+			if err != nil {
+				available = false
+				break
+			}
+			connections = append(connections, connection)
+		}
+		for _, connection := range connections {
+			_ = connection.Close()
+		}
+		if available {
+			return base
+		}
+	}
+	t.Fatal("no consecutive UDP range available")
+	return 0
 }

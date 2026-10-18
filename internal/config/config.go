@@ -50,6 +50,7 @@ type HTTP struct {
 
 type Logging struct {
 	Path       string `yaml:"path"`
+	Level      string `yaml:"level"`
 	MaxBytes   int64  `yaml:"maxBytes"`
 	MaxBackups int    `yaml:"maxBackups"`
 }
@@ -119,7 +120,7 @@ func Default() Config {
 			AllowedOrigin: defaultOrigin, AuthTimeout: 5 * time.Second,
 			Heartbeat: 15 * time.Second, IdleTimeout: 45 * time.Second,
 		},
-		Logging: Logging{Path: defaultLogPath(), MaxBytes: 10 << 20, MaxBackups: 5},
+		Logging: Logging{Path: defaultLogPath(), Level: "info", MaxBytes: 10 << 20, MaxBackups: 5},
 		Capability: Capability{
 			Issuer: "debt-flow-web-api", Audience: "debt-flow-sip-gateway",
 		},
@@ -208,6 +209,11 @@ func (c Config) Validate() error {
 		c.Logging.MaxBackups < 1 || c.Logging.MaxBackups > 20 {
 		problems = append(problems, errors.New("logging path, maxBytes (>= 1 MiB) and maxBackups (1-20) are required"))
 	}
+	switch c.Logging.Level {
+	case "debug", "info", "warn", "error":
+	default:
+		problems = append(problems, errors.New("logging.level must be debug, info, warn, or error"))
+	}
 	origins := c.HTTP.EffectiveAllowedOrigins()
 	if len(origins) == 0 {
 		problems = append(problems, errors.New("http.allowedOrigins must contain at least one origin"))
@@ -275,8 +281,8 @@ func (c Config) Validate() error {
 	if !c.TURN.Enabled {
 		problems = append(problems, errors.New("embedded TURN must be enabled in P1"))
 	} else {
-		if net.ParseIP(c.TURN.AdvertisedIP) == nil {
-			problems = append(problems, errors.New("turn.advertisedIp must be configured when TURN is enabled"))
+		if ip := net.ParseIP(c.TURN.AdvertisedIP); ip == nil || ip.To4() == nil {
+			problems = append(problems, errors.New("turn.advertisedIp must be a valid IPv4 address when TURN is enabled"))
 		}
 		if c.TURN.Realm == "" || !validPortRange(c.TURN.RelayMinPort, c.TURN.RelayMaxPort) {
 			problems = append(problems, errors.New("TURN realm and relay port range are required"))
@@ -288,14 +294,14 @@ func (c Config) Validate() error {
 	}
 	if !validPortRange(c.SIP.RTPMinPort, c.SIP.RTPMaxPort) {
 		problems = append(problems, errors.New("SIP RTP port range is invalid"))
-	} else if (int(c.SIP.RTPMaxPort)-int(c.SIP.RTPMinPort)+1)/2 < c.Limits.MaxCalls {
+	} else if rtpPairCapacity(c.SIP.RTPMinPort, c.SIP.RTPMaxPort) < c.Limits.MaxCalls {
 		problems = append(problems, errors.New("SIP RTP port range must provide one RTP/RTCP pair per maximum call"))
 	}
-	if net.ParseIP(c.SIP.RTPAdvertisedIP) == nil {
-		problems = append(problems, errors.New("sip.rtpAdvertisedIp must be a valid IP address"))
+	if ip := net.ParseIP(c.SIP.RTPAdvertisedIP); ip == nil || ip.To4() == nil {
+		problems = append(problems, errors.New("sip.rtpAdvertisedIp must be a valid IPv4 address"))
 	}
-	if net.ParseIP(c.ICE.AdvertisedIP) == nil {
-		problems = append(problems, errors.New("ice.advertisedIp must be a valid IP address"))
+	if ip := net.ParseIP(c.ICE.AdvertisedIP); ip == nil || ip.To4() == nil {
+		problems = append(problems, errors.New("ice.advertisedIp must be a valid IPv4 address"))
 	}
 	if c.Limits.MaxMessageBytes != 64<<10 || c.Limits.MessagesPerWindow <= 0 ||
 		c.Limits.MessageWindow <= 0 || c.Limits.WriterQueue <= 0 ||
@@ -411,6 +417,17 @@ func isLoopbackHost(host string) bool {
 
 func validPortRange(minimum, maximum uint16) bool {
 	return minimum > 0 && maximum >= minimum
+}
+
+func rtpPairCapacity(minimum, maximum uint16) int {
+	if !validPortRange(minimum, maximum) {
+		return 0
+	}
+	first := int(minimum)
+	if first%2 != 0 {
+		first++
+	}
+	return (int(maximum) - first + 1) / 2
 }
 
 func defaultLogPath() string {

@@ -24,6 +24,10 @@ $sourceModified = (-not $hasGitCommit) -or [bool]$gitStatusOutput
 if ($RequireSignature -and (-not $hasGitCommit -or $sourceModified)) {
     throw "signed release builds require a committed, clean Git worktree"
 }
+$existingOutput = @(Get-ChildItem -LiteralPath $OutputDirectory -Force)
+if ($RequireSignature -and $existingOutput.Count -ne 0) {
+    throw "signed release builds require a new or empty output directory"
+}
 
 $env:CGO_ENABLED = "0"
 $env:GOOS = "windows"

@@ -40,6 +40,7 @@ type RTPManager struct {
 	onSource       RTPSourceEventHandler
 	mu             sync.RWMutex
 	endpoints      map[string]*rtpEndpoint
+	nextPort       int
 	tuningWarnOnce sync.Once
 }
 
@@ -66,9 +67,16 @@ func NewRTPManager(cfg RTPConfig, onPacket RTPPacketHandler, onRTCP RTCPPacketHa
 	if cfg.ListenIP == nil || cfg.AdvertisedIP == nil || cfg.MinPort == 0 || cfg.MaxPort < cfg.MinPort {
 		return nil, errors.New("invalid RTP manager configuration")
 	}
+	firstPort := int(cfg.MinPort)
+	if firstPort%2 != 0 {
+		firstPort++
+	}
+	if firstPort+1 > int(cfg.MaxPort) {
+		return nil, errors.New("RTP port range must contain an even RTP port and its RTCP pair")
+	}
 	return &RTPManager{
 		cfg: cfg, onPacket: onPacket, onRTCP: onRTCP, onSource: onSource,
-		endpoints: make(map[string]*rtpEndpoint),
+		endpoints: make(map[string]*rtpEndpoint), nextPort: firstPort,
 	}, nil
 }
 
@@ -85,14 +93,18 @@ func (m *RTPManager) Allocate(callID string) (*net.UDPAddr, error) {
 	if firstPort%2 != 0 {
 		firstPort++
 	}
-	for port := firstPort; port+1 <= int(m.cfg.MaxPort); port += 2 {
+	pairCount := (int(m.cfg.MaxPort) - firstPort + 1) / 2
+	port := m.nextPort
+	for range pairCount {
 		conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: m.cfg.ListenIP, Port: port})
 		if err != nil {
+			port = nextRTPPort(port, firstPort, int(m.cfg.MaxPort))
 			continue
 		}
 		rtcpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: m.cfg.ListenIP, Port: port + 1})
 		if err != nil {
 			_ = conn.Close()
+			port = nextRTPPort(port, firstPort, int(m.cfg.MaxPort))
 			continue
 		}
 		m.tuneSocket(conn, rtpReadBufferBytes, rtpWriteBufferBytes)
@@ -104,11 +116,20 @@ func (m *RTPManager) Allocate(callID string) (*net.UDPAddr, error) {
 			rtpWriteBuffer: make([]byte, 1600), cancel: cancel,
 		}
 		m.endpoints[callID] = endpoint
+		m.nextPort = nextRTPPort(port, firstPort, int(m.cfg.MaxPort))
 		go m.readLoop(ctx, callID, endpoint)
 		go m.readRTCPLoop(ctx, callID, endpoint)
 		return cloneUDPAddr(endpoint.advertised), nil
 	}
 	return nil, errors.New("RTP port range exhausted")
+}
+
+func nextRTPPort(current, first, maximum int) int {
+	next := current + 2
+	if next+1 > maximum {
+		return first
+	}
+	return next
 }
 
 func (m *RTPManager) tuneSocket(conn *net.UDPConn, readBytes, writeBytes int) {

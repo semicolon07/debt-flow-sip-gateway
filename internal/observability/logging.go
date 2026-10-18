@@ -19,14 +19,34 @@ type rotatingWriter struct {
 	size       int64
 }
 
-func NewLogger(path string, maxBytes int64, maxBackups int) (*slog.Logger, io.Closer, error) {
+func NewLogger(path string, maxBytes int64, maxBackups int, level string) (*slog.Logger, io.Closer, error) {
 	writer, err := newRotatingWriter(path, maxBytes, maxBackups)
 	if err != nil {
 		return nil, nil, err
 	}
+	configuredLevel, err := parseLevel(level)
+	if err != nil {
+		_ = writer.Close()
+		return nil, nil, err
+	}
 	logger := slog.New(slog.NewJSONHandler(io.MultiWriter(os.Stdout, writer),
-		&slog.HandlerOptions{Level: slog.LevelInfo}))
+		&slog.HandlerOptions{Level: configuredLevel}))
 	return logger, writer, nil
+}
+
+func parseLevel(value string) (slog.Level, error) {
+	switch value {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, errors.New("invalid logging level")
+	}
 }
 
 func newRotatingWriter(path string, maxBytes int64, maxBackups int) (*rotatingWriter, error) {

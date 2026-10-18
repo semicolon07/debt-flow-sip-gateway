@@ -306,7 +306,9 @@ Capability requirements:
 - rate limit 60 messages ต่อ rolling 10 วินาทีต่อ session
 - ping/heartbeat interval 15 วินาที และ timeout 45 วินาที
 - writer queue ต้อง bounded; slow client ต้องถูก disconnect ด้วย explicit reason
-- หลัง authenticate/reconnect ส่งข้อมูลตามลำดับ `welcome → snapshot → replay → live`
+- หลัง authenticate/reconnect ส่งข้อมูลตามลำดับ
+  `welcome → durable replay → authoritative snapshot → live` เพื่อให้ event ที่ค้างถูกส่งครบ
+  แต่ snapshot ล่าสุดเป็นผู้ตัดสิน volatile registration/call/media state และ replay เก่าไม่ทำให้ UI ถอยหลัง
 
 ### 8.2 Envelope
 
@@ -352,7 +354,7 @@ Gateway decrypt/verify capability ใน process และ consume capability ID
 | `session.authenticate` | verify one-time session capability และเปิด session |
 | `session.renew` | browser relay capability ใหม่เพื่อต่อ lease |
 | `state.get` | ขอ authoritative snapshot |
-| `events.ack` | ACK durable event ถึง sequence ที่ Portal/Web API commit แล้ว |
+| `events.ack` | ACK durable event ถึง sequence ที่ Portal/Web API commit แล้ว; production client ส่ง `commandId` และรอ correlated `command_result` หลัง SQLite commit; result อาจเลื่อน cursor ผ่าน gap ของ user session อื่นโดยไม่ ACK ข้อมูลข้ามผู้ใช้ |
 | `registration.start` | โหลด bootstrap และ register PBX |
 | `registration.stop` | unregister เมื่อไม่มี active call |
 | `webrtc.offer` | browser ส่ง SDP offer |
@@ -368,7 +370,7 @@ Gateway decrypt/verify capability ใน process และ consume capability ID
 
 ### 8.5 Events
 
-- `session.welcome`
+- `session.welcome` พร้อม authoritative `acknowledgedThrough` สำหรับ reconcile หลัง reconnect/ACK response loss
 - `gateway.snapshot`
 - `registration.state_changed`
 - `webrtc.answer`

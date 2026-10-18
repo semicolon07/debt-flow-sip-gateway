@@ -14,6 +14,32 @@ rollback runtime ทำที่ Collection บน Web API/Admin Portal แบ�
 5. ถ้าต้อง rollback ให้เปลี่ยน Collection เป็น `desktop_agent` แบบ explicit หลัง drain แล้วตรวจ call event
    ingest ต่อเนื่อง
 
+## Inbound call ไม่เข้า Portal
+
+1. ตั้ง `logging.level: "debug"` ชั่วคราวแล้ว restart service
+2. ตรวจ `inbound SIP INVITE received`; ถ้าไม่พบให้ตรวจ PBX Contact, route และ Windows Firewall ก่อน
+3. ถ้าพบ `inbound SIP call rejected` ให้ใช้ `reason` และ `sipStatusCode` แยกสาเหตุ เช่น
+   `registration_not_ready`, `browser_session_or_webrtc_not_ready`, `webrtc_not_ready`,
+   `active_call_or_session_unavailable`, `no_codec_intersection`, `invalid_sdp` หรือ `media_setup_failed`
+4. เมื่อจบการตรวจให้คืน `logging.level: "info"` และ restart service
+
+`callRef` เป็น hash สั้นของ SIP Call-ID สำหรับ correlation เท่านั้น ไม่ใช่ raw SIP Call-ID และ log จะไม่เก็บ
+หมายเลขผู้โทร, raw SIP/SDP, Authorization หรือ credential
+
+## Inbound แสดงใน Portal แต่กดรับแล้วล้ม
+
+1. ตรวจว่ามี `inbound SIP call ringing` แล้วตามด้วย `inbound SIP call answered` และ `sipStatusCode=200`
+2. ถ้าพบ `inbound SIP call answer failed` ให้ดู `failureKind` ที่ sanitize แล้ว:
+   `timeout`/`ack_missing` ให้ตรวจ ACK และ NAT/firewall, `transport` ให้ตรวจ SIP UDP/TCP route,
+   `dialog_id_mismatch`/`dialog_tag_missing` ให้ตรวจ PBX dialog headers
+3. ถ้า browser วางสายขณะ Answer กำลังรอ ACK ระบบจะส่ง BYE หลัง ACK โดยตั้งใจ; ไม่ควรมี
+   `call.connected` โผล่กลับมาหลัง `call.ended`
+4. ตรวจ API timeline ว่ามี `call.created → incoming → answering → connected` หรือ terminal state
+   ที่ sequence เพิ่มต่อเนื่อง ห้ามลบ outbox เพื่อข้าม event ที่ติด
+
+Gateway รุ่นที่แก้แล้วต้องไม่แสดง `sip_response_failed` เพียงเพราะผู้ใช้กดรับหลังเห็น 180; INVITE transaction
+จะถูกคงไว้จนมี final response การทดสอบ release ต้องครอบคลุมทั้ง UDP และ TCP
+
 ## Gateway or metrics unavailable
 
 - ตรวจ Windows Service `DebtFlowSipGateway`, IIS ARR/WebSocket และ listener 8080/9090 บน loopback

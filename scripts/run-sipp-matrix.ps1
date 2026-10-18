@@ -11,6 +11,7 @@ param(
         "outbound-no-answer",
         "inbound-answer-bye",
         "inbound-answer-bye-pcma",
+        "inbound-answer-bye-mixed-codecs",
         "inbound-cancel",
         "inbound-unsupported-codec",
         "inbound-malformed-sdp",

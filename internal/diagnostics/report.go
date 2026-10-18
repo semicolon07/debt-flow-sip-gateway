@@ -47,8 +47,9 @@ type HTTP struct {
 }
 
 type Logging struct {
-	MaxBytes   int64 `json:"maxBytes"`
-	MaxBackups int   `json:"maxBackups"`
+	Level      string `json:"level"`
+	MaxBytes   int64  `json:"maxBytes"`
+	MaxBackups int    `json:"maxBackups"`
 }
 
 type Capability struct {
@@ -127,7 +128,7 @@ func Build(cfg config.Config, version string, now time.Time) Report {
 			AuthTimeout: cfg.HTTP.AuthTimeout.String(), Heartbeat: cfg.HTTP.Heartbeat.String(),
 			IdleTimeout: cfg.HTTP.IdleTimeout.String(),
 		},
-		Logging: Logging{MaxBytes: cfg.Logging.MaxBytes, MaxBackups: cfg.Logging.MaxBackups},
+		Logging: Logging{Level: cfg.Logging.Level, MaxBytes: cfg.Logging.MaxBytes, MaxBackups: cfg.Logging.MaxBackups},
 		Capability: Capability{
 			Issuer: cfg.Capability.Issuer, Audience: cfg.Capability.Audience,
 			ProtectedKeyIDs: keyIDs, PlainKeyCount: len(cfg.Capability.PlaintextKeys),

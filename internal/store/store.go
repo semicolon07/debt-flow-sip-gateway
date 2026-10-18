@@ -55,11 +55,15 @@ type BeginCommandResult struct {
 }
 
 type Event struct {
-	SessionID string
-	Sequence  uint64
-	Type      string
-	Payload   []byte
-	CreatedAt time.Time
+	SessionID           string
+	AgentInstanceID     string
+	UserSessionID       string
+	CollectionID        string
+	CollectionBindingID string
+	Sequence            uint64
+	Type                string
+	Payload             []byte
+	CreatedAt           time.Time
 }
 
 type Stats struct {
@@ -105,6 +109,37 @@ func Open(ctx context.Context, path string, limits Limits) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) BindSession(ctx context.Context, sessionID, agentInstanceID, userSessionID,
+	collectionID, collectionBindingID string, now time.Time) error {
+	if sessionID == "" || agentInstanceID == "" || userSessionID == "" ||
+		collectionID == "" || collectionBindingID == "" {
+		return errors.New("complete session binding is required")
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	result, err := s.db.ExecContext(ctx, `
+INSERT INTO session_bindings(
+  session_id, agent_instance_id, user_session_id, collection_id, collection_binding_id, updated_at_utc)
+VALUES(?, ?, ?, ?, ?, ?)
+ON CONFLICT(session_id) DO UPDATE SET updated_at_utc=excluded.updated_at_utc
+WHERE session_bindings.agent_instance_id=excluded.agent_instance_id
+  AND session_bindings.user_session_id=excluded.user_session_id
+  AND session_bindings.collection_id=excluded.collection_id
+  AND session_bindings.collection_binding_id=excluded.collection_binding_id`,
+		sessionID, agentInstanceID, userSessionID, collectionID, collectionBindingID, utc(now))
+	if err != nil {
+		return fmt.Errorf("bind gateway session: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("inspect gateway session binding: %w", err)
+	}
+	if rows != 1 {
+		return errors.New("gateway session binding conflicts with persisted identity")
+	}
+	return nil
+}
 
 func (s *Store) CheckIntegrity(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx, `PRAGMA quick_check`)
@@ -170,6 +205,17 @@ CREATE TABLE IF NOT EXISTS agent_sequences (
     next_sequence INTEGER NOT NULL CHECK(next_sequence > 0)
 );
 
+CREATE TABLE IF NOT EXISTS session_bindings (
+    session_id TEXT PRIMARY KEY,
+    agent_instance_id TEXT NOT NULL,
+    user_session_id TEXT NOT NULL,
+    collection_id TEXT NOT NULL,
+    collection_binding_id TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_session_bindings_agent_user
+ON session_bindings(agent_instance_id, user_session_id, session_id);
+
 CREATE TABLE IF NOT EXISTS calls (
     call_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -228,7 +274,7 @@ ON CONFLICT(agent_instance_id) DO UPDATE SET
     next_sequence = MAX(agent_sequences.next_sequence, excluded.next_sequence)`); err != nil {
 		return fmt.Errorf("backfill agent sequence cursor: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE schema_info SET version = 5 WHERE version < 5`); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE schema_info SET version = 6 WHERE version < 6`); err != nil {
 		return fmt.Errorf("update sqlite schema version: %w", err)
 	}
 	return nil
@@ -385,10 +431,22 @@ VALUES(?, ?, ?, NULLIF(?, ''), ?, ?, ?)`, sessionID, agentInstanceID, sequence, 
 	if err != nil {
 		return Event{}, fmt.Errorf("append outbox event: %w", err)
 	}
+	stored := Event{
+		SessionID: sessionID, AgentInstanceID: agentInstanceID, Sequence: sequence,
+		Type: eventType, Payload: payload, CreatedAt: now.UTC(),
+	}
+	bindingErr := tx.QueryRowContext(ctx, `
+SELECT user_session_id, collection_id, collection_binding_id
+FROM session_bindings WHERE session_id=? AND agent_instance_id=?`,
+		sessionID, agentInstanceID).Scan(
+		&stored.UserSessionID, &stored.CollectionID, &stored.CollectionBindingID)
+	if bindingErr != nil && !errors.Is(bindingErr, sql.ErrNoRows) {
+		return Event{}, fmt.Errorf("read event session binding: %w", bindingErr)
+	}
 	if err := tx.Commit(); err != nil {
 		return Event{}, err
 	}
-	return Event{SessionID: sessionID, Sequence: sequence, Type: eventType, Payload: payload, CreatedAt: now.UTC()}, nil
+	return stored, nil
 }
 
 func (s *Store) PendingEvents(ctx context.Context, sessionID string, after uint64, limit int) ([]Event, error) {
@@ -396,10 +454,14 @@ func (s *Store) PendingEvents(ctx context.Context, sessionID string, after uint6
 		limit = s.limits.PerSession
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT session_id, sequence, event_type, payload, created_at_utc
-FROM outbox
-WHERE session_id = ? AND acked_at_utc IS NULL AND sequence > ?
-ORDER BY sequence LIMIT ?`, sessionID, after, limit)
+SELECT o.session_id, o.agent_instance_id,
+       COALESCE(b.user_session_id, ''), COALESCE(b.collection_id, ''),
+       COALESCE(b.collection_binding_id, ''),
+       o.sequence, o.event_type, o.payload, o.created_at_utc
+FROM outbox o
+LEFT JOIN session_bindings b ON b.session_id=o.session_id
+WHERE o.session_id = ? AND o.acked_at_utc IS NULL AND o.sequence > ?
+ORDER BY o.sequence LIMIT ?`, sessionID, after, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -408,7 +470,47 @@ ORDER BY sequence LIMIT ?`, sessionID, after, limit)
 	for rows.Next() {
 		var event Event
 		var created string
-		if err := rows.Scan(&event.SessionID, &event.Sequence, &event.Type, &event.Payload, &created); err != nil {
+		if err := rows.Scan(&event.SessionID, &event.AgentInstanceID, &event.UserSessionID,
+			&event.CollectionID, &event.CollectionBindingID, &event.Sequence,
+			&event.Type, &event.Payload, &created); err != nil {
+			return nil, err
+		}
+		event.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
+		if err != nil {
+			return nil, fmt.Errorf("parse outbox timestamp: %w", err)
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
+func (s *Store) PendingAgentEvents(ctx context.Context, agentInstanceID, userSessionID string,
+	after uint64, limit int) ([]Event, error) {
+	if agentInstanceID == "" || userSessionID == "" {
+		return nil, errors.New("agent and user session are required")
+	}
+	if limit <= 0 || limit > s.limits.Global {
+		limit = s.limits.Global
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT o.session_id, o.agent_instance_id, b.user_session_id, b.collection_id,
+       b.collection_binding_id, o.sequence, o.event_type, o.payload, o.created_at_utc
+FROM outbox o
+JOIN session_bindings b ON b.session_id=o.session_id
+WHERE o.agent_instance_id=? AND b.user_session_id=?
+  AND o.acked_at_utc IS NULL AND o.sequence > ?
+ORDER BY o.sequence LIMIT ?`, agentInstanceID, userSessionID, after, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var events []Event
+	for rows.Next() {
+		var event Event
+		var created string
+		if err := rows.Scan(&event.SessionID, &event.AgentInstanceID, &event.UserSessionID,
+			&event.CollectionID, &event.CollectionBindingID, &event.Sequence,
+			&event.Type, &event.Payload, &created); err != nil {
 			return nil, err
 		}
 		event.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
@@ -425,8 +527,95 @@ func (s *Store) Acknowledge(ctx context.Context, sessionID string, through uint6
 	defer s.writeMu.Unlock()
 	_, err := s.db.ExecContext(ctx, `
 UPDATE outbox SET acked_at_utc = COALESCE(acked_at_utc, ?)
-WHERE session_id = ? AND sequence <= ?`, utc(now), sessionID, through)
+WHERE session_id = ? AND sequence <= ? AND acked_at_utc IS NULL`, utc(now), sessionID, through)
 	return err
+}
+
+// AcknowledgeAgent advances the cumulative cursor across logical gateway
+// sessions owned by the same persistent browser/agent identity. A browser
+// refresh or Collection switch creates a new session ID, while event sequences
+// remain global to agent_instance_id; limiting ACK to the newest session would
+// leave already-committed rows orphaned forever.
+func (s *Store) AcknowledgeAgent(ctx context.Context, agentInstanceID, userSessionID string,
+	through uint64, now time.Time) (uint64, error) {
+	if agentInstanceID == "" || userSessionID == "" {
+		return 0, errors.New("agent instance and user session are required")
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var nextSequence uint64
+	err = tx.QueryRowContext(ctx,
+		`SELECT next_sequence FROM agent_sequences WHERE agent_instance_id=?`, agentInstanceID,
+	).Scan(&nextSequence)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, errors.New("event acknowledgement has no produced sequence")
+	}
+	if err != nil {
+		return 0, err
+	}
+	if nextSequence == 0 || through >= nextSequence {
+		return 0, errors.New("event acknowledgement exceeds produced sequence")
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE outbox SET acked_at_utc = COALESCE(acked_at_utc, ?)
+WHERE rowid IN (
+  SELECT o.rowid FROM outbox o
+  JOIN session_bindings b ON b.session_id=o.session_id
+  WHERE o.agent_instance_id=? AND b.user_session_id=?
+    AND o.sequence <= ? AND o.acked_at_utc IS NULL
+)`, utc(now), agentInstanceID, userSessionID, through); err != nil {
+		return 0, err
+	}
+	confirmed, err := confirmedCursor(ctx, tx, agentInstanceID, userSessionID)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return confirmed, nil
+}
+
+// ConfirmedCursor returns the highest sequence for which this authenticated
+// user has no uncommitted event. Sequence numbers are agent-wide, so gaps that
+// belong to a different user session are deliberately skipped without ACKing
+// that other user's rows.
+func (s *Store) ConfirmedCursor(ctx context.Context, agentInstanceID, userSessionID string) (uint64, error) {
+	if agentInstanceID == "" || userSessionID == "" {
+		return 0, errors.New("agent instance and user session are required")
+	}
+	return confirmedCursor(ctx, s.db, agentInstanceID, userSessionID)
+}
+
+type rowQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func confirmedCursor(ctx context.Context, query rowQuerier, agentInstanceID, userSessionID string) (uint64, error) {
+	var cursor uint64
+	err := query.QueryRowContext(ctx, `
+WITH produced AS (
+  SELECT COALESCE((SELECT next_sequence - 1 FROM agent_sequences WHERE agent_instance_id=?), 0) AS last_sequence
+), pending AS (
+  SELECT MIN(o.sequence) AS first_sequence
+  FROM outbox o
+  JOIN session_bindings b ON b.session_id=o.session_id
+  WHERE o.agent_instance_id=? AND b.user_session_id=? AND o.acked_at_utc IS NULL
+)
+SELECT CASE
+  WHEN pending.first_sequence IS NULL THEN produced.last_sequence
+  ELSE pending.first_sequence - 1
+END
+FROM produced, pending`, agentInstanceID, agentInstanceID, userSessionID).Scan(&cursor)
+	if err != nil {
+		return 0, err
+	}
+	return cursor, nil
 }
 
 func (s *Store) SaveCall(ctx context.Context, sessionID, agentInstanceID string, snapshot call.Snapshot, now time.Time) error {
@@ -589,6 +778,10 @@ func (s *Store) Maintain(ctx context.Context, before, now time.Time) (Maintenanc
 		{`DELETE FROM commands WHERE status IN ('completed','failed') AND updated_at_utc < ?`, utc(before)},
 		{`DELETE FROM calls WHERE active = 0 AND updated_at_utc < ?`, utc(before)},
 		{`DELETE FROM consumed_capabilities WHERE expires_at_utc < ?`, utc(now)},
+		{`DELETE FROM session_bindings
+WHERE updated_at_utc < ?
+  AND NOT EXISTS (SELECT 1 FROM outbox WHERE outbox.session_id=session_bindings.session_id)
+  AND NOT EXISTS (SELECT 1 FROM calls WHERE calls.session_id=session_bindings.session_id)`, utc(before)},
 	}
 	var result MaintenanceResult
 	for _, statement := range statements {

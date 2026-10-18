@@ -56,7 +56,8 @@ PeerConnection/RTP buffers และ unacknowledged outbox ใช้ memory ห�
   lease/reconnect, takeover protection และ bounded queues
 - SQLite WAL command journal, per-agent monotonic event sequence, durable session outbox, ACK/replay และ
   deterministic restart terminalization
-- bounded rotating JSON operational logs, Prometheus dashboard/alerts และ allowlisted diagnostics
+- bounded rotating JSON operational logs พร้อม production `info`/sanitized diagnostic `debug`,
+  Prometheus dashboard/alerts และ allowlisted diagnostics
 - Pion WebRTC/ICE, embedded TURN UDP/TCP, G.711 RTP mapping, RFC 4733 DTMF และ browser audio controls
 - SIPGo REGISTER/INVITE lifecycle หลัง `sip.spikeApproved` gate พร้อม inbound/outbound call state
 - local AES-256-GCM session/call capability verification โดย Gateway ไม่เชื่อม Web API

@@ -137,6 +137,133 @@ func TestOutboxSequenceIsMonotonicAcrossSessionsForTheSameAgent(t *testing.T) {
 	}
 }
 
+func TestAgentACKClearsCommittedRowsAcrossGatewaySessions(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, 10, 100)
+	now := time.Now().UTC()
+	for _, binding := range []struct{ session, agent, user, collection string }{
+		{"session-1", "agent-1", "user-session-1", "col-1"},
+		{"session-2", "agent-1", "user-session-1", "col-2"},
+		{"session-3", "agent-1", "user-session-2", "col-3"},
+		{"session-4", "agent-1", "user-session-1", "col-4"},
+		{"session-5", "agent-2", "user-session-2", "col-5"},
+	} {
+		if err := store.BindSession(ctx, binding.session, binding.agent, binding.user,
+			binding.collection, "binding-"+binding.collection, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := store.AppendEvent(ctx, "session-1", "agent-1", "first", "call.state_changed", []byte(`{}`), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.AppendEvent(ctx, "session-2", "agent-1", "second", "call.state_changed", []byte(`{}`), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherUser, err := store.AppendEvent(ctx, "session-3", "agent-1", "other-user", "call.state_changed", []byte(`{}`), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fourth, err := store.AppendEvent(ctx, "session-4", "agent-1", "fourth", "call.state_changed", []byte(`{}`), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherAgent, err := store.AppendEvent(ctx, "session-5", "agent-2", "other-agent", "call.state_changed", []byte(`{}`), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := store.PendingAgentEvents(ctx, "agent-1", "user-session-1", 0, 10)
+	if err != nil || len(replay) != 3 || replay[0].CollectionID != "col-1" ||
+		replay[0].CollectionBindingID != "binding-col-1" || replay[1].CollectionID != "col-2" ||
+		replay[2].CollectionID != "col-4" {
+		t.Fatalf("unexpected cross-session replay: events=%+v err=%v", replay, err)
+	}
+	isolated, err := store.PendingAgentEvents(ctx, "agent-1", "user-session-2", 0, 10)
+	if err != nil || len(isolated) != 1 || isolated[0].Sequence != otherUser.Sequence {
+		t.Fatalf("event replay crossed authenticated user session: events=%+v err=%v", isolated, err)
+	}
+	confirmed, err := store.AcknowledgeAgent(ctx, "agent-1", "user-session-1", second.Sequence, now)
+	if err != nil || confirmed != otherUser.Sequence {
+		t.Fatalf("ACK did not skip the other user's sequence: confirmed=%d err=%v", confirmed, err)
+	}
+	confirmed, err = store.AcknowledgeAgent(ctx, "agent-1", "user-session-1", fourth.Sequence, now)
+	if err != nil || confirmed != fourth.Sequence {
+		t.Fatalf("final ACK: confirmed=%d err=%v", confirmed, err)
+	}
+	if _, err := store.AcknowledgeAgent(ctx, "agent-1", "user-session-1", 999, now); err == nil {
+		t.Fatal("expected an ACK beyond the produced sequence to fail")
+	}
+	for _, sessionID := range []string{"session-1", "session-2", "session-4"} {
+		pending, err := store.PendingEvents(ctx, sessionID, 0, 10)
+		if err != nil || len(pending) != 0 {
+			t.Fatalf("agent ACK left session %s pending: events=%+v err=%v", sessionID, pending, err)
+		}
+	}
+	pending, err := store.PendingEvents(ctx, "session-3", 0, 10)
+	if err != nil || len(pending) != 1 || pending[0].Sequence != otherUser.Sequence {
+		t.Fatalf("agent ACK crossed identity boundary: events=%+v err=%v", pending, err)
+	}
+	pending, err = store.PendingEvents(ctx, "session-5", 0, 10)
+	if err != nil || len(pending) != 1 || pending[0].Sequence != otherAgent.Sequence {
+		t.Fatalf("agent ACK crossed agent boundary: events=%+v err=%v", pending, err)
+	}
+	if first.Sequence != 1 || second.Sequence != 2 {
+		t.Fatalf("unexpected agent sequences: first=%d second=%d", first.Sequence, second.Sequence)
+	}
+}
+
+func TestSessionBindingIsImmutableAndMaintenanceRemovesOnlyUnreferencedBindings(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, 10, 100)
+	now := time.Now().UTC()
+	old := now.Add(-2 * time.Hour)
+	if err := store.BindSession(ctx, "session-empty", "agent-1", "user-session-1",
+		"col-1", "binding-col-1", old); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindSession(ctx, "session-referenced", "agent-1", "user-session-1",
+		"col-1", "binding-col-1", old); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindSession(ctx, "session-touched", "agent-1", "user-session-1",
+		"col-1", "binding-col-1", old); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindSession(ctx, "session-touched", "agent-1", "user-session-1",
+		"col-1", "binding-col-1", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AppendEvent(ctx, "session-referenced", "agent-1", "event-1",
+		"call.state_changed", []byte(`{}`), old); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindSession(ctx, "session-referenced", "agent-1", "user-session-1",
+		"col-2", "binding-col-2", now); err == nil {
+		t.Fatal("expected immutable session binding conflict")
+	}
+	if _, err := store.Maintain(ctx, now.Add(-time.Hour), now); err != nil {
+		t.Fatal(err)
+	}
+	var empty, referenced, touched int
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM session_bindings WHERE session_id='session-empty'`).Scan(&empty); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM session_bindings WHERE session_id='session-referenced'`).Scan(&referenced); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM session_bindings WHERE session_id='session-touched'`).Scan(&touched); err != nil {
+		t.Fatal(err)
+	}
+	if empty != 0 || referenced != 1 || touched != 1 {
+		t.Fatalf("unexpected binding maintenance: empty=%d referenced=%d touched=%d",
+			empty, referenced, touched)
+	}
+}
+
 func TestConcurrentWritersAreSerializedWithoutSQLiteBusy(t *testing.T) {
 	const workers = 200
 	ctx := context.Background()
@@ -279,8 +406,8 @@ VALUES('session-1', 7, 'legacy-event', 'call.state_changed', X'7B7D', '2026-10-1
 	if err := store.db.QueryRowContext(ctx, `SELECT version FROM schema_info LIMIT 1`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 5 {
-		t.Fatalf("schema version=%d, want 5", version)
+	if version != 6 {
+		t.Fatalf("schema version=%d, want 6", version)
 	}
 	var optimizedIndexes int
 	if err := store.db.QueryRowContext(ctx, `
@@ -337,8 +464,8 @@ VALUES('call-legacy', 'session-legacy', X'7B7D', 0, '2026-10-17T00:00:00Z');`)
 	if err := store.db.QueryRowContext(ctx, `SELECT version FROM schema_info LIMIT 1`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 5 {
-		t.Fatalf("schema version=%d, want 5", version)
+	if version != 6 {
+		t.Fatalf("schema version=%d, want 6", version)
 	}
 }
 

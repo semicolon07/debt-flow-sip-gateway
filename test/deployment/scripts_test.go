@@ -3,6 +3,7 @@ package deployment
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -10,12 +11,30 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestInstallerStopsAnExistingServiceBeforeReplacingTheBinary(t *testing.T) {
+func TestInstallerValidatesStagedBinaryThenStopsServiceBeforeReplacingStableBinary(t *testing.T) {
 	script := readScript(t, "install-service.ps1")
+	validate := strings.Index(script, "& $stagedTarget --config $config --check-config")
 	stop := strings.Index(script, "Stop-Service -Name $ServiceName")
-	copyBinary := strings.Index(script, "Copy-Item $source $target -Force")
-	if stop < 0 || copyBinary < 0 || stop > copyBinary {
-		t.Fatal("installer must stop an existing service before replacing its executable")
+	replaceBinary := strings.Index(script, "Move-Item -LiteralPath $stagedTarget -Destination $target -Force")
+	if validate < 0 || stop < 0 || replaceBinary < 0 || validate > stop || stop > replaceBinary {
+		t.Fatal("installer must validate staging before stopping the service and replace only after it stops")
+	}
+}
+
+func TestInstallerRollsBackBinaryAndRestartsExistingServiceOnFailure(t *testing.T) {
+	script := readScript(t, "install-service.ps1")
+	for _, required := range []string{
+		`Copy-Item -LiteralPath $target -Destination $rollbackTarget -Force`,
+		`Copy-Item -LiteralPath $rollbackTarget -Destination $target -Force`,
+		`Start-Service -Name $ServiceName -ErrorAction SilentlyContinue`,
+		`Remove-Item -LiteralPath $stagedTarget -Force -ErrorAction SilentlyContinue`,
+		`-ExpectedSignerThumbprint is required with -RequireSignature`,
+		`source executable must have a valid Authenticode signature from the expected signer`,
+		`$actualThumbprint -ne $expectedThumbprint`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("transactional installer is missing %s", required)
+		}
 	}
 }
 
@@ -48,24 +67,64 @@ func TestReleasePreflightRequiresSignedPackageEvidenceAndProtectedKeys(t *testin
 	script := readScript(t, "test-pilot-preflight.ps1")
 	for _, required := range []string{
 		`"release-binary-checksum"`,
+		`"release-package-checksums"`,
 		`"release-cyclonedx-sbom"`,
 		`"release-build-info"`,
 		`"release-manifest-binary-binding"`,
 		`"capability-keys-protected"`,
 		`"secure-browser-origin"`,
 		`Get-AuthenticodeSignature`,
+		`"-ExpectedSignerThumbprint is required"`,
+		`$actualThumbprint -eq $expectedThumbprint`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Fatalf("release preflight is missing %s", required)
 		}
 	}
 	if !strings.Contains(script, `$checksumValid -or -not $RequireReleaseEvidence`) ||
+		!strings.Contains(script, `$packageChecksumsValid -or -not $RequireReleaseEvidence`) ||
 		!strings.Contains(script, `$sbomValid -or -not $RequireReleaseEvidence`) {
 		t.Fatal("development mode may relax package evidence but release mode must not")
+	}
+	for _, required := range []string{
+		`StartsWith($releasePrefix, [StringComparison]::OrdinalIgnoreCase)`,
+		`duplicate checksum path`,
+		`$actualHash -ne $expectedHash`,
+		`$entryCount -gt 0 -and $binaryEntrySeen`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("recursive package checksum verification is missing %s", required)
+		}
 	}
 	if !strings.Contains(script, `"wildcard browser origin enabled"`) ||
 		!strings.Contains(script, `Add-Check "secure-browser-origin" (-not $insecureLoopbackOrigin)`) {
 		t.Fatal("preflight must disclose but permit the explicit HTTPS wildcard policy")
+	}
+}
+
+func TestReleasePreflightScansForbiddenAPIClientKeysWithoutRejectingCapabilityIssuer(t *testing.T) {
+	script := readScript(t, "test-pilot-preflight.ps1")
+	if strings.Contains(script, `-Pattern '(?i)web.?api|api.?url|http.?client|bearer|authorization'`) {
+		t.Fatal("preflight must not scan arbitrary values or comments for API-client words")
+	}
+	const pattern = `(?im)^\s*[A-Za-z0-9_-]*(?:api|http.?client|bearer|authorization)[A-Za-z0-9_-]*\s*:`
+	matcher := regexp.MustCompile(pattern)
+	config, err := os.ReadFile(filepath.Join(moduleRoot(t), "config.example.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matcher.Match(config) {
+		t.Fatal("production configuration identity values must not look like an outbound API client")
+	}
+	for _, forbidden := range []string{
+		"webApiUrl: https://api.example.test",
+		"debtFlowApiEndpoint: https://api.example.test",
+		"httpClient: enabled",
+		"authorization: bearer",
+	} {
+		if !matcher.MatchString(forbidden) {
+			t.Fatalf("forbidden API-client key was not detected: %q", forbidden)
+		}
 	}
 }
 
@@ -97,6 +156,8 @@ func TestSignedReleaseBuilderBindsVersionAndCommitFromACleanTree(t *testing.T) {
 		`gitCommit = $gitCommit`,
 		`targetOs = "windows"`,
 		`targetArchitecture = "amd64"`,
+		`Get-ChildItem -LiteralPath $OutputDirectory -Force`,
+		`signed release builds require a new or empty output directory`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Fatalf("signed release builder is missing %s", required)

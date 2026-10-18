@@ -27,7 +27,7 @@ import (
 
 func Run(ctx context.Context, cfg config.Config) error {
 	logger, logCloser, err := observability.NewLogger(
-		cfg.Logging.Path, cfg.Logging.MaxBytes, cfg.Logging.MaxBackups,
+		cfg.Logging.Path, cfg.Logging.MaxBytes, cfg.Logging.MaxBackups, cfg.Logging.Level,
 	)
 	if err != nil {
 		return fmt.Errorf("open operational log: %w", err)
@@ -200,6 +200,7 @@ func Run(ctx context.Context, cfg config.Config) error {
 		sipRuntime, err = sip.NewSIPGoRuntime(sip.SIPGoConfig{
 			ListenUDP: cfg.SIP.ListenUDP, ListenTCP: cfg.SIP.ListenTCP,
 			AdvertisedIP: cfg.SIP.RTPAdvertisedIP, UserAgent: "DebtFlowSipGateway/1",
+			Logger: logger,
 			CanAcceptIncoming: func(sessionID string) bool {
 				return coordinator != nil && coordinator.CanAcceptIncoming(sessionID)
 			},

@@ -48,8 +48,10 @@ P1 engineering scope ปิดรับมอบเมื่อ 18/10/2026 แ�
 Build the release with required signature, then run on the clean VM:
 
 ```powershell
-.\scripts\build.ps1 -Version <version> -CodeSigningCertificateThumbprint <thumbprint> -RequireSignature
-.\scripts\test-pilot-preflight.ps1 -RequireReleaseEvidence -ForbiddenApiHost api-debt-flow.uniga.app
+.\scripts\build.ps1 -Version <version> -OutputDirectory .\dist\release\<version> `
+  -CodeSigningCertificateThumbprint <thumbprint> -RequireSignature
+.\scripts\test-pilot-preflight.ps1 -RequireReleaseEvidence `
+  -ForbiddenApiHost api-debt-flow.uniga.app -ExpectedSignerThumbprint <thumbprint>
 ```
 
 Run each SIPp scenario for both transports. The PBX address inside the issued SIP bootstrap must point to

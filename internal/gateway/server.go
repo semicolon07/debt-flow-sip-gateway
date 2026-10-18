@@ -389,10 +389,11 @@ func (s *Server) enqueueInitialAndStream(
 	live <-chan protocol.Envelope,
 	writerDone <-chan error,
 ) (<-chan error, error) {
-	// Queue the welcome, snapshot and durable replay synchronously before the
-	// live pump starts. Initial replay applies backpressure through the bounded
-	// writer queue instead of rejecting a healthy reconnect merely because its
-	// replay is longer than that queue.
+	// Queue welcome, durable replay and the final authoritative snapshot
+	// synchronously before the live pump starts. Initial replay applies
+	// backpressure through the bounded writer queue instead of rejecting a
+	// healthy reconnect merely because its replay is longer than that queue.
+	// The final snapshot prevents stale replay from regressing volatile state.
 	for _, event := range initial {
 		select {
 		case current.send <- event:

@@ -2,7 +2,7 @@
 
 วันที่: 17/10/2026
 
-สถานะ: **P1 engineering scope CLOSED 18/10/2026 / ยังไม่อนุมัติ production rollout**
+สถานะ: **Corrective local gates passed 18/10/2026 / ยังไม่อนุมัติ production rollout**
 
 การรับมอบครั้งนี้ปิดงาน implementation, contract integration และ automated verification ของ P1
 ส่วน interoperability, clean-VM, signed release, load/soak และ operational evidence เป็น production release
@@ -26,18 +26,29 @@ gate ที่ยังต้องดำเนินการตาม `pilot-a
 - SIPGo UDP/TCP client แยกตาม transport/local port, REGISTER digest, inbound/outbound dialog lifecycle,
   late-200 handling และ explicit RTP/RTCP endpoint parsing
 - inbound Answer ใช้ remote RTP/RTCP endpoint ที่ validate จาก INVITE โดยไม่ parse SDP ว่างซ้ำจาก UAS
-  connected callback; regression ครอบคลุม incoming → answering → connected, เสียงสองทาง, remote BYE,
-  Reject 486 และ remote CANCEL
+  connected callback และคง SIP INVITE server transaction ไว้จน final response/ACK แทนการ return หลัง 180;
+  regression ครอบคลุม UDP/TCP incoming → answering → connected, remote BYE, Reject 486, remote CANCEL,
+  local hangup ระหว่าง ringing/รอ ACK และ late CANCEL หลัง final response โดย call/transaction ถูก cleanup ครบ
+- inbound codec selection หา intersection จาก PCMU/PCMA ทั้ง offer โดยไม่ขึ้นกับลำดับ preference ของ PBX
+  และ SDP answer/translator ใช้ RFC 4733 payload ที่ PBX เสนอจริง; ไม่มี intersection เท่านั้นจึงตอบ 488
 - Pion WebRTC PCMU/PCMA passthrough, RFC 4733, ICE UDP mux และ embedded TURN UDP/TCP
+- RFC 4733 ที่ส่งพร้อม audio ใช้ SSRC แยกจาก audio stream เพื่อไม่ให้ sequence space ของ event packets
+  ชนกับ G.711 RTP ที่ยังไหลพร้อมกัน
 - TURN one-allocation-per-session/global quota, atomic slot reservation, bandwidth quota และ bounded metrics
 - SQLite WAL command journal/outbox/ACK/replay/restart terminalization พร้อม size/retention guard
-- SQLite schema v4 เก็บ persistent `agentInstanceId` ใน session outbox และ sequence cursor แยกตาม agent;
+- SQLite schema v6 เก็บ persistent `agentInstanceId` ใน session outbox, sequence cursor แยกตาม agent และ
+  immutable session binding สำหรับ user/Collection-scoped replay;
   session ใหม่ของ browser installation เดิมจึงไม่ reuse `(agentInstanceId, sequence)` ที่ Web API ใช้
   deduplicate, retention purge ไม่ทำให้ cursor reset และ restart terminal event ใช้ scope เดิมของ call
 - WSS command error correlation, deterministic `welcome → replay → authoritative snapshot → live`, failed-takeover
   isolation และ registry ownership แยกตาม user session + Collection
 - initial durable replay ใช้ bounded writer backpressure จึงส่ง replay ที่ยาวกว่า queue ได้ตามลำดับ;
   writer failure ถูกส่งกลับ admission loop และ live queue overflow ยัง fail closed
+- durable replay ผูก session กับ agent/user/Collection ใน SQLite จึงส่ง event ที่ยังไม่ commit ต่อหลัง page refresh
+  โดยรักษา metadata ต้นทางและไม่เปิดช่อง cross-user replay; ACK เป็น correlated commit และ reconnect ใช้
+  authoritative `acknowledgedThrough` ปิด ACK-response-loss window
+- Web App fence callback จาก retired WebSocket/PeerConnection และ async media setup ทุกช่วง await;
+  event จาก session/Collection เก่าถูก ingest แต่ไม่เรียก ringtone หรือเปลี่ยน current-call projection
 - WSS heartbeat ใช้ transport ping/pong เป็น liveness source; session ที่ไม่มี application command จะไม่ถูก
   idle timeout ผิดพลาด และ reader/writer failure ยกเลิก connection lifecycle ร่วมกัน
 - WSS message admission ใช้ bounded sliding window จริง จึงไม่เปิดช่อง burst สองเท่าที่รอยต่อ fixed window
@@ -63,6 +74,8 @@ gate ที่ยังต้องดำเนินการตาม `pilot-a
 - outbox capacity alert คำนวณจาก limit ที่ตั้งจริง โดยใช้ pressure สูงสุดของ pending รวม, pending ต่อ session
   และ DB+WAL; warning ที่ 80% และ critical/block-call boundary ที่ 90% มี deployment contract test กำกับ
 - SQLite maintenance/statistics failure มี bounded Prometheus counter และ critical alert แยกจาก checkpoint-busy gauge
+- cumulative outbox ACK update เฉพาะ pending rows จึงไม่ย้อนเขียนประวัติที่ ACK แล้วแบบ O(n²);
+  local `synchronous=FULL` benchmark ลดจาก 3.70–4.18 ms/op เป็น 0.198–0.227 ms/op
 - release script สร้าง Windows amd64 executable, CycloneDX SBOM, recursive checksums และรองรับ required
   Authenticode signing
 - installer หยุด service ก่อน replace executable, register service SID ก่อนให้ ACL, จำกัด capability keys
@@ -80,6 +93,8 @@ gate ที่ยังต้องดำเนินการตาม `pilot-a
   call-context/event-ingest contract เดิม
 - Web App เพิ่ม `SipGatewayAdapter`, WebRTC/audio controls, capability renewal/reconnect และ normalize event
   เข้า `PhoneEventRelayService` เดิม
+- registration event ที่ผ่าน local projection ถูก cumulative ACK ทันทีเมื่อ sequence ต่อเนื่อง แม้ยังไม่มี
+  call event ตามมา จึงไม่ replay/สะสม durable registration outbox โดยไม่จำเป็น
 - inbound `ringing` ถูก normalize เป็น `incoming` เพื่อเปิด Answer/Reject และ browser สร้าง local
   ringtone/ringback แบบ cadence ผ่าน output device/volume ที่ผู้ใช้เลือก; tone implementation ถูก lazy-load
   เพื่อให้ production bundle ยังผ่าน hard performance budget
@@ -87,9 +102,11 @@ gate ที่ยังต้องดำเนินการตาม `pilot-a
   เพื่อไม่ขอ microphone/capability วนเมื่อ permission ถูกปฏิเสธหรือ revoke
 - browser audio ใช้ mono voice constraints (`echoCancellation`, `noiseSuppression`, `autoGainControl`),
   ติดตาม `devicechange` เพื่อ fallback ไป default microphone/speaker และมี inbound-RTP watchdog ที่
-  retry playback/แจ้ง diagnostic โดยไม่ตัด SIP call อัตโนมัติ
+  retry playback/แจ้ง diagnostic โดยไม่ตัด SIP call อัตโนมัติ; การสลับ/ปิด microphone disconnect Web Audio
+  graph เดิมและ cleanup stream แม้สร้าง processed track ไม่สำเร็จ
 - Gateway ขยาย shared ICE และ per-call RTP/RTCP UDP buffers, mark DSCP EF แบบ best-effort,
-  และเพิ่ม packet-loss/jitter dashboard + alert โดย QoS ที่ OS ไม่รองรับจะ log warning และทำงานต่อ
+  ใช้ round-robin port cursor สำหรับ burst allocation 200 calls และเพิ่ม packet-loss/jitter dashboard + alert
+  โดย QoS ที่ OS ไม่รองรับจะ log warning และทำงานต่อ
 - legacy data ที่ไม่มี runtime/transport normalize เป็น `desktop_agent` + `udp`
 
 ## Desktop Agent contract/lifecycle parity fix (2026-10-18)
@@ -110,11 +127,16 @@ gate ที่ยังต้องดำเนินการตาม `pilot-a
   โดยไม่ต้องลบ SQLite; Gateway รุ่นใหม่ไม่ใช้ทางลัดนี้แล้ว
 
 Regression tests ครอบคลุม outbound lifecycle ทั้งเส้น, inbound `incoming/answering`, terminal event pair,
-legacy API ingest และ Gateway-to-existing-durable-contract normalization
+legacy API ingest, exact Gateway inbound answer lifecycle ที่ Web App/Web API, idempotent re-ingest และ
+Gateway-to-existing-durable-contract normalization
 
 ## Local verification
 
-- `go test -race ./...` ผ่านทุก package รวม deployment-script ordering/least-privilege/alert-threshold contract tests
+- `go test -race ./...` ผ่านทุก package รวม UDP/TCP inbound transaction lifecycle และพบ/ปิด race จาก
+  SIPGo global logger initialization ระหว่าง runtime teardown/recreate รวมทั้ง serialize `call.answer`
+  กับ remote CANCEL/BYE และถอด terminating session ออกจาก registry โดยไม่มีช่องให้ command ใหม่แทรก
+- simultaneous local hangup/remote BYE มี deterministic regression ครบทั้งสองลำดับ; race detector
+  วน 50 รอบยืนยันว่า terminal event, SIP hangup และ media cleanup เกิดเพียงครั้งเดียว
 - architecture test parse production Go AST และ fail CI หากมีการสร้าง outbound `net/http` client หรือ
   import common HTTP client SDK เพื่อบังคับ invariant ว่า Gateway ไม่มี Web API control client
 - .NET-issued encrypted session/call capability vectors ถูก verify ด้วย Go โดยตรง รวม AAD, JSON contract
@@ -126,9 +148,10 @@ legacy API ingest และ Gateway-to-existing-durable-contract normalization
 - SIPp harness มี contract test ตรวจ XML/runner registration และ scenario สำหรับ digest/auth failure,
   PCMU/PCMA, busy, no-answer/CANCEL, inbound CANCEL, unsupported codec, malformed SDP และ late-200
 - `go vet ./...` และ Windows amd64 CGO-disabled cross-build ผ่าน
-- PowerShell 7.5.4 parser ตรวจ deployment scripts ทุกไฟล์ผ่าน; unsigned packaging smoke สร้าง PE32+ amd64,
-  release manifest, CycloneDX 1.6 SBOM และ recursive `SHA256SUMS` ที่ verify ได้ครบ; Windows CI มี
-  parser gate ซ้ำก่อน build
+- PowerShell 7.5.4 parser เคยตรวจ deployment scripts ก่อน corrective installer/preflight hardening ผ่าน;
+  source-contract tests ล่าสุดผ่าน แต่ script ปัจจุบันต้อง rerun parser gate บน PowerShell/Windows ก่อน release;
+  unsigned packaging smoke สร้าง PE32+ amd64, release manifest, CycloneDX 1.6 SBOM และ recursive
+  `SHA256SUMS` ที่ verify ได้ครบ; Windows CI มี parser gate ก่อน build
 - `govulncheck` ไม่พบ vulnerability ใน symbol/package ที่ใช้งาน; อัปเดต `x/net` เป็น `v0.60.0`
   เพื่อล้าง HTTP/2 module advisories และเพิ่ม reachable-vulnerability gate ใน CI
 - Web App `npm audit --omit=dev` ไม่พบ production dependency vulnerability
@@ -141,11 +164,23 @@ legacy API ingest และ Gateway-to-existing-durable-contract normalization
   ที่พบใน API test graph ถูก pin เป็น `2.1.13` แล้ว พร้อมรัน API 870 tests และ rescan ยืนยันว่า advisory หาย
 - benchmark harness ครอบคลุม capability/JSON/RTP 200 streams/runtime snapshot 250 sessions+200 calls/SQLite;
   live Windows sampler เก็บ normalized CPU, working/private memory, Go heap, sockets และ Gateway high-water marks
-- Web API Infrastructure 2,573 tests ผ่าน (90 tests skip ตาม environment) รวม legacy Gateway ingest regression
+- Web API Application 2,089, Infrastructure 2,574 และ API 873 tests ผ่าน; Infrastructure 90 และ API 3
+  tests ที่ต้องใช้ environment จริงถูก skip ตามเงื่อนไข รวม legacy Gateway ingest regression
 - Web API `dotnet format --verify-no-changes --no-restore` ผ่าน
-- Web App: 570 test files / 4,057 tests, strict app/spec และ production build ผ่าน;
-  microphone/speaker test paths ปิด media tracks และ `AudioContext` ผ่าน `finally` แม้ browser API ล้มกลางทาง
+- Web App: 571 test files / 4,096 tests, strict app/spec, production build และ performance-budget check ผ่าน;
+  microphone/speaker test paths ปิด media tracks, disconnect Web Audio graph และปิด `AudioContext`
+  แม้ browser API ล้มกลางทาง
 - diagnostics allowlist report ผ่าน automated secret-leak test และ manual pattern scan
+- production preflight ตรวจเฉพาะชื่อ key ของ outbound API/client configuration; ไม่ false-positive กับค่า
+  capability identity ปกติ `issuer: debt-flow-web-api` หรือ comment และมี deployment regression 20 รอบ
+- release preflight verify ทุก entry ใน `SHA256SUMS` ไม่ใช่เฉพาะ executable พร้อมปฏิเสธ absolute/path
+  traversal, duplicate, missing และ mismatched entry และบังคับให้ manifest มี `sip-gateway.exe`
+- signed release builder ปฏิเสธ output directory ที่มีไฟล์อยู่แล้วและคู่มือใช้ versioned directory ใหม่
+  เพื่อไม่ให้ stale file จาก build ก่อนหน้าปะปนใน package/SHA256SUMS
+- Windows installer stage และตรวจ signature/config ก่อนหยุด service; การ replace/ACL/config/start อยู่ใน
+  rollback boundary ที่คืน executable เดิมและ start service เดิมกลับเมื่อขั้นใดล้มเหลว
+- production installer/preflight pin Authenticode signer certificate thumbprint และปฏิเสธ executable
+  ที่แม้ signature valid แต่ลงนามโดย publisher อื่น
 - local browser POC ที่ `test/poc/sip-gateway-poc.html` ครอบคลุม API-assisted/manual capability,
   WSS/WebRTC, direct/TURN, registration, inbound/outbound, DTMF, device switching และ sanitized log;
   dev HTTP origin ใช้ได้เฉพาะ loopback เมื่อ opt-in และ production preflight ปฏิเสธ flag นี้
@@ -159,7 +194,7 @@ Frontend `npm run verify` ยัง exit 1 จาก baseline นอก scope �
 |---|---|---|
 | dependency/ADR/gated spikes | pinned Go modules, ADR, race/fuzz/SIPp contract tests | target Windows/PBX/browser spike |
 | Windows service + DPAPI | cross-build, installer/provision/preflight scripts และ deployment contract tests | clean Windows Server 2022 run |
-| browser inbound/outbound | Gateway adapter, shared event relay และ 4,037 Web App tests | Edge/Chrome + real audio end-to-end |
+| browser inbound/outbound | Gateway adapter, shared event relay และ 4,096 Web App tests | Edge/Chrome + real audio end-to-end |
 | IIS WSS/direct ICE/TURN | multi-Origin allowlist/explicit wildcard WSS, ICE/TURN implementation/config | IIS/private-network route evidence |
 | SIP/media/DTMF | SIPGo/Pion/RTP tests และ 13 SIPp scenarios | Issabel/Asterisk UDP/TCP matrix |
 | security/recovery | capability/replay/restart/outbox/diagnostic tests; Gateway/Web App scans ผ่าน | Web API baseline dependency remediation/approval และ revoke/outage/key-rotation drill on target |

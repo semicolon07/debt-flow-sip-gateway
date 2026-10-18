@@ -69,6 +69,8 @@ type peer struct {
 	codec      pion.RTPCodecCapability
 	codecInfo  CodecInfo
 	mu         sync.RWMutex
+	callbackMu sync.RWMutex
+	active     bool
 }
 
 type Stats struct {
@@ -160,19 +162,14 @@ func (e *Engine) Open(sessionID string, credential TURNCredential) error {
 	}
 	p := &peer{connection: connection}
 	connection.OnICECandidate(func(candidate *pion.ICECandidate) {
-		if candidate != nil && e.onCandidate != nil {
-			e.onCandidate(sessionID, candidate.ToJSON())
+		if candidate != nil {
+			e.deliverCandidate(sessionID, p, candidate.ToJSON())
 		}
 	})
 	connection.OnConnectionStateChange(func(state pion.PeerConnectionState) {
-		e.mu.RLock()
-		current := e.peers[sessionID]
-		e.mu.RUnlock()
 		// Reconnect replaces the PeerConnection. Ignore the terminal callback from
 		// the intentionally retired peer so it cannot tear down the resumed call.
-		if current == p && e.onState != nil {
-			e.onState(sessionID, state)
-		}
+		e.deliverState(sessionID, p, state)
 	})
 	connection.OnTrack(func(track *pion.TrackRemote, _ *pion.RTPReceiver) {
 		mime := strings.ToLower(track.Codec().MimeType)
@@ -184,9 +181,7 @@ func (e *Engine) Open(sessionID string, credential TURNCredential) error {
 			if err != nil {
 				return
 			}
-			if e.onRTP != nil {
-				e.onRTP(sessionID, packet)
-			}
+			e.deliverRTP(sessionID, p, packet)
 		}
 	})
 	e.mu.Lock()
@@ -196,6 +191,15 @@ func (e *Engine) Open(sessionID string, credential TURNCredential) error {
 		_ = connection.Close()
 		return errors.New("WebRTC session capacity reached")
 	}
+	if previous != nil {
+		// Wait for callbacks that started on the previous peer to finish, then
+		// retire it before publishing the replacement. This prevents stale ICE,
+		// RTP, RTCP, or failure notifications crossing the reconnect boundary.
+		previous.callbackMu.Lock()
+		previous.active = false
+		previous.callbackMu.Unlock()
+	}
+	p.active = true
 	e.peers[sessionID] = p
 	e.mu.Unlock()
 	if previous != nil {
@@ -204,12 +208,12 @@ func (e *Engine) Open(sessionID string, credential TURNCredential) error {
 	return nil
 }
 
-func (e *Engine) AcceptOffer(sessionID, sdp string) (string, error) {
+func (e *Engine) AcceptOffer(sessionID, sdp, preferredCodec string) (string, error) {
 	p, err := e.get(sessionID)
 	if err != nil {
 		return "", err
 	}
-	selected, err := selectCodec(sdp)
+	selected, err := selectCodec(sdp, preferredCodec)
 	if err != nil {
 		return "", err
 	}
@@ -235,8 +239,8 @@ func (e *Engine) AcceptOffer(sessionID, sdp string) (string, error) {
 			if err != nil {
 				return
 			}
-			if len(packets) > 0 && e.onRTCP != nil {
-				e.onRTCP(sessionID, packets)
+			if len(packets) > 0 {
+				e.deliverRTCP(sessionID, p, packets)
 			}
 		}
 	}()
@@ -314,6 +318,9 @@ func (e *Engine) CloseSession(sessionID string) error {
 	e.mu.Lock()
 	p, exists := e.peers[sessionID]
 	if exists {
+		p.callbackMu.Lock()
+		p.active = false
+		p.callbackMu.Unlock()
 		delete(e.peers, sessionID)
 	}
 	e.mu.Unlock()
@@ -364,6 +371,11 @@ func selectedRoute(connection *pion.PeerConnection) string {
 func (e *Engine) Close() error {
 	e.mu.Lock()
 	peers := e.peers
+	for _, p := range peers {
+		p.callbackMu.Lock()
+		p.active = false
+		p.callbackMu.Unlock()
+	}
 	e.peers = make(map[string]*peer)
 	e.mu.Unlock()
 	var result error
@@ -384,6 +396,38 @@ func (e *Engine) get(sessionID string) (*peer, error) {
 	return p, nil
 }
 
+func (e *Engine) deliverCandidate(sessionID string, source *peer, candidate pion.ICECandidateInit) {
+	source.callbackMu.RLock()
+	defer source.callbackMu.RUnlock()
+	if source.active && e.onCandidate != nil {
+		e.onCandidate(sessionID, candidate)
+	}
+}
+
+func (e *Engine) deliverState(sessionID string, source *peer, state pion.PeerConnectionState) {
+	source.callbackMu.RLock()
+	defer source.callbackMu.RUnlock()
+	if source.active && e.onState != nil {
+		e.onState(sessionID, state)
+	}
+}
+
+func (e *Engine) deliverRTP(sessionID string, source *peer, packet *rtp.Packet) {
+	source.callbackMu.RLock()
+	defer source.callbackMu.RUnlock()
+	if source.active && e.onRTP != nil {
+		e.onRTP(sessionID, packet)
+	}
+}
+
+func (e *Engine) deliverRTCP(sessionID string, source *peer, packets []rtcp.Packet) {
+	source.callbackMu.RLock()
+	defer source.callbackMu.RUnlock()
+	if source.active && e.onRTCP != nil {
+		e.onRTCP(sessionID, packets)
+	}
+}
+
 func supportedCodecs() []pion.RTPCodecParameters {
 	return []pion.RTPCodecParameters{
 		{RTPCodecCapability: pion.RTPCodecCapability{MimeType: mimePCMU, ClockRate: 8000, Channels: 1}, PayloadType: 0},
@@ -398,7 +442,11 @@ type selectedCodec struct {
 	dtmfPayloadType uint8
 }
 
-func selectCodec(offer string) (selectedCodec, error) {
+func selectCodec(offer, preferredCodec string) (selectedCodec, error) {
+	preferredCodec = strings.ToUpper(strings.TrimSpace(preferredCodec))
+	if preferredCodec != "" && preferredCodec != "PCMU" && preferredCodec != "PCMA" {
+		return selectedCodec{}, fmt.Errorf("unsupported preferred WebRTC codec %q", preferredCodec)
+	}
 	lines := strings.Split(strings.ReplaceAll(offer, "\r\n", "\n"), "\n")
 	type codecDescription struct {
 		name     string
@@ -482,18 +530,27 @@ func selectCodec(offer string) (selectedCodec, error) {
 		}
 		switch description.name {
 		case "PCMU":
+			if preferredCodec != "" && preferredCodec != "PCMU" {
+				continue
+			}
 			parsed, _ := strconv.ParseUint(payload, 10, 7)
 			return selectedCodec{
 				capability:  pion.RTPCodecCapability{MimeType: mimePCMU, ClockRate: 8000, Channels: 1},
 				payloadType: uint8(parsed), dtmfPayloadType: dtmfPayloadType,
 			}, nil
 		case "PCMA":
+			if preferredCodec != "" && preferredCodec != "PCMA" {
+				continue
+			}
 			parsed, _ := strconv.ParseUint(payload, 10, 7)
 			return selectedCodec{
 				capability:  pion.RTPCodecCapability{MimeType: mimePCMA, ClockRate: 8000, Channels: 1},
 				payloadType: uint8(parsed), dtmfPayloadType: dtmfPayloadType,
 			}, nil
 		}
+	}
+	if preferredCodec != "" {
+		return selectedCodec{}, fmt.Errorf("offer does not contain required active-call codec %s", preferredCodec)
 	}
 	return selectedCodec{}, errors.New("offer has no PCMU/PCMA codec intersection")
 }

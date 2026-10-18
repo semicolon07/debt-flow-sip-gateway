@@ -5,6 +5,7 @@ param(
     [string]$ServiceName = "DebtFlowSipGateway",
     [string]$PublicGatewayHost = "sip-gateway.uniga.app",
     [string]$ForbiddenApiHost,
+    [string]$ExpectedSignerThumbprint,
     [string]$OutputPath = (Join-Path $PWD "sip-gateway-preflight.json"),
     [switch]$RequireReleaseEvidence
 )
@@ -43,8 +44,28 @@ Add-Check "config-present" $configExists (if ($configExists) { "present" } else 
 
 if ($binaryExists) {
     $signature = Get-AuthenticodeSignature -LiteralPath $BinaryPath
-    $signatureValid = $signature.Status -eq "Valid"
-    $signatureDetail = if ($signatureValid) { "valid" } elseif ($RequireReleaseEvidence) { "required but $($signature.Status)" } else { "development: $($signature.Status)" }
+    $expectedThumbprint = if ([string]::IsNullOrWhiteSpace($ExpectedSignerThumbprint)) {
+        ""
+    } else {
+        $ExpectedSignerThumbprint.Replace(" ", "").ToUpperInvariant()
+    }
+    $actualThumbprint = if ($null -ne $signature.SignerCertificate) {
+        $signature.SignerCertificate.Thumbprint.Replace(" ", "").ToUpperInvariant()
+    } else {
+        ""
+    }
+    $signerConfigured = -not [string]::IsNullOrWhiteSpace($expectedThumbprint)
+    $signatureValid = $signature.Status -eq "Valid" -and $signerConfigured -and
+        $actualThumbprint -eq $expectedThumbprint
+    $signatureDetail = if ($signatureValid) {
+        "valid expected signer"
+    } elseif ($RequireReleaseEvidence -and -not $signerConfigured) {
+        "-ExpectedSignerThumbprint is required"
+    } elseif ($RequireReleaseEvidence) {
+        "invalid signature or unexpected signer"
+    } else {
+        "development: signature pin not required"
+    }
     Add-Check "authenticode-signature" ($signatureValid -or -not $RequireReleaseEvidence) $signatureDetail
     try {
         & $BinaryPath --config $ConfigPath --check-config | Out-Null
@@ -59,14 +80,53 @@ if ($binaryExists) {
     $buildInfoPath = Join-Path $releaseDirectory "build-info.txt"
     $releaseManifestPath = Join-Path $releaseDirectory "release-manifest.json"
     $checksumValid = $false
+    $packageChecksumsValid = $false
+    $packageChecksumDetail = "missing"
     if (Test-Path -LiteralPath $checksumsPath -PathType Leaf) {
         $binaryHash = (Get-FileHash -LiteralPath $BinaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
         $checksumValid = [bool](Get-Content -LiteralPath $checksumsPath | Where-Object {
             $_ -eq "$binaryHash  sip-gateway.exe"
         })
+        try {
+            $releaseRoot = [IO.Path]::GetFullPath($releaseDirectory).TrimEnd('\', '/')
+            $releasePrefix = $releaseRoot + [IO.Path]::DirectorySeparatorChar
+            $seenPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $entryCount = 0
+            $binaryEntrySeen = $false
+            foreach ($line in Get-Content -LiteralPath $checksumsPath) {
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                if ($line -notmatch '^([0-9a-fA-F]{64})  (.+)$') {
+                    throw "invalid checksum record"
+                }
+                $expectedHash = $Matches[1].ToLowerInvariant()
+                $relativePath = $Matches[2].Trim().Replace('/', [IO.Path]::DirectorySeparatorChar)
+                if ([IO.Path]::IsPathRooted($relativePath)) { throw "absolute checksum path" }
+                $candidate = [IO.Path]::GetFullPath((Join-Path $releaseRoot $relativePath))
+                if (-not $candidate.StartsWith($releasePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "checksum path escapes release directory"
+                }
+                if (-not $seenPaths.Add($candidate)) { throw "duplicate checksum path" }
+                if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { throw "checksum file missing" }
+                $actualHash = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($actualHash -ne $expectedHash) { throw "checksum mismatch" }
+                if ($relativePath -ieq "sip-gateway.exe") { $binaryEntrySeen = $true }
+                $entryCount++
+            }
+            $packageChecksumsValid = $entryCount -gt 0 -and $binaryEntrySeen
+            $packageChecksumDetail = if ($packageChecksumsValid) {
+                "$entryCount files verified"
+            } else {
+                "empty manifest or binary entry missing"
+            }
+        } catch {
+            $packageChecksumsValid = $false
+            $packageChecksumDetail = "invalid, missing or mismatched package entry"
+        }
     }
     Add-Check "release-binary-checksum" ($checksumValid -or -not $RequireReleaseEvidence) `
         (if ($checksumValid) { "SHA256SUMS match" } elseif ($RequireReleaseEvidence) { "missing or mismatched" } else { "development: not required" })
+    Add-Check "release-package-checksums" ($packageChecksumsValid -or -not $RequireReleaseEvidence) `
+        (if ($packageChecksumsValid) { $packageChecksumDetail } elseif ($RequireReleaseEvidence) { $packageChecksumDetail } else { "development: $packageChecksumDetail" })
 
     $sbomValid = $false
     if (Test-Path -LiteralPath $sbomPath -PathType Leaf) {
@@ -106,7 +166,11 @@ if ($binaryExists) {
 }
 
 if ($configExists) {
-    $forbiddenConfig = Select-String -LiteralPath $ConfigPath -Pattern '(?i)web.?api|api.?url|http.?client|bearer|authorization' -Quiet
+    # Match forbidden client configuration keys only. Capability identity values
+    # such as `issuer: debt-flow-web-api` and explanatory comments are expected
+    # and must not make the release preflight fail.
+    $forbiddenConfigKeyPattern = '(?im)^\s*[A-Za-z0-9_-]*(?:api|http.?client|bearer|authorization)[A-Za-z0-9_-]*\s*:'
+    $forbiddenConfig = Select-String -LiteralPath $ConfigPath -Pattern $forbiddenConfigKeyPattern -Quiet
     $configDetail = if ($forbiddenConfig) { "forbidden API/client key detected" } else { "no forbidden API/client key" }
     Add-Check "no-gateway-api-client-config" (-not $forbiddenConfig) $configDetail
     $plaintextCapabilityKeys = Select-String -LiteralPath $ConfigPath `

@@ -70,7 +70,8 @@ type WebRTCOffer struct {
 }
 
 type EventsACK struct {
-	Sequence uint64 `json:"sequence"`
+	CommandID string `json:"commandId,omitempty"`
+	Sequence  uint64 `json:"sequence"`
 }
 
 type DTMF struct {

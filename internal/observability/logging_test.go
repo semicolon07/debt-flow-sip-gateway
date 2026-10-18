@@ -1,6 +1,7 @@
 package observability
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,5 +30,25 @@ func TestRotatingWriterBoundsOperationalLogs(t *testing.T) {
 		if info.Size() > 64 {
 			t.Fatalf("log file %s exceeded bound: %d", candidate, info.Size())
 		}
+	}
+}
+
+func TestParseLevel(t *testing.T) {
+	tests := map[string]slog.Level{
+		"debug": slog.LevelDebug,
+		"info":  slog.LevelInfo,
+		"warn":  slog.LevelWarn,
+		"error": slog.LevelError,
+	}
+	for input, want := range tests {
+		t.Run(input, func(t *testing.T) {
+			got, err := parseLevel(input)
+			if err != nil || got != want {
+				t.Fatalf("parseLevel(%q)=(%v, %v), want (%v, nil)", input, got, err, want)
+			}
+		})
+	}
+	if _, err := parseLevel("trace"); err == nil {
+		t.Fatal("expected unsupported logging level to fail")
 	}
 }
