@@ -355,6 +355,157 @@ func TestOutboundFinalResponseAndTimeoutAreIsolatedAcrossSessions(t *testing.T) 
 	}
 }
 
+func TestOutboundDigestAuthenticationRetriesInviteWithAccountIdentity(t *testing.T) {
+	tests := []struct {
+		name            string
+		status          int
+		reason          string
+		challengeHeader string
+		authorization   string
+	}{
+		{
+			name: "www-authenticate", status: 401, reason: "Unauthorized",
+			challengeHeader: "WWW-Authenticate", authorization: "Authorization",
+		},
+		{
+			name: "proxy-authenticate", status: 407, reason: "Proxy Authentication Required",
+			challengeHeader: "Proxy-Authenticate", authorization: "Proxy-Authorization",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runtime, peer := newOutboundSIPTestRuntime(t)
+			const callID = "outbound-digest-auth"
+			if err := runtime.StartCall(
+				context.Background(), "session-1", callID, "9001", []byte(testInboundSDP),
+			); err != nil {
+				t.Fatal(err)
+			}
+			firstInvite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+			writeSIPAuthChallenge(t, peer, gateway, firstInvite, test.status, test.reason,
+				test.challengeHeader, `Digest realm="pbx.test", nonce="nonce-one", algorithm=MD5, qop="auth"`)
+			authenticatedInvite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+			if headerValue(authenticatedInvite, test.authorization) == "" {
+				t.Fatalf("authenticated INVITE has no %s: %q", test.authorization, authenticatedInvite)
+			}
+			if got := headerValue(authenticatedInvite, "From"); !strings.Contains(got, "sip:1129@") {
+				t.Fatalf("authenticated INVITE From=%q", got)
+			}
+			if headerValue(authenticatedInvite, "Call-ID") != headerValue(firstInvite, "Call-ID") {
+				t.Fatal("authenticated INVITE changed Call-ID")
+			}
+			if headerValue(authenticatedInvite, "Via") == headerValue(firstInvite, "Via") {
+				t.Fatal("authenticated INVITE reused the original Via branch")
+			}
+			if headerValue(authenticatedInvite, "CSeq") == headerValue(firstInvite, "CSeq") {
+				t.Fatal("authenticated INVITE did not increment CSeq")
+			}
+			writeSIPResponse(t, peer, gateway, authenticatedInvite, 180, "Ringing", "digest-auth")
+			if event := readRuntimeEvent(t, runtime, EventRinging); event.CallID != callID {
+				t.Fatalf("ringing event=%+v", event)
+			}
+			writeSIPResponseWithBody(t, peer, gateway, authenticatedInvite, 200, "OK",
+				"digest-auth", testInboundSDP)
+			_, _ = readSIPRequestFromContaining(t, peer, "ACK ")
+			if event := readRuntimeEvent(t, runtime, EventConnected); event.CallID != callID {
+				t.Fatalf("connected event=%+v", event)
+			}
+		})
+	}
+}
+
+func TestOutboundDigestAuthenticationRetriesStaleNonce(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	const callID = "outbound-stale-digest-auth"
+	if err := runtime.StartCall(
+		context.Background(), "session-1", callID, "9001", []byte(testInboundSDP),
+	); err != nil {
+		t.Fatal(err)
+	}
+	firstInvite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	writeSIPAuthChallenge(t, peer, gateway, firstInvite, 401, "Unauthorized", "WWW-Authenticate",
+		`Digest realm="pbx.test", nonce="nonce-one", algorithm=MD5, qop="auth"`)
+	secondInvite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	writeSIPAuthChallenge(t, peer, gateway, secondInvite, 401, "Unauthorized", "WWW-Authenticate",
+		`Digest realm="pbx.test", nonce="nonce-two", algorithm=MD5, qop="auth", stale=true`)
+	thirdInvite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	if headerValue(thirdInvite, "Authorization") == "" {
+		t.Fatal("stale nonce retry has no Authorization header")
+	}
+	writeSIPResponseWithBody(t, peer, gateway, thirdInvite, 200, "OK", "digest-stale", testInboundSDP)
+	_, _ = readSIPRequestFromContaining(t, peer, "ACK ")
+	if event := readRuntimeEvent(t, runtime, EventConnected); event.CallID != callID {
+		t.Fatalf("connected event=%+v", event)
+	}
+}
+
+func TestConcurrentSessionsDoNotCrossDigestIdentities(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	peerPort := peer.LocalAddr().(*net.UDPAddr).Port
+	if err := runtime.Configure(context.Background(), "session-2", Configuration{
+		Host: "127.0.0.1", Port: uint16(peerPort), Transport: TransportUDP,
+		Username: "3100", Password: "second-secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.setRegistered("session-2", true)
+	for _, call := range []struct {
+		sessionID string
+		callID    string
+	}{
+		{sessionID: "session-1", callID: "digest-session-1129"},
+		{sessionID: "session-2", callID: "digest-session-3100"},
+	} {
+		if err := runtime.StartCall(context.Background(), call.sessionID, call.callID,
+			"9001", []byte(testInboundSDP)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	initial := make(map[string]struct {
+		request string
+		target  net.Addr
+	}, 2)
+	for range 2 {
+		request, target := readSIPRequestFromContaining(t, peer, "INVITE ")
+		username := sipUsernameFromHeader(headerValue(request, "From"))
+		initial[username] = struct {
+			request string
+			target  net.Addr
+		}{request: request, target: target}
+	}
+	for _, username := range []string{"1129", "3100"} {
+		value, ok := initial[username]
+		if !ok {
+			t.Fatalf("missing initial INVITE for %s: %+v", username, initial)
+		}
+		writeSIPAuthChallenge(t, peer, value.target, value.request, 401, "Unauthorized",
+			"WWW-Authenticate", `Digest realm="pbx.test", nonce="nonce-`+username+`", algorithm=MD5, qop="auth"`)
+	}
+
+	for range 2 {
+		request, target := readSIPRequestFromContaining(t, peer, "INVITE ")
+		username := sipUsernameFromHeader(headerValue(request, "From"))
+		authorization := headerValue(request, "Authorization")
+		if !strings.Contains(authorization, `username="`+username+`"`) {
+			t.Fatalf("digest identity crossed sessions: from=%q authorization=%q",
+				headerValue(request, "From"), authorization)
+		}
+		writeSIPResponse(t, peer, target, request, 603, "Decline", "digest-"+username)
+	}
+	for range 2 {
+		_, _ = readSIPRequestFromContaining(t, peer, "ACK ")
+	}
+	failed := map[string]bool{}
+	for range 2 {
+		event := readRuntimeEvent(t, runtime, EventFailed)
+		failed[event.SessionID] = true
+	}
+	if !failed["session-1"] || !failed["session-2"] {
+		t.Fatalf("terminal events crossed or missing: %+v", failed)
+	}
+}
+
 func TestTransportLevelFinalResponseFallbackEndsCallWhenTransactionDoesNotMatch(t *testing.T) {
 	runtime, peer := newOutboundSIPTestRuntime(t)
 	runtime.cfg.OutboundTimeout = 2 * time.Second
@@ -1415,6 +1566,25 @@ func writeSIPResponse(
 	writeSIPResponseWithBody(t, peer, target, request, status, reason, toTag, "")
 }
 
+func writeSIPAuthChallenge(
+	t *testing.T,
+	peer net.PacketConn,
+	target net.Addr,
+	request string,
+	status int,
+	reason string,
+	headerName string,
+	challenge string,
+) {
+	t.Helper()
+	response := buildResponseForRequest(request, status, reason)
+	response = strings.Replace(response, "Content-Length: 0\r\n",
+		headerName+": "+challenge+"\r\nContent-Length: 0\r\n", 1)
+	if _, err := peer.WriteTo([]byte(response), target); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func writeSIPResponseWithBody(
 	t *testing.T,
 	peer net.PacketConn,
@@ -1527,4 +1697,18 @@ func headerValue(message, name string) string {
 		}
 	}
 	return ""
+}
+
+func sipUsernameFromHeader(value string) string {
+	lower := strings.ToLower(value)
+	start := strings.Index(lower, "sip:")
+	if start < 0 {
+		return ""
+	}
+	start += len("sip:")
+	end := strings.IndexByte(value[start:], '@')
+	if end < 0 {
+		return ""
+	}
+	return value[start : start+end]
 }
