@@ -37,12 +37,13 @@ type Runtime struct {
 }
 
 type HTTP struct {
-	Listen        string `json:"listen"`
-	MetricsListen string `json:"metricsListen"`
-	AllowedOrigin string `json:"allowedOrigin"`
-	AuthTimeout   string `json:"authTimeout"`
-	Heartbeat     string `json:"heartbeat"`
-	IdleTimeout   string `json:"idleTimeout"`
+	Listen         string   `json:"listen"`
+	MetricsListen  string   `json:"metricsListen"`
+	AllowedOrigin  string   `json:"allowedOrigin,omitempty"`
+	AllowedOrigins []string `json:"allowedOrigins"`
+	AuthTimeout    string   `json:"authTimeout"`
+	Heartbeat      string   `json:"heartbeat"`
+	IdleTimeout    string   `json:"idleTimeout"`
 }
 
 type Logging struct {
@@ -112,12 +113,17 @@ func Build(cfg config.Config, version string, now time.Time) Report {
 		keyIDs = append(keyIDs, keyID)
 	}
 	slices.Sort(keyIDs)
+	legacyAllowedOrigin := cfg.HTTP.AllowedOrigin
+	if len(cfg.HTTP.AllowedOrigins) > 0 {
+		legacyAllowedOrigin = ""
+	}
 	return Report{
 		SchemaVersion: 1, GeneratedAtUTC: now.UTC(), Version: version,
 		Runtime: Runtime{OS: runtime.GOOS, Arch: runtime.GOARCH, NumCPU: runtime.NumCPU(), Go: runtime.Version()},
 		NodeID:  cfg.NodeID,
 		HTTP: HTTP{
-			Listen: cfg.HTTP.Listen, MetricsListen: cfg.HTTP.MetricsListen, AllowedOrigin: cfg.HTTP.AllowedOrigin,
+			Listen: cfg.HTTP.Listen, MetricsListen: cfg.HTTP.MetricsListen,
+			AllowedOrigin: legacyAllowedOrigin, AllowedOrigins: cfg.HTTP.EffectiveAllowedOrigins(),
 			AuthTimeout: cfg.HTTP.AuthTimeout.String(), Heartbeat: cfg.HTTP.Heartbeat.String(),
 			IdleTimeout: cfg.HTTP.IdleTimeout.String(),
 		},

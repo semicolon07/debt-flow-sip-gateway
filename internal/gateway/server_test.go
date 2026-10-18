@@ -76,7 +76,7 @@ func testServerWithHeartbeat(
 	t.Helper()
 	runtime := &fakeRuntime{}
 	server, err := NewServer(ServerConfig{
-		AllowedOrigin: "https://debt-flow.uniga.app", AuthTimeout: time.Second,
+		AllowedOrigins: []string{"https://debt-flow.uniga.app"}, AuthTimeout: time.Second,
 		Heartbeat: heartbeat, IdleTimeout: idleTimeout, ReconnectGrace: 10 * time.Millisecond,
 		MaxMessageBytes: 64 << 10, MessagesPerWindow: 60, MessageWindow: 10 * time.Second,
 		WriterQueue: 8,
@@ -161,6 +161,42 @@ func TestGatewayRequiresExactOrigin(t *testing.T) {
 	})
 	if err == nil || response == nil || response.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403, response=%v err=%v", response, err)
+	}
+}
+
+func TestOriginAllowedSupportsMultipleExactOriginsAndWildcard(t *testing.T) {
+	for name, test := range map[string]struct {
+		candidate     string
+		allowed       []string
+		allowLoopback bool
+		want          bool
+	}{
+		"first exact origin": {
+			candidate: "https://app.example", allowed: []string{"https://app.example", "https://admin.example"}, want: true,
+		},
+		"second exact origin": {
+			candidate: "https://admin.example", allowed: []string{"https://app.example", "https://admin.example"}, want: true,
+		},
+		"unlisted origin": {
+			candidate: "https://evil.example", allowed: []string{"https://app.example", "https://admin.example"}, want: false,
+		},
+		"wildcard HTTPS": {
+			candidate: "https://tenant.example", allowed: []string{"*"}, want: true,
+		},
+		"wildcard rejects missing origin": {candidate: "", allowed: []string{"*"}, want: false},
+		"wildcard rejects opaque origin":  {candidate: "null", allowed: []string{"*"}, want: false},
+		"wildcard rejects public HTTP": {
+			candidate: "http://tenant.example", allowed: []string{"*"}, want: false,
+		},
+		"wildcard allows opted-in HTTP loopback": {
+			candidate: "http://127.0.0.1:8765", allowed: []string{"*"}, allowLoopback: true, want: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := originAllowed(test.candidate, test.allowed, test.allowLoopback); got != test.want {
+				t.Fatalf("originAllowed(%q)=%v, want %v", test.candidate, got, test.want)
+			}
+		})
 	}
 }
 

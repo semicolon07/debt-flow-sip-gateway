@@ -219,8 +219,10 @@ func Run(ctx context.Context, cfg config.Config) error {
 	coordinator.SetObserver(metrics)
 	defer coordinator.Close()
 	wss, err := NewServer(ServerConfig{
-		AllowedOrigin: cfg.HTTP.AllowedOrigin, AuthTimeout: cfg.HTTP.AuthTimeout,
-		Heartbeat: cfg.HTTP.Heartbeat, IdleTimeout: cfg.HTTP.IdleTimeout,
+		AllowedOrigins:              cfg.HTTP.EffectiveAllowedOrigins(),
+		AllowInsecureLoopbackOrigin: cfg.HTTP.AllowInsecureLoopbackOrigin,
+		AuthTimeout:                 cfg.HTTP.AuthTimeout,
+		Heartbeat:                   cfg.HTTP.Heartbeat, IdleTimeout: cfg.HTTP.IdleTimeout,
 		ReconnectGrace: cfg.Lease.ReconnectGrace, MaxMessageBytes: cfg.Limits.MaxMessageBytes,
 		MessagesPerWindow: cfg.Limits.MessagesPerWindow, MessageWindow: cfg.Limits.MessageWindow,
 		WriterQueue: cfg.Limits.WriterQueue,

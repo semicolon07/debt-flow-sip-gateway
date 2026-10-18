@@ -51,6 +51,45 @@ func TestValidateAllowsExplicitDevelopmentLoopbackOrigin(t *testing.T) {
 	}
 }
 
+func TestValidateAllowsMultipleOriginsAndWildcard(t *testing.T) {
+	for name, origins := range map[string][]string{
+		"multiple exact origins": {"https://app.example", "https://admin.example"},
+		"explicit wildcard":      {"*"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := Default()
+			makeCapabilityValid(&cfg)
+			cfg.TURN.AdvertisedIP = "10.0.0.10"
+			cfg.HTTP.AllowedOrigins = origins
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("valid origin allowlist: %v", err)
+			}
+			if got := cfg.HTTP.EffectiveAllowedOrigins(); len(got) != len(origins) || got[0] != origins[0] {
+				t.Fatalf("effective origins=%v, want %v", got, origins)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsInvalidOrDuplicateOriginList(t *testing.T) {
+	for name, origins := range map[string][]string{
+		"empty":     {},
+		"path":      {"https://app.example/path"},
+		"duplicate": {"https://app.example", "https://app.example"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := Default()
+			makeCapabilityValid(&cfg)
+			cfg.TURN.AdvertisedIP = "10.0.0.10"
+			cfg.HTTP.AllowedOrigin = ""
+			cfg.HTTP.AllowedOrigins = origins
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("expected invalid origin allowlist to be rejected")
+			}
+		})
+	}
+}
+
 func TestValidateRejectsInsecureOriginWithoutOptInOrOutsideLoopback(t *testing.T) {
 	for name, test := range map[string]struct {
 		origin  string

@@ -36,9 +36,12 @@ type Config struct {
 }
 
 type HTTP struct {
-	Listen                      string        `yaml:"listen"`
-	MetricsListen               string        `yaml:"metricsListen"`
+	Listen        string `yaml:"listen"`
+	MetricsListen string `yaml:"metricsListen"`
+	// AllowedOrigin is the legacy single-origin setting. AllowedOrigins takes
+	// precedence when it is non-empty so existing deployments remain valid.
 	AllowedOrigin               string        `yaml:"allowedOrigin"`
+	AllowedOrigins              []string      `yaml:"allowedOrigins"`
 	AllowInsecureLoopbackOrigin bool          `yaml:"allowInsecureLoopbackOrigin"`
 	AuthTimeout                 time.Duration `yaml:"authTimeout"`
 	Heartbeat                   time.Duration `yaml:"heartbeat"`
@@ -164,6 +167,18 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
+// EffectiveAllowedOrigins returns a detached allowlist. The plural setting is
+// authoritative when present; otherwise the legacy single-origin value is used.
+func (h HTTP) EffectiveAllowedOrigins() []string {
+	if len(h.AllowedOrigins) > 0 {
+		return append([]string(nil), h.AllowedOrigins...)
+	}
+	if h.AllowedOrigin == "" {
+		return nil
+	}
+	return []string{h.AllowedOrigin}
+}
+
 func (c Config) Validate() error {
 	var problems []error
 	for label, address := range map[string]string{
@@ -193,18 +208,41 @@ func (c Config) Validate() error {
 		c.Logging.MaxBackups < 1 || c.Logging.MaxBackups > 20 {
 		problems = append(problems, errors.New("logging path, maxBytes (>= 1 MiB) and maxBackups (1-20) are required"))
 	}
-	origin, err := url.Parse(c.HTTP.AllowedOrigin)
-	validOriginShape := err == nil && origin.Host != "" && origin.Path == "" && origin.RawQuery == "" &&
-		origin.Fragment == "" && origin.User == nil
-	secureOrigin := validOriginShape && origin.Scheme == "https"
-	insecureLoopbackOrigin := validOriginShape && origin.Scheme == "http" && isLoopbackHost(origin.Hostname())
-	if !secureOrigin && !(c.HTTP.AllowInsecureLoopbackOrigin && insecureLoopbackOrigin) {
-		problems = append(problems, errors.New(
-			"http.allowedOrigin must be an HTTPS origin without a path, or an explicitly enabled HTTP loopback origin"))
+	origins := c.HTTP.EffectiveAllowedOrigins()
+	if len(origins) == 0 {
+		problems = append(problems, errors.New("http.allowedOrigins must contain at least one origin"))
 	}
-	if c.HTTP.AllowInsecureLoopbackOrigin && !insecureLoopbackOrigin {
+	hasInsecureLoopbackOrigin := false
+	seenOrigins := make(map[string]struct{}, len(origins))
+	for _, configuredOrigin := range origins {
+		if configuredOrigin == "*" {
+			if _, duplicate := seenOrigins[configuredOrigin]; duplicate {
+				problems = append(problems, errors.New("http.allowedOrigins must not contain duplicate origins"))
+			}
+			seenOrigins[configuredOrigin] = struct{}{}
+			continue
+		}
+		origin, err := url.Parse(configuredOrigin)
+		validOriginShape := err == nil && origin.Host != "" && origin.Path == "" && origin.RawQuery == "" &&
+			origin.Fragment == "" && origin.User == nil
+		secureOrigin := validOriginShape && origin.Scheme == "https"
+		insecureLoopbackOrigin := validOriginShape && origin.Scheme == "http" && isLoopbackHost(origin.Hostname())
+		if !secureOrigin && !(c.HTTP.AllowInsecureLoopbackOrigin && insecureLoopbackOrigin) {
+			problems = append(problems, fmt.Errorf(
+				"http origin %q must be HTTPS without a path, or an explicitly enabled HTTP loopback origin",
+				configuredOrigin))
+		}
+		if insecureLoopbackOrigin {
+			hasInsecureLoopbackOrigin = true
+		}
+		if _, duplicate := seenOrigins[configuredOrigin]; duplicate {
+			problems = append(problems, errors.New("http.allowedOrigins must not contain duplicate origins"))
+		}
+		seenOrigins[configuredOrigin] = struct{}{}
+	}
+	if c.HTTP.AllowInsecureLoopbackOrigin && !hasInsecureLoopbackOrigin {
 		problems = append(problems, errors.New(
-			"http.allowInsecureLoopbackOrigin may only be used with an HTTP localhost or loopback origin"))
+			"http.allowInsecureLoopbackOrigin requires an HTTP localhost or loopback entry"))
 	}
 	if c.NodeID == "" || c.Capability.Issuer == "" || c.Capability.Audience == "" {
 		problems = append(problems, errors.New("nodeId and capability issuer/audience are required"))

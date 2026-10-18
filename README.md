@@ -52,7 +52,8 @@ PeerConnection/RTP buffers และ unacknowledged outbox ใช้ memory ห�
 
 - Windows Service executable, strict YAML configuration, IIS reverse-proxy template, Authenticode-ready
   PowerShell packaging, CycloneDX SBOM และ sanitized diagnostics bundle
-- exact-Origin WSS protocol V1, one-time authentication, lease/reconnect, takeover protection และ bounded queues
+- exact/multi-Origin WSS allowlist (พร้อม explicit `*`), protocol V1, one-time authentication,
+  lease/reconnect, takeover protection และ bounded queues
 - SQLite WAL command journal, per-agent monotonic event sequence, durable session outbox, ACK/replay และ
   deterministic restart terminalization
 - bounded rotating JSON operational logs, Prometheus dashboard/alerts และ allowlisted diagnostics

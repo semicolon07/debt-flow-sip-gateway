@@ -10,12 +10,10 @@ import (
 )
 
 func TestRTPManagerAcceptsConfiguredSource(t *testing.T) {
-	probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := probe.LocalAddr().(*net.UDPAddr).Port
-	_ = probe.Close()
+	probeRTP, probeRTCP := listenUDPPair(t, 30000, 39000)
+	port := probeRTP.LocalAddr().(*net.UDPAddr).Port
+	_ = probeRTP.Close()
+	_ = probeRTCP.Close()
 	received := make(chan *rtp.Packet, 2)
 	manager, err := NewRTPManager(RTPConfig{
 		ListenIP: net.ParseIP("127.0.0.1"), AdvertisedIP: net.ParseIP("127.0.0.1"),

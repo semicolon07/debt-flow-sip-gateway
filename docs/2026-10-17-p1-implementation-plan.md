@@ -131,7 +131,8 @@ sip-gateway.exe
   บนเครื่อง client
 - Browser, Gateway, Web API private ingress และ PBX ติดต่อกันผ่าน private/VPN network เท่านั้น
 - Gateway HTTP listener ฟังเฉพาะ `127.0.0.1:8080`; ห้าม expose ตรงออก network
-- Production Origin ที่อนุญาตคือ `https://debt-flow.uniga.app` แบบ exact match
+- Production ใช้ `http.allowedOrigins` เป็น exact HTTPS allowlist หลายค่า; รองรับ explicit `*`
+  เมื่อยอมรับความเสี่ยง และ production preflight จะ flag wildcard
 
 ### 4.2 Proposed ports
 
@@ -299,7 +300,7 @@ Capability requirements:
 
 - URL คงที่ `wss://sip-gateway.uniga.app/gateway/v1` โดยไม่มี credential/query parameter
 - IIS ส่ง WebSocket ไปยัง `127.0.0.1:8080`
-- ตรวจ exact Origin `https://debt-flow.uniga.app`
+- ตรวจ Origin กับ exact multi-origin allowlist หรือ explicit wildcard policy
 - client ต้องส่ง `session.authenticate` เป็นข้อความแรกภายใน 5 วินาที
 - maximum message size 64 KiB
 - rate limit 60 messages ต่อ rolling 10 วินาทีต่อ session
@@ -576,7 +577,7 @@ Exit: clean VM install/enroll/start/stop/restart ได้และ recovery tes
 ### Phase 2 — Portal session and WSS protocol
 
 - API encrypted capability issue และ browser-relayed session lease/revoke
-- IIS WSS endpoint, protocol parser, Origin/rate/size/heartbeat limits
+- IIS WSS endpoint, protocol parser, Origin allowlist/rate/size/heartbeat limits
 - durable command deduplication, outbox ACK/replay และ snapshot
 - session ownership, reconnect grace และ takeover rules
 - Portal `runtimeMode` และ `SipGatewayAdapter`
@@ -641,7 +642,7 @@ Exit: release candidate พร้อม pilot approval; desktop agent ยัง�
 - DPAPI protected capability key file และ service-only ACL
 - capability key provision/rotate/overlap/expiry
 - SQLite WAL crash recovery, corrupt/incomplete journal และ retention bounds
-- IIS WSS proxy, timeout, header forwarding และ exact Origin
+- IIS WSS proxy, timeout, header forwarding และ Origin allowlist/wildcard policy
 - firewall/port binding/restart บน Windows Server 2022 clean VM
 
 ### 14.3 Browser integration

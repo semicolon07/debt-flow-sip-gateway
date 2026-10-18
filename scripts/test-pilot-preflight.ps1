@@ -115,7 +115,18 @@ if ($configExists) {
     Add-Check "capability-keys-protected" (-not $plaintextCapabilityKeys) $protectedKeyDetail
     $insecureLoopbackOrigin = Select-String -LiteralPath $ConfigPath `
         -Pattern '(?im)^\s*allowInsecureLoopbackOrigin\s*:\s*true\s*(?:#.*)?$' -Quiet
-    $originDetail = if ($insecureLoopbackOrigin) { "insecure loopback POC origin enabled" } else { "secure origin required" }
+    $wildcardOrigin = Select-String -LiteralPath $ConfigPath `
+        -Pattern '(?im)^\s*(?:allowedOrigin\s*:\s*|-\s*)["'']?\*["'']?\s*(?:#.*)?$' -Quiet
+    $originDetail = if ($insecureLoopbackOrigin) {
+        "insecure loopback POC origin enabled"
+    } elseif ($wildcardOrigin) {
+        "wildcard browser origin enabled"
+    } else {
+        "exact secure origin allowlist"
+    }
+    # Wildcard is an explicit supported policy and remains visible in the evidence
+    # detail for security review; only the development HTTP-loopback escape hatch
+    # fails the production security check.
     Add-Check "secure-browser-origin" (-not $insecureLoopbackOrigin) $originDetail
 }
 

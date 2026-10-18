@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,15 +40,16 @@ type Runtime interface {
 }
 
 type ServerConfig struct {
-	AllowedOrigin     string
-	AuthTimeout       time.Duration
-	Heartbeat         time.Duration
-	IdleTimeout       time.Duration
-	ReconnectGrace    time.Duration
-	MaxMessageBytes   int64
-	MessagesPerWindow int
-	MessageWindow     time.Duration
-	WriterQueue       int
+	AllowedOrigins              []string
+	AllowInsecureLoopbackOrigin bool
+	AuthTimeout                 time.Duration
+	Heartbeat                   time.Duration
+	IdleTimeout                 time.Duration
+	ReconnectGrace              time.Duration
+	MaxMessageBytes             int64
+	MessagesPerWindow           int
+	MessageWindow               time.Duration
+	WriterQueue                 int
 }
 
 type Server struct {
@@ -100,10 +104,15 @@ type ServerStats struct {
 }
 
 func NewServer(cfg ServerConfig, redeemer Redeemer, runtime Runtime, logger *slog.Logger) (*Server, error) {
-	if cfg.AllowedOrigin == "" || cfg.AuthTimeout <= 0 || cfg.Heartbeat <= 0 || cfg.IdleTimeout <= 0 ||
+	if len(cfg.AllowedOrigins) == 0 || cfg.AuthTimeout <= 0 || cfg.Heartbeat <= 0 || cfg.IdleTimeout <= 0 ||
 		cfg.ReconnectGrace <= 0 || cfg.MaxMessageBytes <= 0 || cfg.MessagesPerWindow <= 0 ||
 		cfg.MessageWindow <= 0 || cfg.WriterQueue <= 0 {
 		return nil, errors.New("invalid gateway server configuration")
+	}
+	for _, origin := range cfg.AllowedOrigins {
+		if origin != "*" && !validBrowserOrigin(origin, cfg.AllowInsecureLoopbackOrigin) {
+			return nil, errors.New("invalid gateway server origin configuration")
+		}
 	}
 	if redeemer == nil || runtime == nil {
 		return nil, errors.New("gateway redeemer and runtime are required")
@@ -111,6 +120,7 @@ func NewServer(cfg ServerConfig, redeemer Redeemer, runtime Runtime, logger *slo
 	if logger == nil {
 		logger = slog.Default()
 	}
+	cfg.AllowedOrigins = append([]string(nil), cfg.AllowedOrigins...)
 	return &Server{
 		cfg: cfg, redeemer: redeemer, runtime: runtime, logger: logger,
 		registry: &registry{
@@ -142,12 +152,14 @@ func (s *Server) handleGateway(writer http.ResponseWriter, request *http.Request
 		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if request.Header.Get("Origin") != s.cfg.AllowedOrigin {
+	if !originAllowed(request.Header.Get("Origin"), s.cfg.AllowedOrigins, s.cfg.AllowInsecureLoopbackOrigin) {
 		http.Error(writer, "origin is not allowed", http.StatusForbidden)
 		return
 	}
 	conn, err := websocket.Accept(writer, request, &websocket.AcceptOptions{
-		// Origin is checked above with an exact scheme/host match.
+		// Origin is checked against the configured allowlist above. Keep the
+		// library check disabled so multiple exact origins and explicit wildcard
+		// semantics are handled consistently in one place.
 		InsecureSkipVerify: true,
 		CompressionMode:    websocket.CompressionDisabled,
 	})
@@ -227,6 +239,38 @@ func (s *Server) handleGateway(writer http.ResponseWriter, request *http.Request
 	if loopErr != nil && !errors.Is(loopErr, context.Canceled) && websocket.CloseStatus(loopErr) == -1 {
 		s.logger.Info("gateway session disconnected", "sessionId", claims.SessionID, "reason", disconnectReason)
 	}
+}
+
+func originAllowed(candidate string, allowed []string, allowInsecureLoopback bool) bool {
+	if !validBrowserOrigin(candidate, allowInsecureLoopback) {
+		return false
+	}
+	for _, configured := range allowed {
+		if configured == "*" || configured == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func validBrowserOrigin(value string, allowInsecureLoopback bool) bool {
+	origin, err := url.Parse(value)
+	if err != nil || origin.Host == "" || origin.Path != "" || origin.RawQuery != "" ||
+		origin.Fragment != "" || origin.User != nil {
+		return false
+	}
+	if origin.Scheme == "https" {
+		return true
+	}
+	if origin.Scheme != "http" || !allowInsecureLoopback {
+		return false
+	}
+	host := origin.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *Server) authenticate(parent context.Context, conn *websocket.Conn) (Claims, error) {

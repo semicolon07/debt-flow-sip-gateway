@@ -63,6 +63,10 @@ func TestReleasePreflightRequiresSignedPackageEvidenceAndProtectedKeys(t *testin
 		!strings.Contains(script, `$sbomValid -or -not $RequireReleaseEvidence`) {
 		t.Fatal("development mode may relax package evidence but release mode must not")
 	}
+	if !strings.Contains(script, `"wildcard browser origin enabled"`) ||
+		!strings.Contains(script, `Add-Check "secure-browser-origin" (-not $insecureLoopbackOrigin)`) {
+		t.Fatal("preflight must disclose but permit the explicit HTTPS wildcard policy")
+	}
 }
 
 func TestReleaseBuilderUsesSupportedGoModuleMetadataTemplate(t *testing.T) {

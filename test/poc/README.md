@@ -11,7 +11,8 @@ DTMF และ durable event ACK โดยไม่ต้องรัน Angular
 http:
   listen: "127.0.0.1:8080"
   metricsListen: "127.0.0.1:9090"
-  allowedOrigin: "http://127.0.0.1:8765"
+  allowedOrigins:
+    - "http://127.0.0.1:8765"
   allowInsecureLoopbackOrigin: true
   authTimeout: 5s
   heartbeat: 15s

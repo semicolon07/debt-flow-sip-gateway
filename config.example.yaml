@@ -3,7 +3,10 @@ nodeId: "sip-gateway-01"
 http:
   listen: "127.0.0.1:8080"
   metricsListen: "127.0.0.1:9090"
-  allowedOrigin: "https://debt-flow.uniga.app"
+  # Exact HTTPS origins are recommended. Use ["*"] only when every HTTPS
+  # browser origin must be accepted; production preflight flags wildcard use.
+  allowedOrigins:
+    - "https://debt-flow.uniga.app"
   # Development POC only. Production preflight rejects true.
   allowInsecureLoopbackOrigin: false
   authTimeout: 5s

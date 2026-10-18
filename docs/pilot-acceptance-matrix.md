@@ -25,7 +25,7 @@ P1 engineering scope ปิดรับมอบเมื่อ 18/10/2026 แ�
 | ID | Gate | Required evidence | Status |
 |---|---|---|---|
 | WIN-01 | Clean Windows Server 2022 install/service/ACL/DPAPI/restart | signed package hash, `sip-gateway-preflight.json`, service event log, restart terminal event | PENDING |
-| IIS-01 | IIS TLS/WSS exact Origin, timeout and header forwarding | TLS certificate details, accepted exact Origin, rejected wrong Origin, reconnect trace | PENDING |
+| IIS-01 | IIS TLS/WSS Origin policy, timeout and header forwarding | TLS certificate details, accepted configured origins, rejected wrong Origin (หรือ explicit wildcard risk acceptance), reconnect trace | PENDING |
 | NET-01 | Gateway has no route to Web API | preflight with `-RequireReleaseEvidence -ForbiddenApiHost ...`, firewall rule export | PENDING |
 | SIP-01 | REGISTER digest refresh/unregister UDP+TCP | SIPp result/message/stat files and Asterisk log | PENDING |
 | SIP-02 | Outbound INVITE/ringing/answer/CANCEL/ACK/BYE/errors UDP+TCP | SIPp evidence plus API timeline | PENDING |

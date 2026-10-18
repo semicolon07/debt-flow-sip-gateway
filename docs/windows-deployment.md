@@ -75,7 +75,7 @@ identity หรือ active key ตั้งค่าไม่ครบ/ไม�
 
 5. วาง `deploy\iis\web.config` ที่ IIS application root, bind hostname บน HTTPS 443 และห้าม expose
    Gateway ports 8080/9090 ออกนอก loopback
-6. ตรวจ `healthz`, `readyz`, metrics และ exact-Origin WSS ผ่าน IIS แล้วทดสอบ browser → API →
+6. ตรวจ `healthz`, `readyz`, metrics และ Origin allowlist WSS ผ่าน IIS แล้วทดสอบ browser → API →
    browser → Gateway capability relay; network policy ต้องพิสูจน์ว่า Gateway ออกไปหา Web API ไม่ได้
 
 7. สร้าง preflight evidence แบบ release ซึ่งจะ fail หาก signature, binary checksum, CycloneDX SBOM,

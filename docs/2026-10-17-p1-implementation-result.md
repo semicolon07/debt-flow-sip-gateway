@@ -160,7 +160,7 @@ Frontend `npm run verify` ยัง exit 1 จาก baseline นอก scope �
 | dependency/ADR/gated spikes | pinned Go modules, ADR, race/fuzz/SIPp contract tests | target Windows/PBX/browser spike |
 | Windows service + DPAPI | cross-build, installer/provision/preflight scripts และ deployment contract tests | clean Windows Server 2022 run |
 | browser inbound/outbound | Gateway adapter, shared event relay และ 4,037 Web App tests | Edge/Chrome + real audio end-to-end |
-| IIS WSS/direct ICE/TURN | exact-Origin WSS, ICE/TURN implementation/config | IIS/private-network route evidence |
+| IIS WSS/direct ICE/TURN | multi-Origin allowlist/explicit wildcard WSS, ICE/TURN implementation/config | IIS/private-network route evidence |
 | SIP/media/DTMF | SIPGo/Pion/RTP tests และ 13 SIPp scenarios | Issabel/Asterisk UDP/TCP matrix |
 | security/recovery | capability/replay/restart/outbox/diagnostic tests; Gateway/Web App scans ผ่าน | Web API baseline dependency remediation/approval และ revoke/outage/key-rotation drill on target |
 | capacity/soak | benchmark/load sampler พร้อม bounded quotas | 250 sessions/200 calls/2-hour report |
