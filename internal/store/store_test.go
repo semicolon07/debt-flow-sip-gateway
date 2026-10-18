@@ -279,8 +279,17 @@ VALUES('session-1', 7, 'legacy-event', 'call.state_changed', X'7B7D', '2026-10-1
 	if err := store.db.QueryRowContext(ctx, `SELECT version FROM schema_info LIMIT 1`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
-		t.Fatalf("schema version=%d, want 4", version)
+	if version != 5 {
+		t.Fatalf("schema version=%d, want 5", version)
+	}
+	var optimizedIndexes int
+	if err := store.db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM sqlite_master
+WHERE type='index' AND name IN ('ix_outbox_unacked_session', 'ix_outbox_unacked_global')`).Scan(&optimizedIndexes); err != nil {
+		t.Fatal(err)
+	}
+	if optimizedIndexes != 2 {
+		t.Fatalf("optimized outbox indexes=%d, want 2", optimizedIndexes)
 	}
 }
 
@@ -328,8 +337,8 @@ VALUES('call-legacy', 'session-legacy', X'7B7D', 0, '2026-10-17T00:00:00Z');`)
 	if err := store.db.QueryRowContext(ctx, `SELECT version FROM schema_info LIMIT 1`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
-		t.Fatalf("schema version=%d, want 4", version)
+	if version != 5 {
+		t.Fatalf("schema version=%d, want 5", version)
 	}
 }
 

@@ -40,6 +40,38 @@ func TestTranslatorRewritesWithoutDecodingPayload(t *testing.T) {
 	}
 }
 
+func TestTranslatorTranslateIntoReusesPayloadStorage(t *testing.T) {
+	translator, err := NewTranslator(Mapping{
+		SourceAudioPayloadType: 0, TargetAudioPayloadType: 8,
+		SourceDTMFPayloadType: 101, TargetDTMFPayloadType: 110,
+		TargetSSRC: 42, InitialSequence: 1000, InitialTimestamp: 9000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := &rtp.Packet{Payload: make([]byte, 0, 160)}
+	source := &rtp.Packet{
+		Header:  rtp.Header{Version: 2, PayloadType: 0, SequenceNumber: 7, Timestamp: 160, SSRC: 99},
+		Payload: []byte{1, 2, 3, 4},
+	}
+	if err := translator.TranslateInto(destination, source); err != nil {
+		t.Fatal(err)
+	}
+	if destination.PayloadType != 8 || destination.SSRC != 42 || string(destination.Payload) != string(source.Payload) {
+		t.Fatalf("unexpected translated packet: %+v", destination)
+	}
+	if &destination.Payload[0] == &source.Payload[0] {
+		t.Fatal("destination payload aliases source")
+	}
+	firstPayload := &destination.Payload[0]
+	if err := translator.TranslateInto(destination, source); err != nil {
+		t.Fatal(err)
+	}
+	if &destination.Payload[0] != firstPayload {
+		t.Fatal("destination payload capacity was not reused")
+	}
+}
+
 func TestBuildDTMFRepeatsTerminalPacket(t *testing.T) {
 	packets, err := BuildDTMF('#', 101, 42, 100, 9000)
 	if err != nil {

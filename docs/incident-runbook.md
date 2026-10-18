@@ -39,6 +39,10 @@ rollback runtime ทำที่ Collection บน Web API/Admin Portal แบ�
 ## Media quality or bridge errors
 
 - เทียบ direct/relay ICE route, RTP packet rate, RTCP reported loss/jitter และ bridge error direction
+- `DebtFlowSipGatewayRTPPacketLossHigh` เตือนเมื่อ RTCP reported loss ratio ต่อ forwarded packets เกิน 2%
+  ต่อเนื่อง 5 นาที; `DebtFlowSipGatewayRTPJitterHigh` เตือนเมื่อ jitter p95 เกิน 50 ms
+- แยก label `direction`: `pbx_to_browser` สูงให้ตรวจ PBX→Gateway, RTP firewall, TURN/ICE และ browser output;
+  `browser_to_pbx` สูงให้ตรวจ microphone/WebRTC uplink และ Gateway→PBX
 - ตรวจ `debt_flow_sip_gateway_rtp_source_events_total` โดย `migrated` หมายถึง PBX เปลี่ยน source port
   และ Gateway เรียนรู้ port ใหม่สำเร็จ ส่วน `rejected_ip` หมายถึง source IP ไม่ตรงกับ SDP และ packet ถูกทิ้ง
 - ถ้า `browser_to_pbx` เพิ่มแต่ `pbx_to_browser` คงที่ ให้ตรวจ RTP firewall, SDP `c=`/`m=audio`,

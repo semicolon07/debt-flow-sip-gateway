@@ -3,6 +3,7 @@ package webrtc
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -14,12 +15,15 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	pion "github.com/pion/webrtc/v4"
+	"golang.org/x/net/ipv4"
 )
 
 const (
 	mimePCMU           = "audio/PCMU"
 	mimePCMA           = "audio/PCMA"
 	mimeTelephoneEvent = "audio/telephone-event"
+	iceUDPReadBuffer   = 8 << 20
+	iceUDPWriteBuffer  = 4 << 20
 )
 
 type Config struct {
@@ -79,6 +83,19 @@ func New(cfg Config, onCandidate CandidateHandler, onRTP RTPHandler, onRTCP RTCP
 	udpConn, err := net.ListenPacket("udp4", cfg.UDPMuxListen)
 	if err != nil {
 		return nil, fmt.Errorf("listen ICE UDP mux: %w", err)
+	}
+	if conn, ok := udpConn.(*net.UDPConn); ok {
+		if err := conn.SetReadBuffer(iceUDPReadBuffer); err != nil {
+			_ = udpConn.Close()
+			return nil, fmt.Errorf("set ICE UDP read buffer: %w", err)
+		}
+		if err := conn.SetWriteBuffer(iceUDPWriteBuffer); err != nil {
+			_ = udpConn.Close()
+			return nil, fmt.Errorf("set ICE UDP write buffer: %w", err)
+		}
+	}
+	if err := ipv4.NewPacketConn(udpConn).SetTOS(46 << 2); err != nil {
+		slog.Warn("WebRTC UDP DSCP EF is unavailable; continuing without QoS marking", "error", err)
 	}
 	loggerFactory := logging.NewDefaultLoggerFactory()
 	loggerFactory.DefaultLogLevel = logging.LogLevelDisabled

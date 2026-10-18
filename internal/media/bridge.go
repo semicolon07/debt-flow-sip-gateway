@@ -39,14 +39,28 @@ func NewTranslator(mapping Mapping) (*Translator, error) {
 }
 
 func (t *Translator) Translate(packet *rtp.Packet) (*rtp.Packet, error) {
+	translated := &rtp.Packet{}
+	if err := t.TranslateInto(translated, packet); err != nil {
+		return nil, err
+	}
+	return translated, nil
+}
+
+// TranslateInto rewrites packet into dst while reusing dst's payload capacity.
+// The caller owns dst and must not reuse it until the downstream synchronous
+// write has returned.
+func (t *Translator) TranslateInto(dst, packet *rtp.Packet) error {
+	if dst == nil {
+		return errors.New("destination RTP packet is required")
+	}
 	if packet == nil {
-		return nil, errors.New("RTP packet is required")
+		return errors.New("RTP packet is required")
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	targetPayloadType, err := t.targetPayloadType(packet.PayloadType)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if !t.initialized {
 		t.firstSSRC = packet.SSRC
@@ -54,15 +68,14 @@ func (t *Translator) Translate(packet *rtp.Packet) (*rtp.Packet, error) {
 		t.firstTimestamp = packet.Timestamp
 		t.initialized = true
 	}
-	translated := &rtp.Packet{
-		Header:  packet.Header,
-		Payload: append([]byte(nil), packet.Payload...),
-	}
-	translated.PayloadType = targetPayloadType
-	translated.SSRC = t.mapping.TargetSSRC
-	translated.SequenceNumber = t.mapping.InitialSequence + (packet.SequenceNumber - t.firstSequence)
-	translated.Timestamp = t.mapping.InitialTimestamp + (packet.Timestamp - t.firstTimestamp)
-	return translated, nil
+	dst.Header = packet.Header
+	dst.Payload = append(dst.Payload[:0], packet.Payload...)
+	dst.Raw = nil
+	dst.PayloadType = targetPayloadType
+	dst.SSRC = t.mapping.TargetSSRC
+	dst.SequenceNumber = t.mapping.InitialSequence + (packet.SequenceNumber - t.firstSequence)
+	dst.Timestamp = t.mapping.InitialTimestamp + (packet.Timestamp - t.firstTimestamp)
+	return nil
 }
 
 func (t *Translator) SSRCMapping() (source, target uint32, initialized bool) {

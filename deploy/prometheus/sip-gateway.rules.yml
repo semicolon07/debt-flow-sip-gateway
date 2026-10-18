@@ -61,6 +61,33 @@ groups:
           summary: SIP Gateway rejected PBX media from an IP that differs from SDP
           runbook: docs/incident-runbook.md#media-quality-or-bridge-errors
 
+      - alert: DebtFlowSipGatewayRTPPacketLossHigh
+        expr: |
+          (
+            sum by (direction) (increase(debt_flow_sip_gateway_rtp_reported_loss_total[5m]))
+            /
+            clamp_min(sum by (direction) (increase(debt_flow_sip_gateway_rtp_packets_total[5m])), 1)
+          ) > 0.02
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: SIP Gateway reported RTP packet loss above 2 percent
+          runbook: docs/incident-runbook.md#media-quality-or-bridge-errors
+
+      - alert: DebtFlowSipGatewayRTPJitterHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, direction) (rate(debt_flow_sip_gateway_rtp_jitter_seconds_bucket[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: SIP Gateway RTCP jitter p95 is above 50 milliseconds
+          runbook: docs/incident-runbook.md#media-quality-or-bridge-errors
+
       - alert: DebtFlowSipGatewaySQLiteCheckpointBusy
         expr: debt_flow_sip_gateway_sqlite_checkpoint_busy == 1
         for: 10m

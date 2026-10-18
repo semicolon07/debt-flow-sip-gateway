@@ -125,18 +125,22 @@ type runtimeSession struct {
 }
 
 type callMedia struct {
-	callID         string
-	codec          gatewaywebrtc.CodecInfo
-	localSDP       []byte
-	toSIP          *gatewaymedia.Translator
-	toBrowser      *gatewaymedia.Translator
-	sipDTMFPayload uint8
-	dtmfSSRC       uint32
-	dtmfSequence   uint16
-	dtmfTimestamp  uint32
-	qualityMu      sync.Mutex
-	browserLoss    map[uint32]uint32
-	pbxLoss        map[uint32]uint32
+	callID          string
+	codec           gatewaywebrtc.CodecInfo
+	localSDP        []byte
+	toSIP           *gatewaymedia.Translator
+	toBrowser       *gatewaymedia.Translator
+	sipDTMFPayload  uint8
+	dtmfSSRC        uint32
+	dtmfSequence    uint16
+	dtmfTimestamp   uint32
+	qualityMu       sync.Mutex
+	browserLoss     map[uint32]uint32
+	pbxLoss         map[uint32]uint32
+	toSIPMu         sync.Mutex
+	toBrowserMu     sync.Mutex
+	toSIPPacket     rtp.Packet
+	toBrowserPacket rtp.Packet
 }
 
 type commandError struct{ code string }
@@ -566,12 +570,13 @@ func (c *Coordinator) OnBrowserRTP(sessionID string, packet *rtp.Packet) {
 	if media == nil {
 		return
 	}
-	translated, err := media.toSIP.Translate(packet)
-	if err != nil {
+	media.toSIPMu.Lock()
+	defer media.toSIPMu.Unlock()
+	if err := media.toSIP.TranslateInto(&media.toSIPPacket, packet); err != nil {
 		c.observeRTPBridgeError("browser_to_pbx")
 		return
 	}
-	if err := c.media.Write(media.callID, translated); err != nil {
+	if err := c.media.Write(media.callID, &media.toSIPPacket); err != nil {
 		c.observeRTPBridgeError("browser_to_pbx")
 		return
 	}
@@ -598,12 +603,13 @@ func (c *Coordinator) OnPBXRTP(callID string, packet *rtp.Packet) {
 	if media == nil || media.callID != callID {
 		return
 	}
-	translated, err := media.toBrowser.Translate(packet)
-	if err != nil {
+	media.toBrowserMu.Lock()
+	defer media.toBrowserMu.Unlock()
+	if err := media.toBrowser.TranslateInto(&media.toBrowserPacket, packet); err != nil {
 		c.observeRTPBridgeError("pbx_to_browser")
 		return
 	}
-	if err := c.rtc.WriteRTP(sessionID, translated); err != nil {
+	if err := c.rtc.WriteRTP(sessionID, &media.toBrowserPacket); err != nil {
 		c.observeRTPBridgeError("pbx_to_browser")
 		return
 	}
@@ -1358,6 +1364,8 @@ func (c *Coordinator) setupCallMedia(session *runtimeSession, callID string) ([]
 		callID: callID, codec: codec, localSDP: localSDP, toSIP: toSIP, toBrowser: toBrowser,
 		sipDTMFPayload: 101, dtmfSSRC: sipSSRC, dtmfSequence: randomUint16(), dtmfTimestamp: randomUint32(),
 		browserLoss: make(map[uint32]uint32), pbxLoss: make(map[uint32]uint32),
+		toSIPPacket:     rtp.Packet{Payload: make([]byte, 0, 160)},
+		toBrowserPacket: rtp.Packet{Payload: make([]byte, 0, 160)},
 	}
 	session.mu.Unlock()
 	return append([]byte(nil), localSDP...), nil

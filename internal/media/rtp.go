@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
+	"golang.org/x/net/ipv4"
 )
 
 type RTPConfig struct {
@@ -22,20 +24,30 @@ type RTPPacketHandler func(callID string, packet *rtp.Packet)
 type RTCPPacketHandler func(callID string, packets []rtcp.Packet)
 type RTPSourceEventHandler func(callID, protocol, outcome string, expected, actual *net.UDPAddr)
 
-const symmetricSourceMigrationPackets = 3
+const (
+	symmetricSourceMigrationPackets = 3
+	rtpReadBufferBytes              = 256 << 10
+	rtpWriteBufferBytes             = 128 << 10
+	rtcpReadBufferBytes             = 64 << 10
+	rtcpWriteBufferBytes            = 64 << 10
+	audioDSCPTOS                    = 46 << 2
+)
 
 type RTPManager struct {
-	cfg       RTPConfig
-	onPacket  RTPPacketHandler
-	onRTCP    RTCPPacketHandler
-	onSource  RTPSourceEventHandler
-	mu        sync.RWMutex
-	endpoints map[string]*rtpEndpoint
+	cfg            RTPConfig
+	onPacket       RTPPacketHandler
+	onRTCP         RTCPPacketHandler
+	onSource       RTPSourceEventHandler
+	mu             sync.RWMutex
+	endpoints      map[string]*rtpEndpoint
+	tuningWarnOnce sync.Once
 }
 
 type rtpEndpoint struct {
 	conn               *net.UDPConn
 	rtcpConn           *net.UDPConn
+	rtpWriteMu         sync.Mutex
+	rtpWriteBuffer     []byte
 	local              *net.UDPAddr
 	advertised         *net.UDPAddr
 	mu                 sync.RWMutex
@@ -83,11 +95,13 @@ func (m *RTPManager) Allocate(callID string) (*net.UDPAddr, error) {
 			_ = conn.Close()
 			continue
 		}
+		m.tuneSocket(conn, rtpReadBufferBytes, rtpWriteBufferBytes)
+		m.tuneSocket(rtcpConn, rtcpReadBufferBytes, rtcpWriteBufferBytes)
 		ctx, cancel := context.WithCancel(context.Background())
 		endpoint := &rtpEndpoint{
 			conn: conn, rtcpConn: rtcpConn, local: cloneUDPAddr(conn.LocalAddr().(*net.UDPAddr)),
-			advertised: &net.UDPAddr{IP: append(net.IP(nil), m.cfg.AdvertisedIP...), Port: port},
-			cancel:     cancel,
+			advertised:     &net.UDPAddr{IP: append(net.IP(nil), m.cfg.AdvertisedIP...), Port: port},
+			rtpWriteBuffer: make([]byte, 1600), cancel: cancel,
 		}
 		m.endpoints[callID] = endpoint
 		go m.readLoop(ctx, callID, endpoint)
@@ -95,6 +109,24 @@ func (m *RTPManager) Allocate(callID string) (*net.UDPAddr, error) {
 		return cloneUDPAddr(endpoint.advertised), nil
 	}
 	return nil, errors.New("RTP port range exhausted")
+}
+
+func (m *RTPManager) tuneSocket(conn *net.UDPConn, readBytes, writeBytes int) {
+	var result error
+	if err := conn.SetReadBuffer(readBytes); err != nil {
+		result = errors.Join(result, fmt.Errorf("read buffer: %w", err))
+	}
+	if err := conn.SetWriteBuffer(writeBytes); err != nil {
+		result = errors.Join(result, fmt.Errorf("write buffer: %w", err))
+	}
+	if err := ipv4.NewPacketConn(conn).SetTOS(audioDSCPTOS); err != nil {
+		result = errors.Join(result, fmt.Errorf("DSCP EF: %w", err))
+	}
+	if result != nil {
+		m.tuningWarnOnce.Do(func() {
+			slog.Warn("RTP UDP socket tuning is partially unavailable; continuing with OS defaults", "error", result)
+		})
+	}
 }
 
 func (m *RTPManager) SetRemote(callID string, remoteRTP, remoteRTCP *net.UDPAddr) error {
@@ -129,17 +161,16 @@ func (m *RTPManager) WriteRTCP(callID string, packets []rtcp.Packet) error {
 	if err != nil {
 		return err
 	}
-	endpoint.mu.RLock()
-	remote := cloneUDPAddr(endpoint.remoteRTCP)
-	endpoint.mu.RUnlock()
-	if remote == nil {
-		return errors.New("remote RTCP address is not set")
-	}
 	raw, err := rtcp.Marshal(packets)
 	if err != nil {
 		return err
 	}
-	_, err = endpoint.rtcpConn.WriteToUDP(raw, remote)
+	endpoint.mu.RLock()
+	defer endpoint.mu.RUnlock()
+	if endpoint.remoteRTCP == nil {
+		return errors.New("remote RTCP address is not set")
+	}
+	_, err = endpoint.rtcpConn.WriteToUDP(raw, endpoint.remoteRTCP)
 	return err
 }
 
@@ -151,17 +182,23 @@ func (m *RTPManager) Write(callID string, packet *rtp.Packet) error {
 	if err != nil {
 		return err
 	}
-	endpoint.mu.RLock()
-	remote := cloneUDPAddr(endpoint.remote)
-	endpoint.mu.RUnlock()
-	if remote == nil {
-		return errors.New("remote RTP address is not set")
+	endpoint.rtpWriteMu.Lock()
+	defer endpoint.rtpWriteMu.Unlock()
+	size := packet.MarshalSize()
+	if size > cap(endpoint.rtpWriteBuffer) {
+		endpoint.rtpWriteBuffer = make([]byte, size)
 	}
-	raw, err := packet.Marshal()
+	raw := endpoint.rtpWriteBuffer[:size]
+	n, err := packet.MarshalTo(raw)
 	if err != nil {
 		return err
 	}
-	_, err = endpoint.conn.WriteToUDP(raw, remote)
+	endpoint.mu.RLock()
+	defer endpoint.mu.RUnlock()
+	if endpoint.remote == nil {
+		return errors.New("remote RTP address is not set")
+	}
+	_, err = endpoint.conn.WriteToUDP(raw[:n], endpoint.remote)
 	return err
 }
 
@@ -206,13 +243,7 @@ func (m *RTPManager) readRTCPLoop(ctx context.Context, callID string, endpoint *
 		if err != nil {
 			continue
 		}
-		endpoint.mu.Lock()
-		expected := cloneUDPAddr(endpoint.remoteRTCP)
-		decision := learnSymmetricSource(
-			&endpoint.remoteRTCP, &endpoint.learnedRTCP,
-			&endpoint.rtcpCandidatePort, &endpoint.rtcpCandidateCount, source,
-		)
-		endpoint.mu.Unlock()
+		decision, expected := validateRTCPSource(endpoint, source)
 		m.observeSource(callID, "rtcp", decision, expected, source)
 		if !decision.accepted() {
 			continue
@@ -239,13 +270,7 @@ func (m *RTPManager) readLoop(ctx context.Context, callID string, endpoint *rtpE
 		if err := packet.Unmarshal(buffer[:n]); err != nil {
 			continue
 		}
-		endpoint.mu.Lock()
-		expected := cloneUDPAddr(endpoint.remote)
-		decision := learnSymmetricSource(
-			&endpoint.remote, &endpoint.learnedRTP,
-			&endpoint.rtpCandidatePort, &endpoint.rtpCandidateCount, source,
-		)
-		endpoint.mu.Unlock()
+		decision, expected := validateRTPSource(endpoint, source)
 		m.observeSource(callID, "rtp", decision, expected, source)
 		if !decision.accepted() {
 			continue
@@ -254,6 +279,42 @@ func (m *RTPManager) readLoop(ctx context.Context, callID string, endpoint *rtpE
 			m.onPacket(callID, &packet)
 		}
 	}
+}
+
+func validateRTPSource(endpoint *rtpEndpoint, source *net.UDPAddr) (sourceDecision, *net.UDPAddr) {
+	endpoint.mu.RLock()
+	stable := endpoint.learnedRTP && sameUDPAddr(endpoint.remote, source)
+	endpoint.mu.RUnlock()
+	if stable {
+		return sourceAccepted, nil
+	}
+	endpoint.mu.Lock()
+	defer endpoint.mu.Unlock()
+	expected := cloneUDPAddr(endpoint.remote)
+	return learnSymmetricSource(
+		&endpoint.remote, &endpoint.learnedRTP,
+		&endpoint.rtpCandidatePort, &endpoint.rtpCandidateCount, source,
+	), expected
+}
+
+func validateRTCPSource(endpoint *rtpEndpoint, source *net.UDPAddr) (sourceDecision, *net.UDPAddr) {
+	endpoint.mu.RLock()
+	stable := endpoint.learnedRTCP && sameUDPAddr(endpoint.remoteRTCP, source)
+	endpoint.mu.RUnlock()
+	if stable {
+		return sourceAccepted, nil
+	}
+	endpoint.mu.Lock()
+	defer endpoint.mu.Unlock()
+	expected := cloneUDPAddr(endpoint.remoteRTCP)
+	return learnSymmetricSource(
+		&endpoint.remoteRTCP, &endpoint.learnedRTCP,
+		&endpoint.rtcpCandidatePort, &endpoint.rtcpCandidateCount, source,
+	), expected
+}
+
+func sameUDPAddr(left, right *net.UDPAddr) bool {
+	return left != nil && right != nil && left.Port == right.Port && left.Zone == right.Zone && left.IP.Equal(right.IP)
 }
 
 type sourceDecision string

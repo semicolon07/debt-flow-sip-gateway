@@ -16,14 +16,16 @@ Unit tests ตรวจ correctness และ race ได้ แต่ไม่�
 RTP rewrite ทั้ง single stream/200 concurrent calls, runtime snapshot ที่ 250 sessions/200 calls และ SQLite
 outbox append+ACK ตัวเลขนี้เหมาะกับ regression comparison ระหว่าง commit ไม่ใช่ server sizing
 
-ตัวอย่าง smoke baseline วันที่ 2026-10-17 บน Darwin/arm64, Apple M2 Pro, `-benchtime=200ms -count=1`:
+ตัวอย่าง smoke baseline วันที่ 2026-10-17–18 บน Darwin/arm64, Apple M2 Pro:
 
 | benchmark | time/op | bytes/op | allocs/op |
 |---|---:|---:|---:|
 | decode + validate `call.start` | 2.542 us | 2,867 | 22 |
 | verify AES-GCM session capability | 3.818 us | 4,999 | 23 |
 | RTP header/payload translate | 63.75 ns | 304 | 2 |
+| RTP reusable-buffer translate (production hot path) | 19.98 ns | 0 | 0 |
 | RTP translate, 200 interleaved call streams | 64.28 ns | 304 | 2 |
+| RTP reusable-buffer translate, 200 interleaved call streams | 39.20 ns | 0 | 0 |
 | snapshot, 250 sessions / 200 active calls | 11.923 us | 2,352 | 4 |
 | SQLite outbox append + ACK | 731.145 us | 4,635 | 99 |
 
@@ -32,9 +34,14 @@ DTLS-SRTP, ICE/TURN, network I/O, SIP PBX I/O หรือ Windows scheduler จ
 
 สำหรับ packetization 20 ms ที่ P1 advertise นั้น หนึ่งสาย G.711 จะมีประมาณ 50 RTP packets/s ต่อทิศทาง
 ดังนั้น 200 สาย full-duplex คือประมาณ 20,000 packet translations/s และ audio payload รวมประมาณ 3.2 MB/s
-ก่อนนับ RTP/UDP/IP/SRTP/TURN overhead จาก benchmark ปัจจุบัน translation path สร้าง allocation 304 bytes/packet
-หรือประมาณ 6.1 MB/s ที่ workload นี้ ค่านี้เป็น lower-bound model สำหรับตามหา GC/allocation regression ไม่ใช่
-ค่าทดแทน live network measurement
+ก่อนนับ RTP/UDP/IP/SRTP/TURN overhead production coordinator ใช้ reusable packet/payload แยกต่อสายและทิศทาง
+จึงลด translation allocation จาก 304 bytes/packet เหลือ 0 ใน steady state หรือลด allocation pressure ราว 6.1 MB/s
+ที่ workload 200 สาย (ไม่นับ allocation ภายใน DTLS-SRTP/network stack) ค่านี้เป็น lower-bound model สำหรับตามหา
+GC/allocation regression ไม่ใช่ค่าทดแทน live network measurement
+
+รอบ tuning 2026-10-18 ยังเพิ่ม reusable RTP marshal buffer ต่อ PBX, fast path สำหรับ symmetric-source ที่นิ่ง,
+cache Prometheus counter handle, ขยาย shared ICE UDP socket buffer และเพิ่ม partial SQLite indexes สำหรับ pending outbox
+โดยยังคง `synchronous=FULL` และ durable event semantics เดิม
 
 ## 2. Live load/soak observation
 

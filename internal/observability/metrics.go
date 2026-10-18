@@ -40,6 +40,9 @@ type Metrics struct {
 	SQLiteWALBytes       prometheus.Gauge
 	SQLiteCheckpointBusy prometheus.Gauge
 	SQLiteFailures       *prometheus.CounterVec
+	rtpBrowserToPBX      prometheus.Counter
+	rtpPBXToBrowser      prometheus.Counter
+	rtpUnknownDirection  prometheus.Counter
 	turnMu               sync.Mutex
 	lastTURN             TURNStats
 }
@@ -205,6 +208,9 @@ func NewMetrics() *Metrics {
 		metrics.SQLiteFailures,
 	)
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	metrics.rtpBrowserToPBX = metrics.RTPPackets.WithLabelValues("browser_to_pbx")
+	metrics.rtpPBXToBrowser = metrics.RTPPackets.WithLabelValues("pbx_to_browser")
+	metrics.rtpUnknownDirection = metrics.RTPPackets.WithLabelValues("unknown")
 	return metrics
 }
 
@@ -225,7 +231,14 @@ func (m *Metrics) ObserveCallEnded(direction, outcome string) {
 }
 
 func (m *Metrics) ObserveRTPPacket(direction string) {
-	m.RTPPackets.WithLabelValues(direction).Inc()
+	switch direction {
+	case "browser_to_pbx":
+		m.rtpBrowserToPBX.Inc()
+	case "pbx_to_browser":
+		m.rtpPBXToBrowser.Inc()
+	default:
+		m.rtpUnknownDirection.Inc()
+	}
 }
 
 func (m *Metrics) ObserveRTPQuality(direction string, lost, jitter uint32) {

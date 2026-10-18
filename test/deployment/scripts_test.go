@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestInstallerStopsAnExistingServiceBeforeReplacingTheBinary(t *testing.T) {
@@ -145,6 +147,39 @@ func TestSQLiteFailureAlertIsConfigured(t *testing.T) {
 	rules := string(raw)
 	if !strings.Contains(rules, "increase(debt_flow_sip_gateway_sqlite_failures_total[5m]) > 0") {
 		t.Fatal("Prometheus rules do not alert on SQLite operation failures")
+	}
+}
+
+func TestMediaQualityAlertsAndDashboardAreConfigured(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(moduleRoot(t), "deploy", "prometheus", "sip-gateway.rules.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := string(raw)
+	var rulesDocument map[string]any
+	if err := yaml.Unmarshal(raw, &rulesDocument); err != nil {
+		t.Fatalf("Prometheus rules are invalid YAML: %v", err)
+	}
+	for _, required := range []string{
+		"DebtFlowSipGatewayRTPPacketLossHigh",
+		"debt_flow_sip_gateway_rtp_reported_loss_total",
+		") > 0.02",
+		"DebtFlowSipGatewayRTPJitterHigh",
+		"debt_flow_sip_gateway_rtp_jitter_seconds_bucket",
+		") > 0.05",
+	} {
+		if !strings.Contains(rules, required) {
+			t.Fatalf("Prometheus media rules are missing %q", required)
+		}
+	}
+	dashboard, err := os.ReadFile(filepath.Join(moduleRoot(t), "deploy", "grafana", "sip-gateway-dashboard.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"RTP packet loss ratio", "RTCP jitter p95"} {
+		if !strings.Contains(string(dashboard), required) {
+			t.Fatalf("Grafana media dashboard is missing %q", required)
+		}
 	}
 }
 

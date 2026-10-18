@@ -85,6 +85,11 @@ gate ที่ยังต้องดำเนินการตาม `pilot-a
   เพื่อให้ production bundle ยังผ่าน hard performance budget
 - browser media แยก permission/device failure ที่ต้องให้ผู้ใช้ retry ออกจาก transient ICE/network reconnect
   เพื่อไม่ขอ microphone/capability วนเมื่อ permission ถูกปฏิเสธหรือ revoke
+- browser audio ใช้ mono voice constraints (`echoCancellation`, `noiseSuppression`, `autoGainControl`),
+  ติดตาม `devicechange` เพื่อ fallback ไป default microphone/speaker และมี inbound-RTP watchdog ที่
+  retry playback/แจ้ง diagnostic โดยไม่ตัด SIP call อัตโนมัติ
+- Gateway ขยาย shared ICE และ per-call RTP/RTCP UDP buffers, mark DSCP EF แบบ best-effort,
+  และเพิ่ม packet-loss/jitter dashboard + alert โดย QoS ที่ OS ไม่รองรับจะ log warning และทำงานต่อ
 - legacy data ที่ไม่มี runtime/transport normalize เป็น `desktop_agent` + `udp`
 
 ## Desktop Agent contract/lifecycle parity fix (2026-10-18)

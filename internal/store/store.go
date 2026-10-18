@@ -162,6 +162,8 @@ CREATE TABLE IF NOT EXISTS outbox (
     UNIQUE(event_key)
 );
 CREATE INDEX IF NOT EXISTS ix_outbox_pending ON outbox(session_id, acked_at_utc, sequence);
+CREATE INDEX IF NOT EXISTS ix_outbox_unacked_session ON outbox(session_id, sequence) WHERE acked_at_utc IS NULL;
+CREATE INDEX IF NOT EXISTS ix_outbox_unacked_global ON outbox(sequence) WHERE acked_at_utc IS NULL;
 
 CREATE TABLE IF NOT EXISTS agent_sequences (
     agent_instance_id TEXT PRIMARY KEY,
@@ -226,7 +228,7 @@ ON CONFLICT(agent_instance_id) DO UPDATE SET
     next_sequence = MAX(agent_sequences.next_sequence, excluded.next_sequence)`); err != nil {
 		return fmt.Errorf("backfill agent sequence cursor: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE schema_info SET version = 4 WHERE version < 4`); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE schema_info SET version = 5 WHERE version < 5`); err != nil {
 		return fmt.Errorf("update sqlite schema version: %w", err)
 	}
 	return nil
