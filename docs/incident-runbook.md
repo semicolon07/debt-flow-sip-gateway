@@ -39,6 +39,10 @@ rollback runtime ทำที่ Collection บน Web API/Admin Portal แบ�
 ## Media quality or bridge errors
 
 - เทียบ direct/relay ICE route, RTP packet rate, RTCP reported loss/jitter และ bridge error direction
+- ตรวจ `debt_flow_sip_gateway_rtp_source_events_total` โดย `migrated` หมายถึง PBX เปลี่ยน source port
+  และ Gateway เรียนรู้ port ใหม่สำเร็จ ส่วน `rejected_ip` หมายถึง source IP ไม่ตรงกับ SDP และ packet ถูกทิ้ง
+- ถ้า `browser_to_pbx` เพิ่มแต่ `pbx_to_browser` คงที่ ให้ตรวจ RTP firewall, SDP `c=`/`m=audio`,
+  direct media/re-INVITE และ source IP/port จริงจาก PBX ก่อน restart Gateway
 - ตรวจ PBX codec ว่า PCMU/PCMA และ RFC 4733 เท่านั้น รวมถึง RTP/RTCP advertised IP/port
 - packet capture อาจมีหมายเลข, SDP, ICE หรือ media จึงเป็น sensitive artifact และไม่อยู่ใน diagnostics bundle
 

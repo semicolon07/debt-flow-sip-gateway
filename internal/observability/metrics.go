@@ -33,6 +33,7 @@ type Metrics struct {
 	RTPReportedLoss      *prometheus.CounterVec
 	RTPJitter            *prometheus.HistogramVec
 	RTPBridgeErrors      *prometheus.CounterVec
+	RTPSourceEvents      *prometheus.CounterVec
 	OutboxDepth          prometheus.Gauge
 	OutboxCapacityRatio  prometheus.Gauge
 	SQLiteDatabaseBytes  prometheus.Gauge
@@ -163,6 +164,10 @@ func NewMetrics() *Metrics {
 			Namespace: "debt_flow", Subsystem: "sip_gateway", Name: "rtp_bridge_errors_total",
 			Help: "RTP or RTCP bridge errors by bounded direction.",
 		}, []string{"direction"}),
+		RTPSourceEvents: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "debt_flow", Subsystem: "sip_gateway", Name: "rtp_source_events_total",
+			Help: "PBX RTP or RTCP source validation and controlled port-learning events.",
+		}, []string{"protocol", "outcome"}),
 		OutboxDepth: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "debt_flow", Subsystem: "sip_gateway", Name: "outbox_pending_events",
 			Help: "Current durable unacknowledged event count.",
@@ -194,7 +199,8 @@ func NewMetrics() *Metrics {
 		metrics.PeerConnections, metrics.ICERoutes, metrics.TURNAllocations, metrics.TURNQuotaUse,
 		metrics.TURNDenials, metrics.TURNBytes, metrics.WSSConnections, metrics.WSSWriterQueueDepth,
 		metrics.WSSDisconnects, metrics.LeaseEvents, metrics.RTPPackets, metrics.RTPReportedLoss,
-		metrics.RTPJitter, metrics.RTPBridgeErrors, metrics.OutboxDepth, metrics.OutboxCapacityRatio,
+		metrics.RTPJitter, metrics.RTPBridgeErrors, metrics.RTPSourceEvents,
+		metrics.OutboxDepth, metrics.OutboxCapacityRatio,
 		metrics.SQLiteDatabaseBytes, metrics.SQLiteWALBytes, metrics.SQLiteCheckpointBusy,
 		metrics.SQLiteFailures,
 	)
@@ -231,6 +237,10 @@ func (m *Metrics) ObserveRTPQuality(direction string, lost, jitter uint32) {
 
 func (m *Metrics) ObserveRTPBridgeError(direction string) {
 	m.RTPBridgeErrors.WithLabelValues(direction).Inc()
+}
+
+func (m *Metrics) ObserveRTPSource(protocol, outcome string) {
+	m.RTPSourceEvents.WithLabelValues(protocol, outcome).Inc()
 }
 
 func (m *Metrics) ObserveLease(outcome string) {

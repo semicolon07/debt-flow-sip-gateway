@@ -22,6 +22,7 @@ func TestMetricsExposeRuntimeAndInfrastructureState(t *testing.T) {
 	metrics.ObserveRTPPacket("browser_to_pbx")
 	metrics.ObserveRTPQuality("browser_to_pbx", 2, 80)
 	metrics.ObserveRTPBridgeError("pbx_to_browser")
+	metrics.ObserveRTPSource("rtp", "migrated")
 	metrics.ObserveLease("refreshed")
 	metrics.ObserveWSSDisconnect("client_closed")
 	metrics.SetStorage(StorageStats{
@@ -76,6 +77,7 @@ func TestMetricsExposeRuntimeAndInfrastructureState(t *testing.T) {
 		"debt_flow_sip_gateway_rtp_reported_loss_total",
 		"debt_flow_sip_gateway_rtp_jitter_seconds",
 		"debt_flow_sip_gateway_rtp_bridge_errors_total",
+		"debt_flow_sip_gateway_rtp_source_events_total",
 		"debt_flow_sip_gateway_sqlite_failures_total",
 	} {
 		if !names[name] {

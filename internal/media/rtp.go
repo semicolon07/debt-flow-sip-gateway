@@ -20,33 +20,44 @@ type RTPConfig struct {
 
 type RTPPacketHandler func(callID string, packet *rtp.Packet)
 type RTCPPacketHandler func(callID string, packets []rtcp.Packet)
+type RTPSourceEventHandler func(callID, protocol, outcome string, expected, actual *net.UDPAddr)
+
+const symmetricSourceMigrationPackets = 3
 
 type RTPManager struct {
 	cfg       RTPConfig
 	onPacket  RTPPacketHandler
 	onRTCP    RTCPPacketHandler
+	onSource  RTPSourceEventHandler
 	mu        sync.RWMutex
 	endpoints map[string]*rtpEndpoint
 }
 
 type rtpEndpoint struct {
-	conn        *net.UDPConn
-	rtcpConn    *net.UDPConn
-	local       *net.UDPAddr
-	advertised  *net.UDPAddr
-	mu          sync.RWMutex
-	remote      *net.UDPAddr
-	remoteRTCP  *net.UDPAddr
-	learnedRTP  bool
-	learnedRTCP bool
-	cancel      context.CancelFunc
+	conn               *net.UDPConn
+	rtcpConn           *net.UDPConn
+	local              *net.UDPAddr
+	advertised         *net.UDPAddr
+	mu                 sync.RWMutex
+	remote             *net.UDPAddr
+	remoteRTCP         *net.UDPAddr
+	learnedRTP         bool
+	learnedRTCP        bool
+	rtpCandidatePort   int
+	rtpCandidateCount  uint8
+	rtcpCandidatePort  int
+	rtcpCandidateCount uint8
+	cancel             context.CancelFunc
 }
 
-func NewRTPManager(cfg RTPConfig, onPacket RTPPacketHandler, onRTCP RTCPPacketHandler) (*RTPManager, error) {
+func NewRTPManager(cfg RTPConfig, onPacket RTPPacketHandler, onRTCP RTCPPacketHandler, onSource RTPSourceEventHandler) (*RTPManager, error) {
 	if cfg.ListenIP == nil || cfg.AdvertisedIP == nil || cfg.MinPort == 0 || cfg.MaxPort < cfg.MinPort {
 		return nil, errors.New("invalid RTP manager configuration")
 	}
-	return &RTPManager{cfg: cfg, onPacket: onPacket, onRTCP: onRTCP, endpoints: make(map[string]*rtpEndpoint)}, nil
+	return &RTPManager{
+		cfg: cfg, onPacket: onPacket, onRTCP: onRTCP, onSource: onSource,
+		endpoints: make(map[string]*rtpEndpoint),
+	}, nil
 }
 
 func (m *RTPManager) Allocate(callID string) (*net.UDPAddr, error) {
@@ -102,6 +113,10 @@ func (m *RTPManager) SetRemote(callID string, remoteRTP, remoteRTCP *net.UDPAddr
 	endpoint.remoteRTCP = cloneUDPAddr(remoteRTCP)
 	endpoint.learnedRTP = false
 	endpoint.learnedRTCP = false
+	endpoint.rtpCandidatePort = 0
+	endpoint.rtpCandidateCount = 0
+	endpoint.rtcpCandidatePort = 0
+	endpoint.rtcpCandidateCount = 0
 	endpoint.mu.Unlock()
 	return nil
 }
@@ -187,14 +202,22 @@ func (m *RTPManager) readRTCPLoop(ctx context.Context, callID string, endpoint *
 				continue
 			}
 		}
-		endpoint.mu.Lock()
-		accepted := learnSymmetricSource(&endpoint.remoteRTCP, &endpoint.learnedRTCP, source)
-		endpoint.mu.Unlock()
-		if !accepted {
+		packets, err := rtcp.Unmarshal(buffer[:n])
+		if err != nil {
 			continue
 		}
-		packets, err := rtcp.Unmarshal(buffer[:n])
-		if err == nil && m.onRTCP != nil {
+		endpoint.mu.Lock()
+		expected := cloneUDPAddr(endpoint.remoteRTCP)
+		decision := learnSymmetricSource(
+			&endpoint.remoteRTCP, &endpoint.learnedRTCP,
+			&endpoint.rtcpCandidatePort, &endpoint.rtcpCandidateCount, source,
+		)
+		endpoint.mu.Unlock()
+		m.observeSource(callID, "rtcp", decision, expected, source)
+		if !decision.accepted() {
+			continue
+		}
+		if m.onRTCP != nil {
 			m.onRTCP(callID, packets)
 		}
 	}
@@ -212,14 +235,19 @@ func (m *RTPManager) readLoop(ctx context.Context, callID string, endpoint *rtpE
 				continue
 			}
 		}
-		endpoint.mu.Lock()
-		accepted := learnSymmetricSource(&endpoint.remote, &endpoint.learnedRTP, source)
-		endpoint.mu.Unlock()
-		if !accepted {
-			continue
-		}
 		var packet rtp.Packet
 		if err := packet.Unmarshal(buffer[:n]); err != nil {
+			continue
+		}
+		endpoint.mu.Lock()
+		expected := cloneUDPAddr(endpoint.remote)
+		decision := learnSymmetricSource(
+			&endpoint.remote, &endpoint.learnedRTP,
+			&endpoint.rtpCandidatePort, &endpoint.rtpCandidateCount, source,
+		)
+		endpoint.mu.Unlock()
+		m.observeSource(callID, "rtp", decision, expected, source)
+		if !decision.accepted() {
 			continue
 		}
 		if m.onPacket != nil {
@@ -228,16 +256,72 @@ func (m *RTPManager) readLoop(ctx context.Context, callID string, endpoint *rtpE
 	}
 }
 
-func learnSymmetricSource(remote **net.UDPAddr, learned *bool, source *net.UDPAddr) bool {
-	if *remote == nil || source == nil || !(*remote).IP.Equal(source.IP) {
-		return false
+type sourceDecision string
+
+const (
+	sourceAccepted         sourceDecision = "accepted"
+	sourceLearned          sourceDecision = "learned"
+	sourceMigrationPending sourceDecision = "migration_pending"
+	sourceMigrated         sourceDecision = "migrated"
+	sourceRejectedInvalid  sourceDecision = "rejected_invalid"
+	sourceRejectedIP       sourceDecision = "rejected_ip"
+)
+
+func (d sourceDecision) accepted() bool {
+	return d == sourceAccepted || d == sourceLearned || d == sourceMigrationPending || d == sourceMigrated
+}
+
+func learnSymmetricSource(
+	remote **net.UDPAddr,
+	learned *bool,
+	candidatePort *int,
+	candidateCount *uint8,
+	source *net.UDPAddr,
+) sourceDecision {
+	if *remote == nil || source == nil || source.IP == nil || source.Port == 0 {
+		return sourceRejectedInvalid
 	}
-	if *learned {
-		return (*remote).Port == source.Port
+	if !(*remote).IP.Equal(source.IP) {
+		return sourceRejectedIP
+	}
+	if !*learned {
+		*remote = cloneUDPAddr(source)
+		*learned = true
+		*candidatePort = 0
+		*candidateCount = 0
+		return sourceLearned
+	}
+	if (*remote).Port == source.Port {
+		*candidatePort = 0
+		*candidateCount = 0
+		return sourceAccepted
+	}
+	if *candidatePort != source.Port {
+		*candidatePort = source.Port
+		*candidateCount = 1
+		return sourceMigrationPending
+	}
+	if *candidateCount < symmetricSourceMigrationPackets {
+		*candidateCount++
+	}
+	if *candidateCount < symmetricSourceMigrationPackets {
+		return sourceMigrationPending
 	}
 	*remote = cloneUDPAddr(source)
-	*learned = true
-	return true
+	*candidatePort = 0
+	*candidateCount = 0
+	return sourceMigrated
+}
+
+func (m *RTPManager) observeSource(
+	callID, protocol string,
+	decision sourceDecision,
+	expected, actual *net.UDPAddr,
+) {
+	if m.onSource == nil || decision == sourceAccepted {
+		return
+	}
+	m.onSource(callID, protocol, string(decision), cloneUDPAddr(expected), cloneUDPAddr(actual))
 }
 
 func (m *RTPManager) get(callID string) (*rtpEndpoint, error) {

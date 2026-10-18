@@ -53,6 +53,14 @@ groups:
           summary: SIP Gateway media bridge errors increased
           runbook: docs/incident-runbook.md#media-quality-or-bridge-errors
 
+      - alert: DebtFlowSipGatewayRTPSourceRejected
+        expr: increase(debt_flow_sip_gateway_rtp_source_events_total{outcome="rejected_ip"}[5m]) > 10
+        labels:
+          severity: warning
+        annotations:
+          summary: SIP Gateway rejected PBX media from an IP that differs from SDP
+          runbook: docs/incident-runbook.md#media-quality-or-bridge-errors
+
       - alert: DebtFlowSipGatewaySQLiteCheckpointBusy
         expr: debt_flow_sip_gateway_sqlite_checkpoint_busy == 1
         for: 10m

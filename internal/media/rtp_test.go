@@ -20,7 +20,7 @@ func TestRTPManagerAcceptsConfiguredSource(t *testing.T) {
 	manager, err := NewRTPManager(RTPConfig{
 		ListenIP: net.ParseIP("127.0.0.1"), AdvertisedIP: net.ParseIP("127.0.0.1"),
 		MinPort: uint16(port), MaxPort: uint16(port + 2),
-	}, func(_ string, packet *rtp.Packet) { received <- packet }, nil)
+	}, func(_ string, packet *rtp.Packet) { received <- packet }, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,20 +52,34 @@ func TestRTPManagerAcceptsConfiguredSource(t *testing.T) {
 	}
 }
 
-func TestLearnSymmetricSourceRequiresExpectedIPAndLocksFirstPort(t *testing.T) {
+func TestLearnSymmetricSourceRequiresExpectedIPAndMigratesStablePort(t *testing.T) {
 	remote := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 1000}
 	learned := false
-	if learnSymmetricSource(&remote, &learned, &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 2000}) {
+	candidatePort := 0
+	var candidateCount uint8
+	if decision := learnSymmetricSource(&remote, &learned, &candidatePort, &candidateCount,
+		&net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 2000}); decision != sourceRejectedIP {
 		t.Fatal("symmetric RTP learned an unexpected source IP")
 	}
-	if !learnSymmetricSource(&remote, &learned, &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 2000}) {
+	if decision := learnSymmetricSource(&remote, &learned, &candidatePort, &candidateCount,
+		&net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 2000}); decision != sourceLearned {
 		t.Fatal("symmetric RTP did not learn a source port from the expected IP")
 	}
 	if remote.Port != 2000 || !learned {
 		t.Fatalf("unexpected learned source: %v learned=%v", remote, learned)
 	}
-	if learnSymmetricSource(&remote, &learned, &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 3000}) {
-		t.Fatal("symmetric RTP switched ports after the source was locked")
+	for index := 1; index <= symmetricSourceMigrationPackets; index++ {
+		decision := learnSymmetricSource(&remote, &learned, &candidatePort, &candidateCount,
+			&net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 3000})
+		if !decision.accepted() {
+			t.Fatal("valid media from a new port was rejected during migration")
+		}
+		if index < symmetricSourceMigrationPackets && remote.Port != 2000 {
+			t.Fatal("symmetric RTP migrated before the new source was stable")
+		}
+	}
+	if remote.Port != 3000 {
+		t.Fatalf("symmetric RTP did not migrate to stable source port: %v", remote)
 	}
 }
 
@@ -73,7 +87,7 @@ func TestRTPManagerLearnsSymmetricSourcePortOnce(t *testing.T) {
 	manager, err := NewRTPManager(RTPConfig{
 		ListenIP: net.ParseIP("127.0.0.1"), AdvertisedIP: net.ParseIP("127.0.0.1"),
 		MinPort: 30000, MaxPort: 34000,
-	}, nil, nil)
+	}, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +148,7 @@ func TestRTPManagerBridgesRTCPOnPairedPort(t *testing.T) {
 	manager, err := NewRTPManager(RTPConfig{
 		ListenIP: net.ParseIP("127.0.0.1"), AdvertisedIP: net.ParseIP("127.0.0.1"),
 		MinPort: 30000, MaxPort: 34000,
-	}, nil, func(_ string, packets []rtcp.Packet) { received <- packets })
+	}, nil, func(_ string, packets []rtcp.Packet) { received <- packets }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

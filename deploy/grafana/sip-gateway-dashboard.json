@@ -49,7 +49,8 @@
       "title": "RTP packets and errors",
       "targets": [
         { "expr": "rate(debt_flow_sip_gateway_rtp_packets_total[1m])", "legendFormat": "packets {{direction}}", "refId": "A" },
-        { "expr": "rate(debt_flow_sip_gateway_rtp_bridge_errors_total[1m])", "legendFormat": "errors {{direction}}", "refId": "B" }
+        { "expr": "rate(debt_flow_sip_gateway_rtp_bridge_errors_total[1m])", "legendFormat": "errors {{direction}}", "refId": "B" },
+        { "expr": "rate(debt_flow_sip_gateway_rtp_source_events_total[1m])", "legendFormat": "source {{protocol}} {{outcome}}", "refId": "C" }
       ],
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 }
     },

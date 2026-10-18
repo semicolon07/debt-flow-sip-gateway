@@ -181,6 +181,14 @@ func Run(ctx context.Context, cfg config.Config) error {
 		if coordinator != nil {
 			coordinator.OnPBXRTCP(callID, packets)
 		}
+	}, func(callID, protocol, outcome string, expected, actual *net.UDPAddr) {
+		metrics.ObserveRTPSource(protocol, outcome)
+		if outcome == "migrated" {
+			logger.Info("PBX media source port migrated",
+				"callId", callID, "protocol", protocol,
+				"previous", expected.String(), "actual", actual.String(),
+			)
+		}
 	})
 	if err != nil {
 		return fmt.Errorf("create RTP manager: %w", err)
