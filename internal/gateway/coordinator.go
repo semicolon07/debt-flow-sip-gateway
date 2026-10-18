@@ -1257,12 +1257,21 @@ func (c *Coordinator) applyCallEvent(session *runtimeSession, event sip.Event) {
 			return
 		}
 	case sip.EventConnected:
-		remote, err := sip.ParseRemoteSDP(event.RemoteSDP)
 		media := session.activeMedia
-		if err != nil || media == nil || remote.Codec != media.codec.Name ||
-			c.media.SetRemote(event.CallID,
-				&net.UDPAddr{IP: net.ParseIP(remote.IP), Port: int(remote.Port)},
-				&net.UDPAddr{IP: net.ParseIP(remote.RTCPIP), Port: int(remote.RTCPPort)}) != nil {
+		snapshot := machine.Snapshot()
+		mediaReady := media != nil && media.callID == event.CallID
+		if mediaReady && snapshot.Direction == call.Outbound {
+			remote, err := sip.ParseRemoteSDP(event.RemoteSDP)
+			mediaReady = err == nil && remote.Codec == media.codec.Name &&
+				c.media.SetRemote(event.CallID,
+					&net.UDPAddr{IP: net.ParseIP(remote.IP), Port: int(remote.Port)},
+					&net.UDPAddr{IP: net.ParseIP(remote.RTCPIP), Port: int(remote.RTCPPort)}) == nil
+		}
+		// Inbound RTP/RTCP and codec were validated and bound from the INVITE in
+		// applyIncomingCall. A UAS 200 response does not contain a new remote SDP,
+		// so parsing event.RemoteSDP here would incorrectly terminalize every
+		// answered inbound call as media_failed.
+		if !mediaReady {
 			machine.RemoteHangup(call.EndMediaFailed, c.now())
 			eventType = "call.ended"
 			closeMedia = true

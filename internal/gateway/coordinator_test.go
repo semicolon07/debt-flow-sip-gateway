@@ -448,6 +448,7 @@ type fakeMedia struct {
 	remoteRTCP *net.UDPAddr
 	writes     []*rtp.Packet
 	rtcp       []rtcp.Packet
+	closed     []string
 }
 
 func (f *fakeMedia) WriteRTCP(_ string, packets []rtcp.Packet) error {
@@ -473,7 +474,12 @@ func (f *fakeMedia) Write(_ string, packet *rtp.Packet) error {
 	f.mu.Unlock()
 	return nil
 }
-func (*fakeMedia) CloseCall(string) error { return nil }
+func (f *fakeMedia) CloseCall(callID string) error {
+	f.mu.Lock()
+	f.closed = append(f.closed, callID)
+	f.mu.Unlock()
+	return nil
+}
 
 type fakeSIP struct {
 	mu          sync.Mutex
@@ -482,6 +488,7 @@ type fakeSIP struct {
 	starts      int
 	answers     int
 	hangups     int
+	rejects     []int
 	closed      []string
 	localSDP    []byte
 }
@@ -506,7 +513,12 @@ func (f *fakeSIP) Answer(_ context.Context, _, _ string, localSDP []byte) error 
 	f.mu.Unlock()
 	return nil
 }
-func (*fakeSIP) Reject(context.Context, string, string, int) error { return nil }
+func (f *fakeSIP) Reject(_ context.Context, _, _ string, status int) error {
+	f.mu.Lock()
+	f.rejects = append(f.rejects, status)
+	f.mu.Unlock()
+	return nil
+}
 func (f *fakeSIP) Hangup(context.Context, string, string) error {
 	f.mu.Lock()
 	f.hangups++
@@ -751,6 +763,199 @@ func TestCoordinatorAcceptsInboundOnlyForHealthyPortal(t *testing.T) {
 	defer sipRuntime.mu.Unlock()
 	if sipRuntime.answers != 1 || len(sipRuntime.localSDP) == 0 {
 		t.Fatalf("expected one SDP answer, got answers=%d sdp=%q", sipRuntime.answers, sipRuntime.localSDP)
+	}
+}
+
+func TestCoordinatorAnswersInboundWithExistingInviteMediaAndBridgesAudio(t *testing.T) {
+	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	sipRuntime := newFakeSIP()
+	coordinator, rtc, media, database := newTestCoordinatorWithStore(t, api, sipRuntime)
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventRegistered, SessionID: claims.SessionID})
+
+	callID := uuid.NewString()
+	remoteSDP := []byte("v=0\r\nc=IN IP4 10.0.0.20\r\nm=audio 20500 RTP/AVP 0 101\r\na=rtcp:30500 IN IP4 10.0.0.21\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n")
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventIncoming, SessionID: claims.SessionID, CallID: callID,
+		RemoteSDP: remoteSDP, RemoteParty: "0812345678",
+	})
+	answerPayload, _ := json.Marshal(protocol.CallCommand{CommandID: uuid.NewString(), CallID: callID})
+	if _, err := coordinator.Handle(context.Background(), claims,
+		protocol.Envelope{Type: "call.answer", Payload: answerPayload}); err != nil {
+		t.Fatal(err)
+	}
+
+	// SIPGoRuntime.Answer emits connected without RemoteSDP because the remote
+	// offer was already supplied by the inbound INVITE.
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventConnected, SessionID: claims.SessionID, CallID: callID, StatusCode: 200,
+	})
+
+	session, err := coordinator.session(claims.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	snapshot := session.activeCall.Snapshot()
+	activeMedia := session.activeMedia
+	session.mu.Unlock()
+	if snapshot.State != call.StateConnected || snapshot.Direction != call.Inbound ||
+		snapshot.ConnectedAt == nil || activeMedia == nil || activeMedia.callID != callID {
+		t.Fatalf("unexpected connected inbound call: snapshot=%+v media=%+v", snapshot, activeMedia)
+	}
+
+	coordinator.OnBrowserRTP(claims.SessionID, &rtp.Packet{
+		Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 11}, Payload: []byte{1, 2},
+	})
+	coordinator.OnPBXRTP(callID, &rtp.Packet{
+		Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 22}, Payload: []byte{3, 4},
+	})
+	media.mu.Lock()
+	if media.remote == nil || media.remote.Port != 20500 || media.remoteRTCP == nil ||
+		media.remoteRTCP.Port != 30500 || len(media.writes) != 1 || len(media.closed) != 0 {
+		media.mu.Unlock()
+		t.Fatalf("unexpected inbound PBX media state: remote=%v rtcp=%v writes=%d closed=%v",
+			media.remote, media.remoteRTCP, len(media.writes), media.closed)
+	}
+	media.mu.Unlock()
+	rtc.mu.Lock()
+	if len(rtc.writes) != 1 || string(rtc.writes[0].Payload) != string([]byte{3, 4}) {
+		rtc.mu.Unlock()
+		t.Fatalf("unexpected inbound browser RTP: %+v", rtc.writes)
+	}
+	rtc.mu.Unlock()
+
+	events, err := database.PendingEvents(context.Background(), claims.SessionID, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	states := make([]call.State, 0, 4)
+	for _, event := range events {
+		if event.Type != "call.created" && event.Type != "call.state_changed" {
+			continue
+		}
+		var eventSnapshot call.Snapshot
+		if err := json.Unmarshal(event.Payload, &eventSnapshot); err != nil {
+			t.Fatal(err)
+		}
+		states = append(states, eventSnapshot.State)
+	}
+	want := []call.State{call.StateCreated, call.StateIncoming, call.StateAnswering, call.StateConnected}
+	if fmt.Sprint(states) != fmt.Sprint(want) {
+		t.Fatalf("inbound lifecycle=%v, want %v", states, want)
+	}
+
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventEnded, SessionID: claims.SessionID, CallID: callID, Reason: "remote_hangup",
+	})
+	session.mu.Lock()
+	snapshot = session.activeCall.Snapshot()
+	session.mu.Unlock()
+	if snapshot.State != call.StateEnded || snapshot.EndReason != call.EndRemoteHangup {
+		t.Fatalf("unexpected inbound terminal state: %+v", snapshot)
+	}
+	media.mu.Lock()
+	defer media.mu.Unlock()
+	if len(media.closed) != 1 || media.closed[0] != callID {
+		t.Fatalf("inbound media close=%v, want [%s]", media.closed, callID)
+	}
+}
+
+func TestCoordinatorRejectsInboundAndClosesMedia(t *testing.T) {
+	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	sipRuntime := newFakeSIP()
+	coordinator, _, media := newTestCoordinatorWithMedia(t, api, sipRuntime)
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventRegistered, SessionID: claims.SessionID})
+	callID := uuid.NewString()
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventIncoming, SessionID: claims.SessionID, CallID: callID,
+		RemoteSDP:   []byte("v=0\r\nc=IN IP4 10.0.0.20\r\nm=audio 20500 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n"),
+		RemoteParty: "0812345678",
+	})
+	rejectPayload, _ := json.Marshal(protocol.CallCommand{CommandID: uuid.NewString(), CallID: callID})
+	if _, err := coordinator.Handle(context.Background(), claims,
+		protocol.Envelope{Type: "call.reject", Payload: rejectPayload}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := coordinator.session(claims.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	snapshot := session.activeCall.Snapshot()
+	session.mu.Unlock()
+	if snapshot.State != call.StateEnded || snapshot.EndReason != call.EndRejected {
+		t.Fatalf("unexpected rejected inbound call: %+v", snapshot)
+	}
+	sipRuntime.mu.Lock()
+	if len(sipRuntime.rejects) != 1 || sipRuntime.rejects[0] != 486 {
+		sipRuntime.mu.Unlock()
+		t.Fatalf("SIP reject statuses=%v, want [486]", sipRuntime.rejects)
+	}
+	sipRuntime.mu.Unlock()
+	media.mu.Lock()
+	defer media.mu.Unlock()
+	if len(media.closed) != 1 || media.closed[0] != callID {
+		t.Fatalf("rejected inbound media close=%v, want [%s]", media.closed, callID)
+	}
+}
+
+func TestCoordinatorHandlesRemoteCancelWhileInboundIsRinging(t *testing.T) {
+	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	coordinator, _, media := newTestCoordinatorWithMedia(t, api, newFakeSIP())
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventRegistered, SessionID: claims.SessionID})
+	callID := uuid.NewString()
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventIncoming, SessionID: claims.SessionID, CallID: callID,
+		RemoteSDP:   []byte("v=0\r\nc=IN IP4 10.0.0.20\r\nm=audio 20500 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n"),
+		RemoteParty: "0812345678",
+	})
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventEnded, SessionID: claims.SessionID, CallID: callID, Reason: "cancelled",
+	})
+	session, err := coordinator.session(claims.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	snapshot := session.activeCall.Snapshot()
+	session.mu.Unlock()
+	if snapshot.State != call.StateEnded || snapshot.EndReason != call.EndCancelled {
+		t.Fatalf("unexpected cancelled inbound call: %+v", snapshot)
+	}
+	media.mu.Lock()
+	defer media.mu.Unlock()
+	if len(media.closed) != 1 || media.closed[0] != callID {
+		t.Fatalf("cancelled inbound media close=%v, want [%s]", media.closed, callID)
 	}
 }
 

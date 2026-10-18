@@ -3,12 +3,13 @@
 SIP Gateway สำหรับให้ Debt Flow Portal โทรผ่าน browser ด้วย WebRTC โดยไม่ต้องติดตั้ง
 Debt Flow SIP Windows Agent ที่เครื่องผู้ใช้
 
-สถานะปัจจุบัน: **P1 implementation baseline complete; external interoperability/pilot gates pending**
+สถานะปัจจุบัน: **P1 engineering scope closed (18/10/2026); production release gates pending**
 
 เอกสารหลัก:
 
 - [P1 implementation plan](docs/2026-10-17-p1-implementation-plan.md)
 - [P1 implementation result](docs/2026-10-17-p1-implementation-result.md)
+- [P2 candidate roadmap](docs/2026-10-18-p2-roadmap.md)
 - [Windows deployment](docs/windows-deployment.md)
 - [Incident runbook](docs/incident-runbook.md)
 - [Pilot acceptance matrix](docs/pilot-acceptance-matrix.md)
@@ -61,7 +62,7 @@ PeerConnection/RTP buffers และ unacknowledged outbox ใช้ memory ห�
 - browser-relayed capability contracts และ Collection `runtimeMode`
 - Portal `SipGatewayAdapter` สำหรับ WSS/WebRTC โดย legacy `desktop_agent` ยังเป็นค่าเริ่มต้น
 
-## Gate ที่ยังต้องผ่านก่อน pilot
+## Production release gate ที่ยังต้องผ่าน
 
 - SIPp และ Issabel/Asterisk จริงทั้ง UDP/TCP, PCMU/PCMA, late-200/CANCEL และ retransmission matrix
 - Windows Server 2022 + IIS + CNG/DPAPI clean-VM validation

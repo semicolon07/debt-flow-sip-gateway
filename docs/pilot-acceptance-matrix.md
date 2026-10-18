@@ -3,6 +3,9 @@
 เอกสารนี้เป็น evidence checklist ไม่ใช่คำรับรองว่า gate ผ่าน ผู้ทดสอบต้องกรอก environment, commit,
 artifact path และผู้อนุมัติ ห้ามเปลี่ยน `sip.spikeApproved` เป็น `true` หากมีแถว `PENDING/FAIL`
 
+P1 engineering scope ปิดรับมอบเมื่อ 18/10/2026 แล้ว แต่ checklist นี้ยังเป็น production release track
+ที่ต้องผ่านก่อน rollout จริง และไม่ถือว่าเป็น feature scope ของ P2
+
 ## Run identity
 
 | Field | Value |

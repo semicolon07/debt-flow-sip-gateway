@@ -2,7 +2,11 @@
 
 วันที่: 17/10/2026
 
-สถานะ: **Implementation baseline complete / External gates pending**
+สถานะ: **CLOSED — engineering scope accepted 18/10/2026 / Production release gates pending**
+
+การปิด P1 หมายถึงขอบเขตการพัฒนาและ automated verification ที่ระบุในเอกสารนี้ได้รับการส่งมอบแล้ว
+ไม่ใช่การรับรองผล pilot หรือ production capacity บน Windows Server/PBX จริง รายการ external evidence
+ที่ยังต้องเก็บให้ติดตามต่อใน `pilot-acceptance-matrix.md` และห้ามข้ามก่อนเปิดใช้กับผู้ใช้จริง
 
 Repository: `sip-gateway`
 

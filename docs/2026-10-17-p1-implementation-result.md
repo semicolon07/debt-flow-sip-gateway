@@ -2,7 +2,12 @@
 
 วันที่: 17/10/2026
 
-สถานะ: **local implementation baseline ผ่าน / ยังไม่อนุมัติ pilot**
+สถานะ: **P1 engineering scope CLOSED 18/10/2026 / ยังไม่อนุมัติ production rollout**
+
+การรับมอบครั้งนี้ปิดงาน implementation, contract integration และ automated verification ของ P1
+ส่วน interoperability, clean-VM, signed release, load/soak และ operational evidence เป็น production release
+gate ที่ยังต้องดำเนินการตาม `pilot-acceptance-matrix.md` การปิด P1 ไม่ได้เปลี่ยน gate ที่ยังเป็น `PENDING`
+ให้เป็น `PASS` และไม่อนุญาตให้เปิด `sip.spikeApproved` จนกว่าจะมีหลักฐานครบ
 
 ## Architecture result
 
@@ -20,6 +25,9 @@
   authenticated user-session binding, replay store และ cross-user session-resume protection
 - SIPGo UDP/TCP client แยกตาม transport/local port, REGISTER digest, inbound/outbound dialog lifecycle,
   late-200 handling และ explicit RTP/RTCP endpoint parsing
+- inbound Answer ใช้ remote RTP/RTCP endpoint ที่ validate จาก INVITE โดยไม่ parse SDP ว่างซ้ำจาก UAS
+  connected callback; regression ครอบคลุม incoming → answering → connected, เสียงสองทาง, remote BYE,
+  Reject 486 และ remote CANCEL
 - Pion WebRTC PCMU/PCMA passthrough, RFC 4733, ICE UDP mux และ embedded TURN UDP/TCP
 - TURN one-allocation-per-session/global quota, atomic slot reservation, bandwidth quota และ bounded metrics
 - SQLite WAL command journal/outbox/ACK/replay/restart terminalization พร้อม size/retention guard
@@ -91,6 +99,8 @@
 - Web App Gateway adapter preserve `trying`, `incoming` และ `ending` แทนการแปลงเป็น `null`
 - Web App publish snapshot `audioState=ready` ซ้ำเมื่อ WebRTC connected แม้ Gateway snapshot จะมาถึงก่อน
   ปิด race ที่โทรศัพท์ขึ้นพร้อมใช้งานแต่ปุ่มตั้งค่าเสียงยังถูก disable
+- Gateway audio volume preferences ถูก validate และเก็บใน browser safe storage แยกจาก mute state
+  ทำให้ระดับลำโพง/ไมโครโฟนคงเดิมหลัง refresh ขณะที่ mute ยังเริ่มแบบปลอดภัยเป็น unmuted
 - Web API ยอมรับ legacy forward-only `created → ringing/connected` เพื่อ drain outbox จาก Gateway รุ่นก่อนหน้า
   โดยไม่ต้องลบ SQLite; Gateway รุ่นใหม่ไม่ใช้ทางลัดนี้แล้ว
 
@@ -128,7 +138,7 @@ legacy API ingest และ Gateway-to-existing-durable-contract normalization
   live Windows sampler เก็บ normalized CPU, working/private memory, Go heap, sockets และ Gateway high-water marks
 - Web API Infrastructure 2,573 tests ผ่าน (90 tests skip ตาม environment) รวม legacy Gateway ingest regression
 - Web API `dotnet format --verify-no-changes --no-restore` ผ่าน
-- Web App: 570 test files / 4,051 tests, strict app/spec, worker types, production build/graph/budget ผ่าน;
+- Web App: 570 test files / 4,057 tests, strict app/spec และ production build ผ่าน;
   microphone/speaker test paths ปิด media tracks และ `AudioContext` ผ่าน `finally` แม้ browser API ล้มกลางทาง
 - diagnostics allowlist report ผ่าน automated secret-leak test และ manual pattern scan
 - local browser POC ที่ `test/poc/sip-gateway-poc.html` ครอบคลุม API-assisted/manual capability,
