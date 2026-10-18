@@ -2,9 +2,10 @@
 
 วันที่: 17/10/2026
 
-สถานะ: **Corrective local gates passed 18/10/2026 / ยังไม่อนุมัติ production rollout**
+สถานะ: **P1 functional scope accepted 18/10/2026 / production rollout qualification ยังเปิดอยู่**
 
-การรับมอบครั้งนี้ปิดงาน implementation, contract integration และ automated verification ของ P1
+การรับมอบครั้งนี้ปิดงาน implementation, contract integration, automated verification และ functional
+acceptance ของ P1 โดยผู้ใช้ยืนยันผลบนระบบที่ deploy แล้วเมื่อ 18/10/2026
 ส่วน interoperability, clean-VM, signed release, load/soak และ operational evidence เป็น production release
 gate ที่ยังต้องดำเนินการตาม `pilot-acceptance-matrix.md` การปิด P1 ไม่ได้เปลี่ยน gate ที่ยังเป็น `PENDING`
 ให้เป็น `PASS` และไม่อนุญาตให้เปิด `sip.spikeApproved` จนกว่าจะมีหลักฐานครบ
@@ -167,7 +168,7 @@ Gateway-to-existing-durable-contract normalization
 - Web API Application 2,089, Infrastructure 2,574 และ API 873 tests ผ่าน; Infrastructure 90 และ API 3
   tests ที่ต้องใช้ environment จริงถูก skip ตามเงื่อนไข รวม legacy Gateway ingest regression
 - Web API `dotnet format --verify-no-changes --no-restore` ผ่าน
-- Web App: 571 test files / 4,096 tests, strict app/spec, production build และ performance-budget check ผ่าน;
+- Web App: 571 test files / 4,098 tests, strict app/spec, production build และ performance-budget check ผ่าน;
   microphone/speaker test paths ปิด media tracks, disconnect Web Audio graph และปิด `AudioContext`
   แม้ browser API ล้มกลางทาง
 - diagnostics allowlist report ผ่าน automated secret-leak test และ manual pattern scan
@@ -194,7 +195,7 @@ Frontend `npm run verify` ยัง exit 1 จาก baseline นอก scope �
 |---|---|---|
 | dependency/ADR/gated spikes | pinned Go modules, ADR, race/fuzz/SIPp contract tests | target Windows/PBX/browser spike |
 | Windows service + DPAPI | cross-build, installer/provision/preflight scripts และ deployment contract tests | clean Windows Server 2022 run |
-| browser inbound/outbound | Gateway adapter, shared event relay และ 4,096 Web App tests | Edge/Chrome + real audio end-to-end |
+| browser inbound/outbound | Gateway adapter, shared event relay และ 4,098 Web App tests | Edge/Chrome + real audio end-to-end |
 | IIS WSS/direct ICE/TURN | multi-Origin allowlist/explicit wildcard WSS, ICE/TURN implementation/config | IIS/private-network route evidence |
 | SIP/media/DTMF | SIPGo/Pion/RTP tests และ 13 SIPp scenarios | Issabel/Asterisk UDP/TCP matrix |
 | security/recovery | capability/replay/restart/outbox/diagnostic tests; Gateway/Web App scans ผ่าน | Web API baseline dependency remediation/approval และ revoke/outage/key-rotation drill on target |
@@ -202,6 +203,15 @@ Frontend `npm run verify` ยัง exit 1 จาก baseline นอก scope �
 | secret-free operations | allowlisted diagnostics + automated secret scan | reviewer-approved pilot bundle |
 | signed release package | Authenticode-ready build, checksum/SBOM/preflight verification | production certificate + approvals |
 | explicit rollback | `desktop_agent` default, explicit Collection runtime switch | operator rollback drill |
+
+## Final functional acceptance (18/10/2026)
+
+- ผู้ใช้ยืนยันว่า corrective build ล่าสุดใช้งานได้บน environment จริงและอนุมัติให้ปิดงาน P1
+- refresh หลังจบสายไม่ทำให้ terminal Call Bar กลับมา และ phone runtime กลับมาพร้อมใช้งานตาม snapshot
+  authoritative ของ Gateway
+- durable replay รักษา session/call correlation เดิมและไม่ทำให้ UI ปัจจุบันย้อนกลับไปใช้สายจาก session เก่า
+- การยืนยันนี้ปิด known functional defects ที่รายงานในรอบ P1 แต่ไม่ใช่หลักฐานแทน capacity, soak,
+  signed-release, security และ full interoperability matrix
 
 ## External gates before pilot
 

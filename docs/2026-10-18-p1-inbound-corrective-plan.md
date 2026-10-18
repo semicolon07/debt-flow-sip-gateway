@@ -2,7 +2,7 @@
 
 วันที่: 18/10/2026
 
-สถานะ: **Implemented and verified locally**
+สถานะ: **Implemented, automated verification ผ่าน และผู้ใช้รับรอง functional flow เมื่อ 18/10/2026**
 
 RequestFeedback: false — ผู้ใช้สั่งให้แก้ inbound ให้รองรับเต็มรูปแบบแล้ว
 
@@ -70,5 +70,6 @@ RequestFeedback: false — ผู้ใช้สั่งให้แก้ inbo
 - Web App targeted inbound/phone-runtime tests, strict TypeScript และ production build
 - `git diff --check`
 
-ยังต้องใช้ SIPp + Issabel/Asterisk จริงทั้ง UDP/TCP และ PCMU/PCMA เป็น production release gate
+ผู้ใช้ยืนยัน corrective flow บน environment ที่ deploy แล้วและอนุมัติให้ปิด P1 เมื่อ 18/10/2026
+ยังต้องใช้ SIPp + Issabel/Asterisk จริงทั้ง UDP/TCP และ PCMU/PCMA เป็น production release qualification
 เพราะ automated tests ไม่สามารถรับรอง PBX/network interoperability แทนสภาพแวดล้อมจริงได้

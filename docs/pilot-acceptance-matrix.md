@@ -6,6 +6,10 @@ artifact path และผู้อนุมัติ ห้ามเปลี�
 P1 engineering scope ปิดรับมอบเมื่อ 18/10/2026 แล้ว แต่ checklist นี้ยังเป็น production release track
 ที่ต้องผ่านก่อน rollout จริง และไม่ถือว่าเป็น feature scope ของ P2
 
+ผู้ใช้ยืนยัน functional flow ของ corrective build บนระบบที่ deploy แล้วเมื่อ 18/10/2026 รวมการกลับมาใช้งาน
+หลัง refresh โดยไม่มี terminal Call Bar ค้าง การยืนยันนี้ปิด P1 functional acceptance แต่ไม่เปลี่ยนสถานะ
+ของ non-waivable gates ด้าน transport/browser matrix, capacity, soak, security และ signed release ด้านล่าง
+
 ## Run identity
 
 | Field | Value |

@@ -2,9 +2,10 @@
 
 วันที่: 17/10/2026
 
-สถานะ: **CLOSED — engineering scope accepted 18/10/2026 / Production release gates pending**
+สถานะ: **CLOSED — functional scope accepted 18/10/2026 / Production release qualification pending**
 
-การปิด P1 หมายถึงขอบเขตการพัฒนาและ automated verification ที่ระบุในเอกสารนี้ได้รับการส่งมอบแล้ว
+การปิด P1 หมายถึงขอบเขตการพัฒนา, automated verification และ reported functional flow ที่ระบุในเอกสารนี้
+ได้รับการส่งมอบและผู้ใช้ยืนยัน corrective build บนระบบที่ deploy แล้วเมื่อ 18/10/2026
 ไม่ใช่การรับรองผล pilot หรือ production capacity บน Windows Server/PBX จริง รายการ external evidence
 ที่ยังต้องเก็บให้ติดตามต่อใน `pilot-acceptance-matrix.md` และห้ามข้ามก่อนเปิดใช้กับผู้ใช้จริง
 

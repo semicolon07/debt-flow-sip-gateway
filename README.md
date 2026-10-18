@@ -3,7 +3,7 @@
 SIP Gateway สำหรับให้ Debt Flow Portal โทรผ่าน browser ด้วย WebRTC โดยไม่ต้องติดตั้ง
 Debt Flow SIP Windows Agent ที่เครื่องผู้ใช้
 
-สถานะปัจจุบัน: **P1 engineering scope closed (18/10/2026); production release gates pending**
+สถานะปัจจุบัน: **P1 functional scope accepted and closed (18/10/2026); production release qualification pending**
 
 เอกสารหลัก:
 
@@ -28,6 +28,10 @@ P1 baseline ที่ยืนยันแล้ว:
 
 P1 ยังเก็บ `sip-windows-agent` เดิมไว้เป็น rollback path ผ่านการตั้งค่า `runtimeMode`
 ระดับ Collection และไม่มี automatic fallback ระหว่าง runtime
+
+ผู้ใช้ยืนยัน corrective build บนระบบที่ deploy แล้วเมื่อ 18/10/2026 รวม recovery หลังจบสายและ refresh
+โดยไม่มี terminal Call Bar ค้าง การยืนยันนี้ปิด P1 functional acceptance แต่ไม่แทน load/soak,
+signed-release, security และ full interoperability evidence ใน pilot matrix
 
 ## การเชื่อมต่อ
 
