@@ -54,6 +54,16 @@ Gateway รุ่นที่แก้แล้วต้องไม่แสด
   realm และ firewall โดยห้ามพิมพ์ password หรือ Authorization header ลง ticket
 - ตรวจว่า SIP username ไม่มี session owner ซ้ำ และ browser session ยัง renew lease ตามปกติ
 - ทดสอบ REGISTER หนึ่ง account หลังแก้ และรอให้ alert resolve ก่อนเปิด Collection เพิ่ม
+- รุ่นที่มี registration generation guard จะ log `SIP registration failed` หรือ
+  `SIP registration refresh failed` พร้อม `sessionId`, `sipStatusCode`, `failureKind` และ
+  `consecutiveFailures`; ใช้ `sessionId` จับคู่หน้า diagnostics โดยไม่ต้องเปิด raw SIP log
+- ถ้า extension หนึ่งได้สม่ำเสมอแต่อีก extension ได้เป็นบางครั้ง ให้เทียบ status ของ REGISTER และ INVITE
+  แยกตาม `sessionId` ก่อนสรุปว่าเป็น Gateway: `401/407` challenge เป็น flow ปกติ แต่ final `403` คือ PBX
+  ปฏิเสธ credential/policy/account binding; ตรวจ duplicate registration, endpoint identify/contact และ ACL
+  ของ extension นั้นบน PBX
+- Gateway ใช้ listener IP/port กลางร่วมกัน แต่ Contact user และ SIP Call-ID แยกต่อ session; PBX ต้องแยก
+  endpoint ด้วย authentication username/Address-of-Record ไม่ควร identify หลาย extension ด้วย source IP/port
+  เพียงอย่างเดียว
 
 ## Capacity pressure
 

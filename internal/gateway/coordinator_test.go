@@ -504,6 +504,7 @@ type fakeSIP struct {
 	rejects           []int
 	closed            []string
 	localSDP          []byte
+	startErr          error
 	answerEntered     chan struct{}
 	answerRelease     chan struct{}
 	hangupEntered     chan struct{}
@@ -534,11 +535,11 @@ func (f *fakeSIP) Unregister(context.Context, string) error {
 }
 func (f *fakeSIP) StartCall(_ context.Context, _, _, destination string, localSDP []byte) error {
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.destination = destination
 	f.starts++
 	f.localSDP = append([]byte(nil), localSDP...)
-	f.mu.Unlock()
-	return nil
+	return f.startErr
 }
 func (f *fakeSIP) Answer(_ context.Context, _, _ string, localSDP []byte) error {
 	f.mu.Lock()
@@ -1884,5 +1885,43 @@ func TestCoordinatorRequiresRegistrationBeforeStartingCall(t *testing.T) {
 	defer sipRuntime.mu.Unlock()
 	if sipRuntime.starts != 0 {
 		t.Fatalf("unregistered session started %d SIP calls", sipRuntime.starts)
+	}
+}
+
+func TestCoordinatorReconcilesStaleRegisteredStateWhenRuntimeRejectsCall(t *testing.T) {
+	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	sipRuntime := newFakeSIP()
+	sipRuntime.startErr = sip.ErrRegistrationNotReady
+	coordinator := newTestCoordinator(t, api, sipRuntime)
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventRegistered, SessionID: claims.SessionID})
+	payload, _ := json.Marshal(protocol.StartCall{
+		CommandID: uuid.NewString(), CallID: uuid.NewString(), CallContextID: "context-1",
+		GatewayCapability: "call-capability",
+	})
+	_, err = coordinator.Handle(context.Background(), claims,
+		protocol.Envelope{Type: "call.start", Payload: payload})
+	var coded interface{ Code() string }
+	if !errors.As(err, &coded) || coded.Code() != "registration_required" {
+		t.Fatalf("expected registration_required, got %v", err)
+	}
+	session, err := coordinator.session(claims.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	registration := session.registration
+	session.mu.Unlock()
+	if registration != string(sip.EventRegistrationFailed) {
+		t.Fatalf("registration=%q, want %q", registration, sip.EventRegistrationFailed)
 	}
 }

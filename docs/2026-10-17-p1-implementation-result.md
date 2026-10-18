@@ -152,6 +152,24 @@ Gateway-to-existing-durable-contract normalization
 - Web App Gateway adapter regression 77 tests และ Web API `PortalPhoneAgentStoreTests` 28 tests ผ่าน
   เพื่อยืนยันว่า terminal event/outcome ใหม่ยังเข้ากับ lifecycle contract เดิม
 
+## Registration/session generation corrective fix (2026-10-18)
+
+- ผูก REGISTER, refresh, unregister และ close กับ instance/generation ของ SIP session ที่เริ่ม operation
+  จริง ผลตอบกลับที่มาช้าจาก session เก่าจึงไม่สามารถเปลี่ยน registration state หรือลบ replacement session
+  หลัง browser reconnect/reconfigure ได้ ซึ่งเป็น invariant เดียวกับ registration generation ของ Desktop Agent
+- refresh REGISTER ที่ล้มครั้งแรกเปลี่ยน runtime และ coordinator เป็น `registration_failed` ทันที เดิม runtime
+  หยุดถือว่า registered แล้ว แต่ coordinator จะยังเห็น `registered` จน retry ล้มครั้งที่ 5 ทำให้รับคำสั่งโทร
+  ทั้งที่ SIP account ไม่พร้อม
+- `StartCall` ตรวจ authoritative registration ที่ SIP runtime ซ้ำก่อนส่ง INVITE; ถ้า coordinator มี state เก่า
+  จะตอบ `registration_required`, reconcile state และไม่ส่ง SIP packet จาก account ที่ unregister/stale
+- `CloseSession` ใช้ conditional removal จึงไม่ลบ session ใหม่ที่เข้ามาแทนระหว่าง unregister; callback จาก
+  register/unregister generation เก่าถูก discard และไม่ emit terminal registration event ของ session ใหม่
+- เพิ่ม sanitized registration diagnostics ที่มีเฉพาะ `sessionId`, transport, SIP status code, failure kind และ
+  consecutive failure count โดยไม่ log extension, password, digest header หรือ raw SIP
+- เพิ่ม real UDP regression สำหรับ first-refresh failure, late REGISTER response หลัง replacement,
+  close/reconfigure race และ call-before-register พร้อม race/stress 50 รอบ; multi-session outbound isolation,
+  terminal response และ immediate redial ยังผ่านครบ
+
 ## Local verification
 
 - `go test -race ./...` ผ่านทุก package รวม UDP/TCP inbound transaction lifecycle และพบ/ปิด race จาก
@@ -233,6 +251,9 @@ Frontend `npm run verify` ยัง exit 1 จาก baseline นอก scope �
 - durable replay รักษา session/call correlation เดิมและไม่ทำให้ UI ปัจจุบันย้อนกลับไปใช้สายจาก session เก่า
 - การยืนยันนี้ปิด known functional defects ที่รายงานในรอบ P1 แต่ไม่ใช่หลักฐานแทน capacity, soak,
   signed-release, security และ full interoperability matrix
+- ภายหลังพบ extension-specific intermittent registration/call authorization และแก้ด้วย
+  registration/session generation corrective fix ด้านบนแล้ว; build corrective ใหม่นี้ยังต้อง rerun
+  target PBX matrix โดยเฉพาะ extension `1129` เทียบ `3100` ก่อนถือเป็น pilot acceptance ล่าสุด
 
 ## External gates before pilot
 

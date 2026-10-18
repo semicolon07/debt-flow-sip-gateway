@@ -991,13 +991,23 @@ func (c *Coordinator) startCall(ctx context.Context, session *runtimeSession, en
 		return nil, commandError{"media_not_ready"}
 	}
 	if err := c.sip.StartCall(ctx, session.claims.SessionID, command.CallID, authorization.Destination, localSDP); err != nil {
-		c.logger.Error("start outbound SIP call failed", "callId", command.CallID, "error", err)
+		errorCode := "sip_adapter_unavailable"
+		if errors.Is(err, sip.ErrRegistrationNotReady) {
+			errorCode = "registration_required"
+			session.mu.Lock()
+			session.registration = string(sip.EventRegistrationFailed)
+			session.mu.Unlock()
+			c.logger.Warn("outbound call rejected because SIP registration is not ready",
+				"callId", command.CallID, "sessionId", session.claims.SessionID)
+		} else {
+			c.logger.Error("start outbound SIP call failed", "callId", command.CallID, "error", err)
+		}
 		c.closeCallMedia(session, command.CallID)
 		machine.RemoteHangup(call.EndSIPFailed, c.now())
 		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, machine.Snapshot(), c.now())
 		_ = c.emitCallEnded(ctx, session, machine.Snapshot())
-		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, "sip_adapter_unavailable", c.now())
-		return nil, commandError{"sip_adapter_unavailable"}
+		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, errorCode, c.now())
+		return nil, commandError{errorCode}
 	}
 	return c.finishCommand(ctx, command.CommandID, "call.start")
 }

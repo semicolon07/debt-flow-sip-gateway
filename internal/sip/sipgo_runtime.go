@@ -84,6 +84,14 @@ type sipgoCall struct {
 	terminateAfterAnswer bool
 }
 
+type sipRegisterResponseError struct {
+	status int
+}
+
+func (e *sipRegisterResponseError) Error() string {
+	return fmt.Sprintf("SIP REGISTER rejected with status %d", e.status)
+}
+
 const (
 	sipOperationTimeout   = 10 * time.Second
 	outboundAnswerTimeout = 60 * time.Second
@@ -91,6 +99,13 @@ const (
 )
 
 var errOutboundAnswerTimeout = errors.New("outbound answer timeout")
+
+var (
+	// ErrRegistrationNotReady lets the coordinator distinguish a stale
+	// registration view from an adapter or transport failure.
+	ErrRegistrationNotReady = errors.New("SIP registration is not ready")
+	errSIPSessionChanged    = errors.New("SIP session changed during operation")
+)
 
 func NewSIPGoRuntime(cfg SIPGoConfig) (*SIPGoRuntime, error) {
 	if cfg.ListenUDP == "" || cfg.ListenTCP == "" || net.ParseIP(cfg.AdvertisedIP) == nil {
@@ -240,14 +255,21 @@ func (r *SIPGoRuntime) Register(ctx context.Context, sessionID string) error {
 	}
 	r.emit(Event{Type: EventRegistering, SessionID: sessionID})
 	if err := r.registerOnce(ctx, session, 120); err != nil {
+		if _, current := r.setRegisteredIfCurrent(sessionID, session, false); !current {
+			return errSIPSessionChanged
+		}
+		r.logRegistrationFailure("SIP registration failed", sessionID, err, 1)
 		r.emit(Event{Type: EventRegistrationFailed, SessionID: sessionID, Reason: "register_failed"})
-		r.setRegistered(sessionID, false)
-		r.startRegistrationLoop(sessionID, time.Second, true)
+		r.startRegistrationLoop(sessionID, session, time.Second, true)
 		return err
 	}
-	r.setRegistered(sessionID, true)
+	if _, current := r.setRegisteredIfCurrent(sessionID, session, true); !current {
+		return errSIPSessionChanged
+	}
+	r.logger.Info("SIP registration succeeded", "sessionId", sessionID,
+		"transport", session.configuration.Transport)
 	r.emit(Event{Type: EventRegistered, SessionID: sessionID, StatusCode: 200})
-	r.startRegistrationLoop(sessionID, 90*time.Second, false)
+	r.startRegistrationLoop(sessionID, session, 90*time.Second, false)
 	return nil
 }
 
@@ -258,16 +280,26 @@ func (r *SIPGoRuntime) Unregister(ctx context.Context, sessionID string) error {
 	if err != nil {
 		return nil
 	}
+	return r.unregisterSession(ctx, sessionID, session)
+}
+
+func (r *SIPGoRuntime) unregisterSession(
+	ctx context.Context, sessionID string, session *sipgoSession,
+) error {
 	r.mu.Lock()
+	if r.sessions[sessionID] != session {
+		r.mu.Unlock()
+		return errSIPSessionChanged
+	}
 	if session.registerCancel != nil {
 		session.registerCancel()
 		session.registerCancel = nil
 	}
 	r.mu.Unlock()
-	err = r.registerOnce(ctx, session, 0)
-	r.mu.Lock()
-	session.registered = false
-	r.mu.Unlock()
+	err := r.registerOnce(ctx, session, 0)
+	if _, current := r.setRegisteredIfCurrent(sessionID, session, false); !current {
+		return errSIPSessionChanged
+	}
 	r.emit(Event{Type: EventUnregistered, SessionID: sessionID})
 	return err
 }
@@ -278,7 +310,7 @@ func (r *SIPGoRuntime) StartCall(ctx context.Context, sessionID, callID, destina
 	if len(localSDP) == 0 {
 		return errors.New("local SIP SDP is required")
 	}
-	session, err := r.session(sessionID)
+	session, err := r.registeredSession(sessionID)
 	if err != nil {
 		return err
 	}
@@ -296,6 +328,12 @@ func (r *SIPGoRuntime) StartCall(ctx context.Context, sessionID, callID, destina
 			Host:   session.configuration.Host,
 		},
 		Params: fromParams,
+	}
+	// Configure/Unregister may have replaced or invalidated the session while
+	// the request was being prepared. Never originate an INVITE from a stale or
+	// unregistered SIP account even when a coordinator has stale state.
+	if !r.isCurrentRegisteredSession(sessionID, session) {
+		return ErrRegistrationNotReady
 	}
 	callCtx, cancel := context.WithCancelCause(context.Background())
 	dialog, err := session.clientDialogs.Invite(ctx, recipient, localSDP,
@@ -509,6 +547,10 @@ func (*SIPGoRuntime) SendDTMF(context.Context, string, string, byte) error {
 }
 
 func (r *SIPGoRuntime) CloseSession(ctx context.Context, sessionID string) error {
+	session, err := r.session(sessionID)
+	if err != nil {
+		return nil
+	}
 	r.mu.RLock()
 	var calls []string
 	for callID, callValue := range r.calls {
@@ -520,9 +562,11 @@ func (r *SIPGoRuntime) CloseSession(ctx context.Context, sessionID string) error
 	for _, callID := range calls {
 		_ = r.Hangup(ctx, sessionID, callID)
 	}
-	_ = r.Unregister(ctx, sessionID)
+	_ = r.unregisterSession(ctx, sessionID, session)
 	r.mu.Lock()
-	delete(r.sessions, sessionID)
+	if r.sessions[sessionID] == session {
+		delete(r.sessions, sessionID)
+	}
 	r.mu.Unlock()
 	return nil
 }
@@ -1009,7 +1053,7 @@ func (r *SIPGoRuntime) registerOnce(ctx context.Context, session *sipgoSession, 
 		}
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("SIP REGISTER rejected with status %d", response.StatusCode)
+		return &sipRegisterResponseError{status: response.StatusCode}
 	}
 	return nil
 }
@@ -1073,10 +1117,11 @@ func setURITransport(uri *sipmessage.Uri, transport Transport) {
 	uri.UriParams.Add("transport", string(transport))
 }
 
-func (r *SIPGoRuntime) startRegistrationLoop(sessionID string, firstDelay time.Duration, retrying bool) {
+func (r *SIPGoRuntime) startRegistrationLoop(
+	sessionID string, session *sipgoSession, firstDelay time.Duration, retrying bool,
+) {
 	r.mu.Lock()
-	session := r.sessions[sessionID]
-	if session == nil {
+	if r.sessions[sessionID] != session {
 		r.mu.Unlock()
 		return
 	}
@@ -1086,11 +1131,12 @@ func (r *SIPGoRuntime) startRegistrationLoop(sessionID string, firstDelay time.D
 	refreshCtx, cancel := context.WithCancel(r.ctx)
 	session.registerCancel = cancel
 	r.mu.Unlock()
-	go r.refreshRegistration(refreshCtx, sessionID, firstDelay, retrying)
+	go r.refreshRegistration(refreshCtx, sessionID, session, firstDelay, retrying)
 }
 
 func (r *SIPGoRuntime) refreshRegistration(
-	ctx context.Context, sessionID string, delay time.Duration, retrying bool,
+	ctx context.Context, sessionID string, session *sipgoSession,
+	delay time.Duration, retrying bool,
 ) {
 	failures := 0
 	for {
@@ -1103,32 +1149,60 @@ func (r *SIPGoRuntime) refreshRegistration(
 			return
 		case <-timer.C:
 		}
-		session, err := r.session(sessionID)
-		if err != nil {
+		if !r.isCurrentSession(sessionID, session) {
 			return
 		}
 		if retrying {
 			r.emit(Event{Type: EventRegistrationRetrying, SessionID: sessionID})
 		}
 		refreshCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err = r.registerOnce(refreshCtx, session, 120)
+		err := r.registerOnce(refreshCtx, session, 120)
 		cancel()
 		if err != nil {
 			failures++
+			wasRetrying := retrying
 			retrying = true
-			r.setRegistered(sessionID, false)
-			if failures%5 == 0 {
+			if _, current := r.setRegisteredIfCurrent(sessionID, session, false); !current {
+				return
+			}
+			// The first failed refresh must be authoritative immediately. The
+			// coordinator must stop calls instead of believing the account is
+			// still registered until the fifth retry fails.
+			if !wasRetrying || failures%5 == 0 {
+				r.logRegistrationFailure("SIP registration refresh failed", sessionID, err, failures)
 				r.emit(Event{Type: EventRegistrationFailed, SessionID: sessionID, Reason: "refresh_failed"})
 			}
 			delay = registrationRetryDelay(failures)
 		} else {
+			wasRetrying := retrying
 			failures = 0
 			retrying = false
 			delay = 90 * time.Second
-			r.setRegistered(sessionID, true)
+			if _, current := r.setRegisteredIfCurrent(sessionID, session, true); !current {
+				return
+			}
+			if wasRetrying {
+				r.logger.Info("SIP registration restored", "sessionId", sessionID,
+					"transport", session.configuration.Transport)
+			}
 			r.emit(Event{Type: EventRegistered, SessionID: sessionID, StatusCode: 200})
 		}
 	}
+}
+
+func (r *SIPGoRuntime) logRegistrationFailure(
+	message, sessionID string, err error, failures int,
+) {
+	status := 0
+	failureKind := sipTransactionFailureKind(err)
+	var responseError *sipRegisterResponseError
+	if errors.As(err, &responseError) {
+		status = responseError.status
+		failureKind = "rejected"
+	}
+	r.logger.Warn(message, "sessionId", sessionID,
+		"sipStatusCode", status, "failureKind", failureKind,
+		"consecutiveFailures", failures)
 }
 
 func registrationRetryDelay(failures int) time.Duration {
@@ -1145,6 +1219,35 @@ func (r *SIPGoRuntime) setRegistered(sessionID string, registered bool) {
 		session.registered = registered
 	}
 	r.mu.Unlock()
+}
+
+// setRegisteredIfCurrent prevents a completed network operation from an old
+// registration generation from mutating a replacement session with the same ID.
+func (r *SIPGoRuntime) setRegisteredIfCurrent(
+	sessionID string, expected *sipgoSession, registered bool,
+) (previous bool, current bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	session := r.sessions[sessionID]
+	if session != expected {
+		return false, false
+	}
+	previous = session.registered
+	session.registered = registered
+	return previous, true
+}
+
+func (r *SIPGoRuntime) isCurrentSession(sessionID string, expected *sipgoSession) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.sessions[sessionID] == expected
+}
+
+func (r *SIPGoRuntime) isCurrentRegisteredSession(sessionID string, expected *sipgoSession) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	session := r.sessions[sessionID]
+	return session == expected && session.registered
 }
 
 func (r *SIPGoRuntime) serveUDP() {
@@ -1174,6 +1277,20 @@ func (r *SIPGoRuntime) session(sessionID string) (*sipgoSession, error) {
 	r.mu.RUnlock()
 	if session == nil {
 		return nil, errors.New("SIP session is not configured")
+	}
+	return session, nil
+}
+
+func (r *SIPGoRuntime) registeredSession(sessionID string) (*sipgoSession, error) {
+	r.mu.RLock()
+	session := r.sessions[sessionID]
+	registered := session != nil && session.registered
+	r.mu.RUnlock()
+	if session == nil {
+		return nil, errors.New("SIP session is not configured")
+	}
+	if !registered {
+		return nil, ErrRegistrationNotReady
 	}
 	return session, nil
 }

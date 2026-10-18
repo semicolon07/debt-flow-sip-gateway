@@ -596,6 +596,153 @@ func TestRegistrationRetryDelayIsExponentiallyBounded(t *testing.T) {
 	}
 }
 
+func TestStartCallRejectsUnregisteredSessionBeforeSendingInvite(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	runtime.setRegistered("session-1", false)
+
+	err := runtime.StartCall(
+		context.Background(), "session-1", "unregistered-call", "9001", []byte(testInboundSDP),
+	)
+	if !errors.Is(err, ErrRegistrationNotReady) {
+		t.Fatalf("StartCall error=%v, want %v", err, ErrRegistrationNotReady)
+	}
+	assertNoSIPPacket(t, peer, 100*time.Millisecond)
+}
+
+func TestStaleRegistrationGenerationCannotMutateReplacementSession(t *testing.T) {
+	runtime, _, _, _, peerPort := newInboundSIPTestRuntime(t)
+	oldSession, err := runtime.session("session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Configure(context.Background(), "session-1", Configuration{
+		Host: "127.0.0.1", Port: uint16(peerPort), Transport: TransportUDP,
+		Username: "3100", Password: "replacement-secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, current := runtime.setRegisteredIfCurrent("session-1", oldSession, true); current {
+		t.Fatal("stale registration generation unexpectedly mutated replacement session")
+	}
+	newSession, err := runtime.session("session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newSession == oldSession || newSession.registered {
+		t.Fatalf("replacement session=%p old=%p registered=%v", newSession, oldSession, newSession.registered)
+	}
+}
+
+func TestRegisterResponseFromReplacedSessionIsDiscarded(t *testing.T) {
+	runtime, peer, _, _, peerPort := newInboundSIPTestRuntime(t)
+	registerResult := make(chan error, 1)
+	go func() {
+		registerResult <- runtime.Register(context.Background(), "session-1")
+	}()
+	request, gateway := readSIPRequestFromContaining(t, peer, "REGISTER ")
+	if err := runtime.Configure(context.Background(), "session-1", Configuration{
+		Host: "127.0.0.1", Port: uint16(peerPort), Transport: TransportUDP,
+		Username: "3100", Password: "replacement-secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writeSIPResponse(t, peer, gateway, request, 200, "OK", "register-replaced")
+
+	select {
+	case err := <-registerResult:
+		if !errors.Is(err, errSIPSessionChanged) {
+			t.Fatalf("Register error=%v, want %v", err, errSIPSessionChanged)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Register did not finish")
+	}
+	if _, err := runtime.registeredSession("session-1"); !errors.Is(err, ErrRegistrationNotReady) {
+		t.Fatalf("replacement registration state error=%v", err)
+	}
+	assertNoRuntimeEvent(t, runtime, EventRegistered, 100*time.Millisecond)
+}
+
+func TestFirstRegistrationRefreshFailureIsAuthoritative(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	session, err := runtime.session("session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.startRegistrationLoop("session-1", session, 5*time.Millisecond, false)
+	request, gateway := readSIPRequestFromContaining(t, peer, "REGISTER ")
+	writeSIPResponse(t, peer, gateway, request, 500, "Server Error", "refresh-failed")
+
+	event := readRuntimeEvent(t, runtime, EventRegistrationFailed)
+	if event.SessionID != "session-1" || event.Reason != "refresh_failed" {
+		t.Fatalf("registration event=%+v", event)
+	}
+	if _, err := runtime.registeredSession("session-1"); !errors.Is(err, ErrRegistrationNotReady) {
+		t.Fatalf("registration state error=%v, want %v", err, ErrRegistrationNotReady)
+	}
+	err = runtime.StartCall(
+		context.Background(), "session-1", "call-after-refresh-failure", "9001", []byte(testInboundSDP),
+	)
+	if !errors.Is(err, ErrRegistrationNotReady) {
+		t.Fatalf("StartCall error=%v, want %v", err, ErrRegistrationNotReady)
+	}
+}
+
+func TestRegistrationRefreshFailureIsIsolatedAcrossSessions(t *testing.T) {
+	runtime, peer, _, _, peerPort := newInboundSIPTestRuntime(t)
+	if err := runtime.Configure(context.Background(), "session-2", Configuration{
+		Host: "127.0.0.1", Port: uint16(peerPort), Transport: TransportUDP,
+		Username: "3100", Password: "second-secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.setRegistered("session-2", true)
+	first, err := runtime.session("session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.startRegistrationLoop("session-1", first, 5*time.Millisecond, false)
+	request, gateway := readSIPRequestFromContaining(t, peer, "REGISTER ")
+	writeSIPResponse(t, peer, gateway, request, 500, "Server Error", "session-one-refresh-failed")
+	_ = readRuntimeEvent(t, runtime, EventRegistrationFailed)
+
+	if _, err := runtime.registeredSession("session-2"); err != nil {
+		t.Fatalf("session-1 refresh failure changed session-2 registration: %v", err)
+	}
+}
+
+func TestCloseSessionDoesNotDeleteConcurrentReplacement(t *testing.T) {
+	runtime, peer, _, _, peerPort := newInboundSIPTestRuntime(t)
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- runtime.CloseSession(context.Background(), "session-1")
+	}()
+	request, gateway := readSIPRequestFromContaining(t, peer, "REGISTER ")
+	if err := runtime.Configure(context.Background(), "session-1", Configuration{
+		Host: "127.0.0.1", Port: uint16(peerPort), Transport: TransportUDP,
+		Username: "3100", Password: "replacement-secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writeSIPResponse(t, peer, gateway, request, 200, "OK", "unregister-replaced")
+
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CloseSession did not finish")
+	}
+	session, err := runtime.session("session-1")
+	if err != nil {
+		t.Fatalf("replacement session was deleted: %v", err)
+	}
+	if session.configuration.Username != "3100" {
+		t.Fatalf("replacement username=%q", session.configuration.Username)
+	}
+}
+
 func TestInboundInviteCanBeAnsweredAfterInviteHandlerPublishesRinging(t *testing.T) {
 	udpAddress := reservePacketAddress(t)
 	tcpAddress := reserveTCPAddress(t)
@@ -1144,6 +1291,40 @@ func readRuntimeEvent(t *testing.T, runtime *SIPGoRuntime, eventType EventType) 
 		case <-deadline:
 			t.Fatalf("timed out waiting for runtime event %s", eventType)
 		}
+	}
+}
+
+func assertNoRuntimeEvent(
+	t *testing.T, runtime *SIPGoRuntime, eventType EventType, duration time.Duration,
+) {
+	t.Helper()
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	for {
+		select {
+		case event := <-runtime.Events():
+			if event.Type == eventType {
+				t.Fatalf("unexpected runtime event %+v", event)
+			}
+		case <-timer.C:
+			return
+		}
+	}
+}
+
+func assertNoSIPPacket(t *testing.T, peer net.PacketConn, duration time.Duration) {
+	t.Helper()
+	if err := peer.SetReadDeadline(time.Now().Add(duration)); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 4096)
+	count, _, err := peer.ReadFrom(buffer)
+	if err == nil {
+		t.Fatalf("unexpected SIP packet: %s", string(buffer[:count]))
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("read SIP packet: %v", err)
 	}
 }
 
