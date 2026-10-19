@@ -13,7 +13,7 @@ Gateway ส่งเสียงประกาศหรือ tone จาก PB
 - `100 Trying` ไม่เปิด media
 - `180/183/1xx` ที่ไม่มี SDP ใช้ browser synthetic ringback
 - `180/183/1xx` ที่มี SDP และ codec PCMU/PCMA ตรงกับสาย เตรียม early RTP/RTCP แต่ยังคง synthetic ringback จนตรวจพบสัญญาณเสียงจริง
-- Gateway ส่ง `call.early_media` หลังส่ง G.711 RTP ที่ผ่าน activity detection เข้า WebRTC สำเร็จเท่านั้น; SDP อย่างเดียว, payload ว่าง, DTMF RTP หรือ digital silence ไม่ทำให้ ringback เงียบ
+- Gateway ส่ง `call.early_media` หลังส่ง G.711 RTP ที่ผ่าน activity detection ต่อเนื่อง 5 packet เข้า WebRTC สำเร็จเท่านั้น; SDP อย่างเดียว, payload ว่าง, DTMF RTP, digital silence หรือ transient noise ไม่ทำให้ ringback เงียบ
 - provisional SDP ผิดรูปแบบ, ไม่มี audio target หรือ codec ไม่ตรง ถูก ignore โดยสายไม่ล้ม และ recovery ได้เมื่อ SDP ถัดไปถูกต้อง
 - provisional SDP ซ้ำอัปเดต RTP target ได้โดยไม่ส่ง `call.early_media` ซ้ำ
 - `200 OK` ที่มี SDP ใช้ final target; ถ้าไม่มี SDP จะ reuse target ที่ negotiate จาก early media
@@ -27,7 +27,7 @@ Gateway ส่งเสียงประกาศหรือ tone จาก PB
 
 - `go test ./...`: ผ่านทุก package
 - `go test -race ./...`: ผ่านทุก package โดยไม่พบ data race
-- Gateway early-media coordinator tests: ผ่าน รวม SDP ที่ยังไม่มี RTP, DTMF, PCMU digital silence, audible G.711, RTP receive-only ก่อน answer, duplicate SDP, malformed SDP recovery และ final response ไม่มี SDP
+- Gateway early-media coordinator tests: ผ่าน รวม SDP ที่ยังไม่มี RTP, DTMF, PCMU digital silence, sustained audible G.711, RTP receive-only ก่อน answer, duplicate SDP, malformed SDP recovery และ final response ไม่มี SDP
 - G.711 activity detector tests: ผ่านสำหรับ PCMU/PCMA silence, audible signal, truncated payload และ unsupported codec
 - SIP runtime tests: ผ่านสำหรับ `183 + SDP`, `180 + SDP` และ `183` ไม่มี SDP
 - Web App tests เฉพาะ adapter/tone: 53 tests ผ่าน

@@ -131,28 +131,32 @@ type runtimeSession struct {
 }
 
 type callMedia struct {
-	callID          string
-	codec           gatewaywebrtc.CodecInfo
-	localSDP        []byte
-	toSIP           *gatewaymedia.Translator
-	toBrowser       *gatewaymedia.Translator
-	sipAudioPayload uint8
-	sipDTMFPayload  uint8
-	dtmfSSRC        uint32
-	dtmfSequence    uint16
-	dtmfTimestamp   uint32
-	qualityMu       sync.Mutex
-	browserLoss     map[uint32]uint32
-	pbxLoss         map[uint32]uint32
-	toSIPMu         sync.Mutex
-	toBrowserMu     sync.Mutex
-	toSIPPacket     rtp.Packet
-	toBrowserPacket rtp.Packet
+	callID           string
+	codec            gatewaywebrtc.CodecInfo
+	localSDP         []byte
+	toSIP            *gatewaymedia.Translator
+	toBrowser        *gatewaymedia.Translator
+	sipAudioPayload  uint8
+	sipDTMFPayload   uint8
+	audibleRTPStreak uint8
+	dtmfSSRC         uint32
+	dtmfSequence     uint16
+	dtmfTimestamp    uint32
+	qualityMu        sync.Mutex
+	browserLoss      map[uint32]uint32
+	pbxLoss          map[uint32]uint32
+	toSIPMu          sync.Mutex
+	toBrowserMu      sync.Mutex
+	toSIPPacket      rtp.Packet
+	toBrowserPacket  rtp.Packet
 }
 
 type commandError struct{ code string }
 
-const liveEventQueueCapacity = 256
+const (
+	liveEventQueueCapacity           = 256
+	earlyMediaAudiblePacketThreshold = 5
+)
 
 func (e commandError) Error() string { return e.code }
 func (e commandError) Code() string  { return e.code }
@@ -667,8 +671,17 @@ func (c *Coordinator) OnPBXRTP(callID string, packet *rtp.Packet) {
 		return
 	}
 	c.observeRTPPacket("pbx_to_browser")
-	if packet.PayloadType != media.sipAudioPayload ||
-		!gatewaymedia.HasAudibleG711(media.codec.Name, packet.Payload) {
+	if packet.PayloadType != media.sipAudioPayload {
+		return
+	}
+	if !gatewaymedia.HasAudibleG711(media.codec.Name, packet.Payload) {
+		media.audibleRTPStreak = 0
+		return
+	}
+	if media.audibleRTPStreak < earlyMediaAudiblePacketThreshold {
+		media.audibleRTPStreak++
+	}
+	if media.audibleRTPStreak < earlyMediaAudiblePacketThreshold {
 		return
 	}
 	publishEarlyMedia := false
