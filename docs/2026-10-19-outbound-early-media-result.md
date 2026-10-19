@@ -23,12 +23,16 @@ Gateway ส่งเสียงประกาศหรือ tone จาก PB
 - `call.early_media` ไม่ถูก ACK/ingest และไม่เปลี่ยน contract ของ Web API
 - stale event ที่ไม่ตรงกับ durable `call.created` ถูก Web App ปฏิเสธ
 - final failure, timeout, cancel, late answer, duplicate terminal event และ remote hangup ยังคง cleanup ตาม authoritative lifecycle เดิม
+- RTP timeline ต่อเนื่องข้ามหลายสายบน WebRTC track เดิม และรองรับ media source เปลี่ยนระหว่าง early media/answer
+- RTCP ใช้ SSRC ที่ Pion negotiate จริง; RFC 4733 จาก PBX ไม่ถูก relabel เป็น G.711 แล้วส่งเป็นเสียงเสียให้ browser
 
 ## การตรวจสอบ
 
 - `go test ./...`: ผ่านทุก package
 - `go test -race ./...`: ผ่านทุก package โดยไม่พบ data race
-- Gateway early-media coordinator tests: ผ่าน รวม `180 + audible RTP` ที่ต้องคง local ringback, การเปลี่ยน `180 → 183`, SDP ที่ยังไม่มี RTP, DTMF, PCMU digital silence, sustained audible G.711, RTP receive-only ก่อน answer, duplicate SDP, malformed SDP recovery และ final response ไม่มี SDP
+- Gateway early-media coordinator tests: ผ่าน รวม `180 + audible RTP` ที่ต้องคง local ringback, การเปลี่ยน `180 → 183`, SDP ที่ยังไม่มี RTP, การ drop PBX DTMF จาก G.711-bound WebRTC track, PCMU digital silence, sustained audible G.711, RTP receive-only ก่อน answer, duplicate SDP, malformed SDP recovery และ final response ไม่มี SDP
+- RTP continuity soak unit test: 500 calls × 50 packets บน track เดิม พร้อม reorder และ wrap-around ผ่าน
+- WebRTC negotiation/RTCP mapping tests: ผ่านด้วย actual outbound SSRC
 - G.711 activity detector tests: ผ่านสำหรับ PCMU/PCMA silence, audible signal, truncated payload และ unsupported codec
 - SIP runtime tests: ผ่านสำหรับ `183 + SDP`, `180 + SDP` และ `183` ไม่มี SDP
 - Web App tests เฉพาะ adapter/tone: 53 tests ผ่าน

@@ -44,6 +44,10 @@ cache Prometheus counter handle, ขยาย shared ICE UDP socket buffer, ใ�
 แทนการ bind-scan จากพอร์ตแรกแบบ O(n²) ตอน burst 200 calls และเพิ่ม partial SQLite indexes สำหรับ pending
 outbox โดยยังคง `synchronous=FULL` และ durable event semantics เดิม
 
+รอบ media continuity 2026-10-19 เพิ่ม sequence/timestamp normalization และ SSRC source-switch guard
+โดย production reusable-buffer benchmark สำหรับ 200 interleaved streams ยังเป็น 0 B/op, 0 allocs/op และวัดได้
+37.23–44.78 ns/op บน Darwin/arm64, Apple M2 Pro ผลนี้ใช้ตรวจ allocation/performance regression เท่านั้น
+
 รอบ corrective audit เดียวกันแก้ cumulative ACK ให้ update เฉพาะแถวที่ยัง pending เดิม query จะย้อนแตะ
 แถวที่ ACK แล้วทั้งหมดทุกครั้ง ทำให้ latency/WAL โตแบบ O(n²) ตามจำนวน event สะสม ผล benchmark หลังแก้
 เร็วขึ้นจาก 3.70–4.18 ms/op เป็น 0.198–0.227 ms/op บนเครื่องเดียวกัน โดยยังใช้ `synchronous=FULL`

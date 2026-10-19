@@ -91,6 +91,48 @@ func TestOpenAtomicallyReplacesAnExistingPeer(t *testing.T) {
 	}
 }
 
+func TestAcceptOfferPublishesTheActualOutboundSSRC(t *testing.T) {
+	engine, err := New(Config{UDPMuxListen: "127.0.0.1:0", MaxSessions: 1}, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	if err := engine.Open("session-1", TURNCredential{}); err != nil {
+		t.Fatal(err)
+	}
+	browserMedia := &pion.MediaEngine{}
+	for _, codec := range supportedCodecs() {
+		if err := browserMedia.RegisterCodec(codec, pion.RTPCodecTypeAudio); err != nil {
+			t.Fatal(err)
+		}
+	}
+	browser, err := pion.NewAPI(pion.WithMediaEngine(browserMedia)).NewPeerConnection(pion.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer browser.Close()
+	if _, err := browser.AddTransceiverFromKind(pion.RTPCodecTypeAudio); err != nil {
+		t.Fatal(err)
+	}
+	offer, err := browser.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := browser.SetLocalDescription(offer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.AcceptOffer("session-1", offer.SDP, ""); err != nil {
+		t.Fatal(err)
+	}
+	codec, err := engine.Codec("session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if codec.OutboundSSRC == 0 {
+		t.Fatal("negotiated WebRTC outbound SSRC is missing")
+	}
+}
+
 func TestFailedPeerReplacementKeepsTheExistingPeer(t *testing.T) {
 	engine, err := New(Config{UDPMuxListen: "127.0.0.1:0", MaxSessions: 1}, nil, nil, nil, nil)
 	if err != nil {

@@ -661,6 +661,14 @@ func (c *Coordinator) OnPBXRTP(callID string, packet *rtp.Packet) {
 	if media == nil || media.callID != callID {
 		return
 	}
+	// TrackLocalStaticRTP is bound to the negotiated G.711 codec and Pion
+	// rewrites every outgoing packet to that audio payload type. Forwarding a
+	// PBX telephone-event packet on this track would therefore make the browser
+	// decode RFC 4733 bytes as audio (typically a click or corrupted frame).
+	// Browser-originated DTMF uses call.dtmf and is sent to SIP separately.
+	if packet.PayloadType != media.sipAudioPayload {
+		return
+	}
 	media.toBrowserMu.Lock()
 	defer media.toBrowserMu.Unlock()
 	if err := media.toBrowser.TranslateInto(&media.toBrowserPacket, packet); err != nil {
@@ -672,9 +680,6 @@ func (c *Coordinator) OnPBXRTP(callID string, packet *rtp.Packet) {
 		return
 	}
 	c.observeRTPPacket("pbx_to_browser")
-	if packet.PayloadType != media.sipAudioPayload {
-		return
-	}
 	// A 180 response asks the client to present local ringing. Continue
 	// forwarding its RTP for compatibility, but only 183/other progress media
 	// can replace browser-generated ringback.
@@ -724,12 +729,12 @@ func (c *Coordinator) OnBrowserRTCP(sessionID string, packets []rtcp.Packet) {
 	}
 	c.observeRTCPQuality(media, "pbx_to_browser", packets)
 	browserSource, sipTarget, browserReady := media.toSIP.SSRCMapping()
-	pbxSource, browserTarget, pbxReady := media.toBrowser.SSRCMapping()
+	pbxSource, _, pbxReady := media.toBrowser.SSRCMapping()
 	if !browserReady || !pbxReady {
 		return
 	}
 	rewritten, err := gatewaymedia.RewriteRTCP(
-		packets, browserSource, sipTarget, browserTarget, pbxSource,
+		packets, browserSource, sipTarget, media.codec.OutboundSSRC, pbxSource,
 	)
 	if err != nil {
 		c.observeRTPBridgeError("browser_to_pbx")
@@ -763,13 +768,13 @@ func (c *Coordinator) OnPBXRTCP(callID string, packets []rtcp.Packet) {
 		return
 	}
 	c.observeRTCPQuality(media, "browser_to_pbx", packets)
-	pbxSource, browserTarget, pbxReady := media.toBrowser.SSRCMapping()
+	pbxSource, _, pbxReady := media.toBrowser.SSRCMapping()
 	browserSource, sipTarget, browserReady := media.toSIP.SSRCMapping()
 	if !pbxReady || !browserReady {
 		return
 	}
 	rewritten, err := gatewaymedia.RewriteRTCP(
-		packets, pbxSource, browserTarget, sipTarget, browserSource,
+		packets, pbxSource, media.codec.OutboundSSRC, sipTarget, browserSource,
 	)
 	if err != nil {
 		c.observeRTPBridgeError("pbx_to_browser")

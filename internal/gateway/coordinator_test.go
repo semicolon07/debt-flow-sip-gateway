@@ -442,7 +442,9 @@ func (f *fakeRTC) Codec(string) (gatewaywebrtc.CodecInfo, error) {
 	if f.codec.Name != "" {
 		return f.codec, nil
 	}
-	return gatewaywebrtc.CodecInfo{Name: "PCMU", AudioPayloadType: 0, DTMFPayloadType: 101}, nil
+	return gatewaywebrtc.CodecInfo{
+		Name: "PCMU", AudioPayloadType: 0, DTMFPayloadType: 101, OutboundSSRC: 33,
+	}, nil
 }
 
 func (f *fakeRTC) State(string) (pion.PeerConnectionState, error) {
@@ -920,9 +922,9 @@ func TestCoordinatorBridgesOutboundEarlyMediaBeforeAnswer(t *testing.T) {
 	rtc.mu.Lock()
 	writeCount := len(rtc.writes)
 	rtc.mu.Unlock()
-	wantWriteCount := 2 + (2 * earlyMediaAudiblePacketThreshold)
+	wantWriteCount := 1 + (2 * earlyMediaAudiblePacketThreshold)
 	if writeCount != wantWriteCount {
-		t.Fatalf("early media WebRTC writes=%d, want %d (DTMF + silence + sustained audio)",
+		t.Fatalf("early media WebRTC writes=%d, want %d (DTMF dropped; silence + sustained audio)",
 			writeCount, wantWriteCount)
 	}
 	updatedSDP := []byte("v=0\r\nc=IN IP4 10.0.0.22\r\nm=audio 20600 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n")
@@ -1092,8 +1094,11 @@ func TestCoordinatorBridgesRTPAndSendsDTMF(t *testing.T) {
 
 	coordinator.OnBrowserRTP(claims.SessionID, &rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 11}, Payload: []byte{1, 2}})
 	coordinator.OnPBXRTP(callID, &rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 22}, Payload: []byte{3, 4}})
+	// RFC 4733 cannot be written through Pion's G.711-bound TrackLocalStaticRTP;
+	// it must not be relabelled and decoded by the browser as an audio frame.
+	coordinator.OnPBXRTP(callID, &rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: 101, SSRC: 22}, Payload: []byte{1, 0x80, 0, 160}})
 	coordinator.OnBrowserRTCP(claims.SessionID, []rtcp.Packet{&rtcp.ReceiverReport{
-		SSRC: 11, Reports: []rtcp.ReceptionReport{{SSRC: rtc.writes[0].SSRC, TotalLost: 2, Jitter: 80}},
+		SSRC: 11, Reports: []rtcp.ReceptionReport{{SSRC: 33, TotalLost: 2, Jitter: 80}},
 	}})
 	coordinator.OnPBXRTCP(callID, []rtcp.Packet{&rtcp.ReceiverReport{
 		SSRC: 22, Reports: []rtcp.ReceptionReport{{SSRC: media.writes[0].SSRC, TotalLost: 1, Jitter: 40}},
@@ -1124,10 +1129,18 @@ func TestCoordinatorBridgesRTPAndSendsDTMF(t *testing.T) {
 			t.Fatalf("inconsistent DTMF stream: %+v", packet.Header)
 		}
 	}
+	pbxReport, ok := media.rtcp[0].(*rtcp.ReceiverReport)
+	if !ok || pbxReport.SSRC != media.writes[0].SSRC || pbxReport.Reports[0].SSRC != 22 {
+		t.Fatalf("browser RTCP did not map to PBX RTP identities: %#v", media.rtcp[0])
+	}
 	rtc.mu.Lock()
 	defer rtc.mu.Unlock()
 	if len(rtc.writes) != 1 || len(rtc.rtcp) != 1 || string(rtc.writes[0].Payload) != string([]byte{3, 4}) {
 		t.Fatalf("unexpected browser RTP writes: %+v", rtc.writes)
+	}
+	browserReport, ok := rtc.rtcp[0].(*rtcp.ReceiverReport)
+	if !ok || browserReport.SSRC != 33 || browserReport.Reports[0].SSRC != 11 {
+		t.Fatalf("PBX RTCP did not map to WebRTC RTP identities: %#v", rtc.rtcp[0])
 	}
 	observer.mu.Lock()
 	defer observer.mu.Unlock()

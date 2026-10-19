@@ -16,6 +16,7 @@ Debt Flow SIP Windows Agent ที่เครื่องผู้ใช้
 - [Performance and capacity testing](docs/performance-testing.md)
 - [Local monitoring and embedded diagnostics](docs/local-monitoring.md)
 - [Monitoring dashboard implementation result](docs/2026-10-18-monitoring-dashboard-result.md)
+- [Session media continuity corrective result](docs/2026-10-19-session-media-continuity-result.md)
 - [Local browser POC](test/poc/README.md)
 
 P1 baseline ที่ยืนยันแล้ว:

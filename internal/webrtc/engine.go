@@ -42,6 +42,7 @@ type CodecInfo struct {
 	Name             string
 	AudioPayloadType uint8
 	DTMFPayloadType  uint8
+	OutboundSSRC     uint32
 }
 
 type CandidateHandler func(sessionID string, candidate pion.ICECandidateInit)
@@ -69,8 +70,28 @@ type peer struct {
 	codec      pion.RTPCodecCapability
 	codecInfo  CodecInfo
 	mu         sync.RWMutex
+	writeMu    sync.Mutex
+	continuity rtpStreamContinuity
 	callbackMu sync.RWMutex
 	active     bool
+}
+
+// rtpStreamContinuity keeps sequence numbers and timestamps continuous for the
+// lifetime of one WebRTC outbound track. SIP calls use a new translated SSRC
+// and random RTP origin per call, while Pion rewrites every packet to the
+// track's stable negotiated SSRC. Without this normalization the browser sees
+// one SSRC jumping to an unrelated sequence/timestamp origin on every call and
+// its jitter buffer may discard early media until the PeerConnection is reset.
+type rtpStreamContinuity struct {
+	initialized     bool
+	sourceSSRC      uint32
+	sourceSequence  uint16
+	sourceTimestamp uint32
+	targetSequence  uint16
+	targetTimestamp uint32
+	nextSequence    uint16
+	nextTimestamp   uint32
+	haveNextAudioTS bool
 }
 
 type Stats struct {
@@ -233,6 +254,11 @@ func (e *Engine) AcceptOffer(sessionID, sdp, preferredCodec string) (string, err
 	if err != nil {
 		return "", err
 	}
+	parameters := sender.GetParameters()
+	if len(parameters.Encodings) != 1 || parameters.Encodings[0].SSRC == 0 {
+		return "", errors.New("WebRTC outbound SSRC is unavailable")
+	}
+	outboundSSRC := uint32(parameters.Encodings[0].SSRC)
 	go func() {
 		for {
 			packets, _, err := sender.ReadRTCP()
@@ -256,6 +282,7 @@ func (e *Engine) AcceptOffer(sessionID, sdp, preferredCodec string) (string, err
 	p.codecInfo = CodecInfo{
 		Name:             strings.TrimPrefix(strings.ToUpper(selected.capability.MimeType), "AUDIO/"),
 		AudioPayloadType: selected.payloadType, DTMFPayloadType: selected.dtmfPayloadType,
+		OutboundSSRC: outboundSSRC,
 	}
 	return answer.SDP, nil
 }
@@ -290,17 +317,75 @@ func (e *Engine) AddCandidate(sessionID string, candidate pion.ICECandidateInit)
 }
 
 func (e *Engine) WriteRTP(sessionID string, packet *rtp.Packet) error {
+	if packet == nil {
+		return errors.New("RTP packet is required")
+	}
 	p, err := e.get(sessionID)
 	if err != nil {
 		return err
 	}
 	p.mu.RLock()
 	track := p.outbound
+	audioPayloadType := p.codecInfo.AudioPayloadType
 	p.mu.RUnlock()
 	if track == nil {
 		return errors.New("WebRTC outbound track is not ready")
 	}
-	return track.WriteRTP(packet)
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	normalized := *packet
+	p.continuity.rewrite(&normalized, audioPayloadType)
+	return track.WriteRTP(&normalized)
+}
+
+func (c *rtpStreamContinuity) rewrite(packet *rtp.Packet, audioPayloadType uint8) {
+	streamChanged := false
+	if !c.initialized {
+		c.initialized = true
+		c.sourceSSRC = packet.SSRC
+		c.sourceSequence = packet.SequenceNumber
+		c.sourceTimestamp = packet.Timestamp
+		c.targetSequence = packet.SequenceNumber
+		c.targetTimestamp = packet.Timestamp
+		c.nextSequence = packet.SequenceNumber
+		c.nextTimestamp = packet.Timestamp
+		streamChanged = true
+	} else if packet.SSRC != c.sourceSSRC {
+		c.sourceSSRC = packet.SSRC
+		c.sourceSequence = packet.SequenceNumber
+		c.sourceTimestamp = packet.Timestamp
+		c.targetSequence = c.nextSequence
+		c.targetTimestamp = c.nextTimestamp
+		streamChanged = true
+	}
+
+	packet.SequenceNumber = c.targetSequence + (packet.SequenceNumber - c.sourceSequence)
+	packet.Timestamp = c.targetTimestamp + (packet.Timestamp - c.sourceTimestamp)
+	if streamChanged {
+		// A new SIP call is a new talkspurt on the stable WebRTC track. Do not
+		// depend on the PBX setting the marker bit at this synthetic boundary.
+		packet.Marker = true
+	}
+	if packet.SequenceNumber == c.nextSequence || sequenceNumberAhead(packet.SequenceNumber, c.nextSequence) {
+		c.nextSequence = packet.SequenceNumber + 1
+	}
+	if packet.PayloadType == audioPayloadType && len(packet.Payload) > 0 {
+		// G.711 carries one 8 kHz sample per payload byte. Advancing to the
+		// next sample keeps a new call strictly after the last audio packet.
+		nextTimestamp := packet.Timestamp + uint32(len(packet.Payload))
+		if !c.haveNextAudioTS || nextTimestamp == c.nextTimestamp || timestampAhead(nextTimestamp, c.nextTimestamp) {
+			c.nextTimestamp = nextTimestamp
+			c.haveNextAudioTS = true
+		}
+	}
+}
+
+func sequenceNumberAhead(value, reference uint16) bool {
+	return int16(value-reference) > 0
+}
+
+func timestampAhead(value, reference uint32) bool {
+	return int32(value-reference) > 0
 }
 
 func (e *Engine) WriteRTCP(sessionID string, packets []rtcp.Packet) error {

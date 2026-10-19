@@ -19,12 +19,17 @@ type Mapping struct {
 }
 
 type Translator struct {
-	mu             sync.Mutex
-	mapping        Mapping
-	initialized    bool
-	firstSSRC      uint32
-	firstSequence  uint16
-	firstTimestamp uint32
+	mu              sync.Mutex
+	mapping         Mapping
+	initialized     bool
+	firstSSRC       uint32
+	firstSequence   uint16
+	firstTimestamp  uint32
+	targetSequence  uint16
+	targetTimestamp uint32
+	nextSequence    uint16
+	nextTimestamp   uint32
+	haveNextAudioTS bool
 }
 
 func NewTranslator(mapping Mapping) (*Translator, error) {
@@ -62,20 +67,58 @@ func (t *Translator) TranslateInto(dst, packet *rtp.Packet) error {
 	if err != nil {
 		return err
 	}
+	streamChanged := false
 	if !t.initialized {
 		t.firstSSRC = packet.SSRC
 		t.firstSequence = packet.SequenceNumber
 		t.firstTimestamp = packet.Timestamp
+		t.targetSequence = t.mapping.InitialSequence
+		t.targetTimestamp = t.mapping.InitialTimestamp
+		t.nextSequence = t.mapping.InitialSequence
+		t.nextTimestamp = t.mapping.InitialTimestamp
 		t.initialized = true
+		streamChanged = true
+	} else if packet.SSRC != t.firstSSRC {
+		// The source may legitimately change when early media and answered media
+		// come from different PBX/provider legs, or when WebRTC reconnects during
+		// an active call. Keep the target RTP stream continuous instead of
+		// forwarding the new source's unrelated sequence/timestamp origin.
+		t.firstSSRC = packet.SSRC
+		t.firstSequence = packet.SequenceNumber
+		t.firstTimestamp = packet.Timestamp
+		t.targetSequence = t.nextSequence
+		t.targetTimestamp = t.nextTimestamp
+		streamChanged = true
 	}
 	dst.Header = packet.Header
 	dst.Payload = append(dst.Payload[:0], packet.Payload...)
 	dst.Raw = nil
 	dst.PayloadType = targetPayloadType
 	dst.SSRC = t.mapping.TargetSSRC
-	dst.SequenceNumber = t.mapping.InitialSequence + (packet.SequenceNumber - t.firstSequence)
-	dst.Timestamp = t.mapping.InitialTimestamp + (packet.Timestamp - t.firstTimestamp)
+	dst.SequenceNumber = t.targetSequence + (packet.SequenceNumber - t.firstSequence)
+	dst.Timestamp = t.targetTimestamp + (packet.Timestamp - t.firstTimestamp)
+	if streamChanged {
+		dst.Marker = true
+	}
+	if dst.SequenceNumber == t.nextSequence || rtpSequenceAhead(dst.SequenceNumber, t.nextSequence) {
+		t.nextSequence = dst.SequenceNumber + 1
+	}
+	if packet.PayloadType == t.mapping.SourceAudioPayloadType && len(packet.Payload) > 0 {
+		nextTimestamp := dst.Timestamp + uint32(len(packet.Payload))
+		if !t.haveNextAudioTS || nextTimestamp == t.nextTimestamp || rtpTimestampAhead(nextTimestamp, t.nextTimestamp) {
+			t.nextTimestamp = nextTimestamp
+			t.haveNextAudioTS = true
+		}
+	}
 	return nil
+}
+
+func rtpSequenceAhead(value, reference uint16) bool {
+	return int16(value-reference) > 0
+}
+
+func rtpTimestampAhead(value, reference uint32) bool {
+	return int32(value-reference) > 0
 }
 
 func (t *Translator) SSRCMapping() (source, target uint32, initialized bool) {

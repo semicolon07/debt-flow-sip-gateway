@@ -87,3 +87,67 @@ func TestBuildDTMFRepeatsTerminalPacket(t *testing.T) {
 		}
 	}
 }
+
+func TestTranslatorKeepsTimelineWhenSourceSSRCChanges(t *testing.T) {
+	translator, err := NewTranslator(Mapping{
+		SourceAudioPayloadType: 0, TargetAudioPayloadType: 8,
+		SourceDTMFPayloadType: 101, TargetDTMFPayloadType: 110,
+		TargetSSRC: 42, InitialSequence: 1000, InitialTimestamp: 9000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packets := []*rtp.Packet{
+		{Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 11, SequenceNumber: 500, Timestamp: 7000}, Payload: make([]byte, 160)},
+		{Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 11, SequenceNumber: 501, Timestamp: 7160}, Payload: make([]byte, 160)},
+		{Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 22, SequenceNumber: 7, Timestamp: 9}, Payload: make([]byte, 160)},
+		{Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 22, SequenceNumber: 8, Timestamp: 169}, Payload: make([]byte, 160)},
+	}
+	translated := make([]*rtp.Packet, 0, len(packets))
+	for _, packet := range packets {
+		result, translateErr := translator.Translate(packet)
+		if translateErr != nil {
+			t.Fatal(translateErr)
+		}
+		translated = append(translated, result)
+	}
+
+	for index, packet := range translated {
+		if packet.SequenceNumber != uint16(1000+index) || packet.Timestamp != uint32(9000+index*160) {
+			t.Fatalf("packet %d discontinuity: seq=%d ts=%d", index, packet.SequenceNumber, packet.Timestamp)
+		}
+	}
+	if !translated[2].Marker {
+		t.Fatal("new RTP source did not start a marked talkspurt")
+	}
+}
+
+func TestTranslatorSourceChangeIgnoresReorderedTail(t *testing.T) {
+	translator, err := NewTranslator(Mapping{
+		SourceAudioPayloadType: 0, TargetAudioPayloadType: 8,
+		SourceDTMFPayloadType: 101, TargetDTMFPayloadType: 110,
+		TargetSSRC: 42, InitialSequence: 65534, InitialTimestamp: ^uint32(0) - 319,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, packet := range []*rtp.Packet{
+		{Header: rtp.Header{PayloadType: 0, SSRC: 11, SequenceNumber: 100, Timestamp: 1000}, Payload: make([]byte, 160)},
+		{Header: rtp.Header{PayloadType: 0, SSRC: 11, SequenceNumber: 102, Timestamp: 1320}, Payload: make([]byte, 160)},
+		{Header: rtp.Header{PayloadType: 0, SSRC: 11, SequenceNumber: 101, Timestamp: 1160}, Payload: make([]byte, 160)},
+	} {
+		if _, err := translator.Translate(packet); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := translator.Translate(&rtp.Packet{
+		Header:  rtp.Header{PayloadType: 0, SSRC: 22, SequenceNumber: 1, Timestamp: 1},
+		Payload: make([]byte, 160),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SequenceNumber != 1 || result.Timestamp != 160 {
+		t.Fatalf("reordered tail or wrap moved boundary: seq=%d ts=%d", result.SequenceNumber, result.Timestamp)
+	}
+}
