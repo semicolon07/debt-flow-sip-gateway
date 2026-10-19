@@ -57,6 +57,22 @@ outbox โดยยังคง `synchronous=FULL` และ durable event seman
 maintenance ลบ session binding เฉพาะเมื่อหมด retention และไม่มี outbox/call อ้างอิง ส่วน session ที่ renew
 จะ touch binding เพื่อไม่ให้ idle session ที่ยังใช้งานถูก purge
 
+รอบ production stabilization 2026-10-19 บน Darwin/arm64, Apple M2 Pro, Go 1.27.2 รัน benchmark
+ห้าครั้งที่ `-benchtime 1s` หลังเพิ่ม atomic snapshot/outbox และ SIP interoperability coverage ได้ผล:
+
+| benchmark | time/op | bytes/op | allocs/op |
+|---|---:|---:|---:|
+| verify AES-GCM session capability | 4.021–4.158 us | 4,999 | 23 |
+| decode + validate `call.start` | 2.717–2.974 us | 2,867–2,868 | 22 |
+| RTP reusable-buffer translate | 20.97–21.59 ns | 0 | 0 |
+| RTP reusable-buffer, 200 calls | 34.66–37.42 ns | 0 | 0 |
+| snapshot, 250 sessions / 200 active calls | 11.247–11.529 us | 2,352 | 4 |
+| SQLite atomic outbox path | 0.230–0.434 ms | 5,710–5,717 | 129 |
+
+RTP hot path ยังผ่าน zero-allocation และผล 200-call local regression ไม่ถดถอยจาก accepted baseline
+อย่างมีนัยสำคัญ ส่วน SQLite allocation คงที่แต่ timing แกว่งมากบน shared development host จึงต้องวัดซ้ำ
+บน Windows target host และไม่ใช้รอบนี้ปิด control-plane performance gate
+
 ## 2. Live load/soak observation
 
 ติดตั้ง signed release บน clean Windows Server 2022 แล้วเริ่ม sampler ก่อนสร้าง workload:

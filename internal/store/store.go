@@ -66,6 +66,15 @@ type Event struct {
 	CreatedAt           time.Time
 }
 
+// EventWrite describes one durable outbox event that must be committed with a
+// call snapshot. Payload ownership remains with the caller; the store copies it
+// into SQLite before this method returns.
+type EventWrite struct {
+	Key     string
+	Type    string
+	Payload []byte
+}
+
 type Stats struct {
 	PendingEvents           int64
 	MaxSessionPendingEvents int64
@@ -642,6 +651,97 @@ ON CONFLICT(call_id) DO UPDATE SET
 	return err
 }
 
+// SaveCallWithEvents commits the authoritative call snapshot and its externally
+// observable lifecycle events in one SQLite transaction. This prevents the
+// in-memory lifecycle from producing an outbox gap when either write fails.
+func (s *Store) SaveCallWithEvents(
+	ctx context.Context,
+	sessionID, agentInstanceID string,
+	snapshot call.Snapshot,
+	writes []EventWrite,
+	now time.Time,
+) ([]Event, error) {
+	if sessionID == "" || agentInstanceID == "" {
+		return nil, errors.New("call session and agent instance are required")
+	}
+	if err := call.ValidateSnapshot(snapshot); err != nil {
+		return nil, err
+	}
+	rawSnapshot, err := json.Marshal(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	for _, write := range writes {
+		if write.Type == "" || len(write.Payload) == 0 {
+			return nil, errors.New("event type and payload are required")
+		}
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	active := snapshot.State != call.StateEnded
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO calls(call_id, session_id, agent_instance_id, snapshot_json, active, updated_at_utc)
+VALUES(?, ?, ?, ?, ?, ?)
+ON CONFLICT(call_id) DO UPDATE SET
+  session_id=excluded.session_id,
+  agent_instance_id=excluded.agent_instance_id,
+  snapshot_json=excluded.snapshot_json,
+  active=excluded.active,
+  updated_at_utc=excluded.updated_at_utc`,
+		snapshot.CallID, sessionID, agentInstanceID, rawSnapshot, active, utc(now)); err != nil {
+		return nil, fmt.Errorf("save call with events: %w", err)
+	}
+
+	terminalGroup := false
+	for _, write := range writes {
+		terminalGroup = terminalGroup || write.Type == "call.ended"
+	}
+	stored := make([]Event, 0, len(writes))
+	for _, write := range writes {
+		if err := s.ensureCapacity(ctx, tx, sessionID, terminalGroup); err != nil {
+			return nil, err
+		}
+		sequence, err := nextSequence(ctx, tx, agentInstanceID)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO outbox(session_id, agent_instance_id, sequence, event_key, event_type, payload, created_at_utc)
+VALUES(?, ?, ?, NULLIF(?, ''), ?, ?, ?)`, sessionID, agentInstanceID, sequence,
+			write.Key, write.Type, write.Payload, utc(now)); err != nil {
+			return nil, fmt.Errorf("append call outbox event: %w", err)
+		}
+		stored = append(stored, Event{
+			SessionID: sessionID, AgentInstanceID: agentInstanceID, Sequence: sequence,
+			Type: write.Type, Payload: write.Payload, CreatedAt: now.UTC(),
+		})
+	}
+
+	var userSessionID, collectionID, collectionBindingID string
+	bindingErr := tx.QueryRowContext(ctx, `
+SELECT user_session_id, collection_id, collection_binding_id
+FROM session_bindings WHERE session_id=? AND agent_instance_id=?`,
+		sessionID, agentInstanceID).Scan(&userSessionID, &collectionID, &collectionBindingID)
+	if bindingErr != nil && !errors.Is(bindingErr, sql.ErrNoRows) {
+		return nil, fmt.Errorf("read call event session binding: %w", bindingErr)
+	}
+	for index := range stored {
+		stored[index].UserSessionID = userSessionID
+		stored[index].CollectionID = collectionID
+		stored[index].CollectionBindingID = collectionBindingID
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return stored, nil
+}
+
 func (s *Store) RecoverRestartedCalls(ctx context.Context, now time.Time) (int, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -683,14 +783,25 @@ FROM calls WHERE active = 1 AND restart_terminalized = 0`)
 		if err != nil {
 			return 0, err
 		}
-		sequence, err := nextSequence(ctx, tx, item.agentInstanceID)
-		if err != nil {
-			return 0, err
-		}
-		if _, err := tx.ExecContext(ctx, `
-INSERT OR IGNORE INTO outbox(session_id, agent_instance_id, sequence, event_key, event_type, payload, created_at_utc)
-VALUES(?, ?, ?, ?, 'call.ended', ?, ?)`, item.sessionID, item.agentInstanceID, sequence, "restart:"+item.callID, payload, utc(now)); err != nil {
-			return 0, err
+		for _, terminal := range []struct {
+			key, eventType string
+		}{
+			{key: "restart-ended-state:" + item.callID, eventType: "call.state_changed"},
+			{key: "restart-ended:" + item.callID, eventType: "call.ended"},
+		} {
+			if err := s.ensureCapacity(ctx, tx, item.sessionID, true); err != nil {
+				return 0, err
+			}
+			sequence, err := nextSequence(ctx, tx, item.agentInstanceID)
+			if err != nil {
+				return 0, err
+			}
+			if _, err := tx.ExecContext(ctx, `
+INSERT INTO outbox(session_id, agent_instance_id, sequence, event_key, event_type, payload, created_at_utc)
+VALUES(?, ?, ?, ?, ?, ?, ?)`, item.sessionID, item.agentInstanceID, sequence,
+				terminal.key, terminal.eventType, payload, utc(now)); err != nil {
+				return 0, err
+			}
 		}
 		if _, err := tx.ExecContext(ctx, `
 UPDATE calls SET snapshot_json=?, active=0, restart_terminalized=1, updated_at_utc=? WHERE call_id=?`,
@@ -852,7 +963,10 @@ func (s *Store) storageBytes() (total, wal int64, err error) {
 }
 
 func atOrAboveReserve(value, limit int) bool {
-	return int64(value)*100 >= int64(limit)*90
+	if limit <= 0 {
+		return value >= limit
+	}
+	return value >= limit-limit/10
 }
 
 func atOrAboveReserve64(value, limit int64) bool {

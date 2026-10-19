@@ -45,6 +45,7 @@ const (
 	EventTrying               EventType = "trying"
 	EventRinging              EventType = "ringing"
 	EventEarlyMedia           EventType = "early_media"
+	EventMediaUpdated         EventType = "media_updated"
 	EventConnected            EventType = "connected"
 	EventEnded                EventType = "ended"
 	EventFailed               EventType = "failed"

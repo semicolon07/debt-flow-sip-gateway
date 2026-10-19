@@ -17,6 +17,8 @@ Debt Flow SIP Windows Agent ที่เครื่องผู้ใช้
 - [Local monitoring and embedded diagnostics](docs/local-monitoring.md)
 - [Monitoring dashboard implementation result](docs/2026-10-18-monitoring-dashboard-result.md)
 - [Session media continuity corrective result](docs/2026-10-19-session-media-continuity-result.md)
+- [Production stabilization plan](docs/2026-10-19-production-stabilization-plan.md)
+- [Production stabilization Definition of Done](docs/2026-10-19-production-stabilization-dod.md)
 - [Local browser POC](test/poc/README.md)
 
 P1 baseline ที่ยืนยันแล้ว:

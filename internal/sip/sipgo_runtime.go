@@ -82,6 +82,12 @@ type sipgoCall struct {
 	rejecting            bool
 	connected            bool
 	terminateAfterAnswer bool
+	localSDP             []byte
+	codec                string
+	lastReliableRSeq     uint32
+	reinviteCSeq         uint32
+	reinviteAck          chan struct{}
+	reinviteNeedsAnswer  bool
 }
 
 type sipRegisterResponseError struct {
@@ -310,6 +316,10 @@ func (r *SIPGoRuntime) StartCall(ctx context.Context, sessionID, callID, destina
 	if len(localSDP) == 0 {
 		return errors.New("local SIP SDP is required")
 	}
+	localMedia, err := ParseRemoteSDP(localSDP)
+	if err != nil {
+		return fmt.Errorf("invalid local SIP SDP: %w", err)
+	}
 	session, err := r.registeredSession(sessionID)
 	if err != nil {
 		return err
@@ -351,7 +361,8 @@ func (r *SIPGoRuntime) StartCall(ctx context.Context, sessionID, callID, destina
 	callValue := &sipgoCall{
 		sessionID: sessionID, callID: callID, sipCallID: sipCallID,
 		outboundContext: callCtx, outbound: dialog, cancel: cancel,
-		outboundDone: make(chan struct{}),
+		outboundDone: make(chan struct{}), localSDP: append([]byte(nil), localSDP...),
+		codec: localMedia.Codec,
 	}
 	r.mu.Lock()
 	r.calls[callID] = callValue
@@ -417,9 +428,14 @@ func (r *SIPGoRuntime) Answer(_ context.Context, sessionID, callID string, local
 	if len(localSDP) == 0 {
 		return errors.New("local SIP SDP is required")
 	}
+	localMedia, err := ParseRemoteSDP(localSDP)
+	if err != nil {
+		return fmt.Errorf("invalid local SIP SDP: %w", err)
+	}
 	if !callValue.beginAnswer() {
 		return errors.New("inbound call answer is already in progress")
 	}
+	callValue.setLocalMedia(localSDP, localMedia.Codec)
 	// sipgo waits for the ACK while RespondSDP retransmits the 200 response. Do
 	// not run that wait on the WebSocket command reader: a slow/missing ACK must
 	// not block session renewal, hangup, or the browser command result.
@@ -592,6 +608,8 @@ func (r *SIPGoRuntime) installHandlers() {
 	r.server.OnAck(r.onAck)
 	r.server.OnCancel(r.onCancel)
 	r.server.OnBye(r.onBye)
+	r.server.OnPrack(r.onPrack)
+	r.server.OnUpdate(r.onUpdate)
 	r.server.OnOptions(func(request *sipmessage.Request, tx sipmessage.ServerTransaction) {
 		_ = tx.Respond(sipmessage.NewResponseFromRequest(request, sipmessage.StatusOK, "OK", nil))
 	})
@@ -638,9 +656,251 @@ func (r *SIPGoRuntime) handleTransportFinalResponse(callValue *sipgoCall, status
 		StatusCode: statusCode, Reason: reason})
 }
 
+func (r *SIPGoRuntime) onReinvite(
+	callValue *sipgoCall,
+	request *sipmessage.Request,
+	tx sipmessage.ServerTransaction,
+) {
+	if unsupported := unsupportedRequiredExtensions(request); len(unsupported) > 0 {
+		r.respondUnsupportedExtension(request, tx, unsupported)
+		return
+	}
+	if !callValue.isConnected() {
+		_ = tx.Respond(sipmessage.NewResponseFromRequest(request,
+			sipmessage.StatusRequestPending, "Request Pending", nil))
+		return
+	}
+	if err := r.readInDialogRequest(callValue, request, tx); err != nil {
+		status := sipmessage.StatusCallTransactionDoesNotExists
+		reason := "Call/Transaction Does Not Exist"
+		if errors.Is(err, sipgo.ErrDialogInvalidCseq) {
+			status = sipmessage.StatusInternalServerError
+			reason = "Server Internal Error"
+		}
+		_ = tx.Respond(sipmessage.NewResponseFromRequest(request, status, reason, nil))
+		return
+	}
+	localSDP, codec := callValue.localMedia()
+	if len(localSDP) == 0 || codec == "" {
+		_ = tx.Respond(sipmessage.NewResponseFromRequest(request,
+			sipmessage.StatusNotAcceptableHere, "Not Acceptable Here", nil))
+		return
+	}
+	remoteSDP := append([]byte(nil), request.Body()...)
+	if len(remoteSDP) > 0 {
+		if _, err := ParseRemoteSDPForCodec(remoteSDP, codec); err != nil {
+			_ = tx.Respond(sipmessage.NewResponseFromRequest(request,
+				sipmessage.StatusNotAcceptableHere, "Not Acceptable Here", nil))
+			return
+		}
+	}
+	cseq := request.CSeq()
+	if cseq == nil {
+		_ = tx.Respond(sipmessage.NewResponseFromRequest(request,
+			sipmessage.StatusBadRequest, "Bad Request", nil))
+		return
+	}
+	ack, accepted := callValue.beginReinvite(cseq.SeqNo, len(remoteSDP) == 0)
+	if !accepted {
+		_ = tx.Respond(sipmessage.NewResponseFromRequest(request,
+			sipmessage.StatusRequestPending, "Request Pending", nil))
+		return
+	}
+	response := sipmessage.NewSDPResponseFromRequest(request, localSDP)
+	if session, err := r.session(callValue.sessionID); err == nil && response.Contact() == nil {
+		response.AppendHeader(sipmessage.HeaderClone(&session.contact))
+	}
+	if err := tx.Respond(response); err != nil {
+		callValue.finishReinvite(cseq.SeqNo)
+		r.logger.Warn("in-dialog SIP re-INVITE response failed", "callId", callValue.callID,
+			"reason", "sip_response_failed", "failureKind", sipTransactionFailureKind(err))
+		return
+	}
+	if len(remoteSDP) > 0 {
+		r.emit(Event{Type: EventMediaUpdated, SessionID: callValue.sessionID,
+			CallID: callValue.callID, StatusCode: sipmessage.StatusOK, RemoteSDP: remoteSDP})
+	}
+	r.waitReinviteAck(callValue, cseq.SeqNo, ack, tx, response)
+}
+
+func (r *SIPGoRuntime) waitReinviteAck(
+	callValue *sipgoCall,
+	cseq uint32,
+	ack <-chan struct{},
+	tx sipmessage.ServerTransaction,
+	response *sipmessage.Response,
+) {
+	interval := sipmessage.T1
+	retransmit := time.NewTimer(interval)
+	deadline := time.NewTimer(64 * sipmessage.T1)
+	defer retransmit.Stop()
+	defer deadline.Stop()
+	defer callValue.finishReinvite(cseq)
+	for {
+		select {
+		case <-ack:
+			return
+		case <-retransmit.C:
+			if err := tx.Respond(response); err != nil {
+				r.logger.Warn("in-dialog SIP re-INVITE retransmission failed",
+					"callId", callValue.callID, "reason", "sip_response_failed",
+					"failureKind", sipTransactionFailureKind(err))
+				return
+			}
+			interval *= 2
+			if interval > sipmessage.T2 {
+				interval = sipmessage.T2
+			}
+			retransmit.Reset(interval)
+		case <-deadline.C:
+			r.logger.Warn("in-dialog SIP re-INVITE ACK timed out", "callId", callValue.callID,
+				"reason", "ack_missing")
+			r.emit(Event{Type: EventFailed, SessionID: callValue.sessionID,
+				CallID: callValue.callID, Reason: "media_failed"})
+			return
+		case <-r.ctx.Done():
+			return
+		}
+	}
+}
+
+func (r *SIPGoRuntime) onUpdate(request *sipmessage.Request, tx sipmessage.ServerTransaction) {
+	callValue := r.callBySIPRequest(request)
+	if callValue == nil || !requestHasDialogTag(request) {
+		_ = tx.Respond(sipmessage.NewResponseFromRequest(request,
+			sipmessage.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil))
+		return
+	}
+	if unsupported := unsupportedRequiredExtensions(request); len(unsupported) > 0 {
+		r.respondUnsupportedExtension(request, tx, unsupported)
+		return
+	}
+	if !callValue.isConnected() {
+		_ = tx.Respond(sipmessage.NewResponseFromRequest(request,
+			sipmessage.StatusRequestPending, "Request Pending", nil))
+		return
+	}
+	if err := r.readInDialogRequest(callValue, request, tx); err != nil {
+		_ = tx.Respond(sipmessage.NewResponseFromRequest(request,
+			sipmessage.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil))
+		return
+	}
+	remoteSDP := append([]byte(nil), request.Body()...)
+	localSDP, codec := callValue.localMedia()
+	if len(remoteSDP) > 0 {
+		if len(localSDP) == 0 {
+			_ = tx.Respond(sipmessage.NewResponseFromRequest(request,
+				sipmessage.StatusNotAcceptableHere, "Not Acceptable Here", nil))
+			return
+		}
+		if _, err := ParseRemoteSDPForCodec(remoteSDP, codec); err != nil {
+			_ = tx.Respond(sipmessage.NewResponseFromRequest(request,
+				sipmessage.StatusNotAcceptableHere, "Not Acceptable Here", nil))
+			return
+		}
+	}
+	var response *sipmessage.Response
+	if len(remoteSDP) > 0 {
+		response = sipmessage.NewSDPResponseFromRequest(request, localSDP)
+	} else {
+		response = sipmessage.NewResponseFromRequest(request, sipmessage.StatusOK, "OK", nil)
+	}
+	if session, err := r.session(callValue.sessionID); err == nil && response.Contact() == nil {
+		response.AppendHeader(sipmessage.HeaderClone(&session.contact))
+	}
+	if err := tx.Respond(response); err != nil {
+		return
+	}
+	if len(remoteSDP) > 0 {
+		r.emit(Event{Type: EventMediaUpdated, SessionID: callValue.sessionID,
+			CallID: callValue.callID, StatusCode: sipmessage.StatusOK, RemoteSDP: remoteSDP})
+	}
+}
+
+func (r *SIPGoRuntime) onPrack(request *sipmessage.Request, tx sipmessage.ServerTransaction) {
+	// The gateway never emits reliable provisional responses as a UAS. A PRACK
+	// therefore cannot match an outstanding reliable response.
+	_ = tx.Respond(sipmessage.NewResponseFromRequest(request,
+		sipmessage.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil))
+}
+
+func (r *SIPGoRuntime) readInDialogRequest(
+	callValue *sipgoCall,
+	request *sipmessage.Request,
+	tx sipmessage.ServerTransaction,
+) error {
+	session, err := r.session(callValue.sessionID)
+	if err != nil {
+		return err
+	}
+	if callValue.inbound != nil {
+		dialog, err := session.serverDialogs.MatchDialogRequest(request)
+		if err != nil || dialog != callValue.inbound {
+			return errors.Join(sipgo.ErrDialogDoesNotExists, err)
+		}
+		return dialog.ReadRequest(request, tx)
+	}
+	if callValue.outbound != nil {
+		dialog, err := session.clientDialogs.MatchRequestDialog(request)
+		if err != nil || dialog != callValue.outbound {
+			return errors.Join(sipgo.ErrDialogDoesNotExists, err)
+		}
+		return dialog.ReadRequest(request, tx)
+	}
+	return sipgo.ErrDialogDoesNotExists
+}
+
+func (r *SIPGoRuntime) respondUnsupportedExtension(
+	request *sipmessage.Request,
+	tx sipmessage.ServerTransaction,
+	unsupported []string,
+) {
+	response := sipmessage.NewResponseFromRequest(request,
+		sipmessage.StatusBadExtension, "Bad Extension", nil)
+	response.AppendHeader(sipmessage.NewHeader("Unsupported", strings.Join(unsupported, ", ")))
+	_ = tx.Respond(response)
+}
+
+func unsupportedRequiredExtensions(message sipmessage.Message) []string {
+	var unsupported []string
+	seen := make(map[string]struct{})
+	for _, header := range message.GetHeaders("Require") {
+		for _, value := range strings.Split(header.Value(), ",") {
+			token := strings.ToLower(strings.TrimSpace(value))
+			if token == "" {
+				continue
+			}
+			if _, duplicate := seen[token]; duplicate {
+				continue
+			}
+			seen[token] = struct{}{}
+			unsupported = append(unsupported, token)
+		}
+	}
+	return unsupported
+}
+
+func requestHasDialogTag(request *sipmessage.Request) bool {
+	to := request.To()
+	return to != nil && to.Params.Has("tag")
+}
+
 func (r *SIPGoRuntime) onInvite(request *sipmessage.Request, tx sipmessage.ServerTransaction) {
 	callRef := sipRequestRef(request)
 	r.logger.Debug("inbound SIP INVITE received", "callRef", callRef)
+	if callValue := r.callBySIPRequest(request); callValue != nil && requestHasDialogTag(request) {
+		r.onReinvite(callValue, request, tx)
+		return
+	}
+	if requestHasDialogTag(request) {
+		_ = tx.Respond(sipmessage.NewResponseFromRequest(request,
+			sipmessage.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil))
+		return
+	}
+	if unsupported := unsupportedRequiredExtensions(request); len(unsupported) > 0 {
+		r.respondUnsupportedExtension(request, tx, unsupported)
+		return
+	}
 	username := request.Recipient.User
 	sessionID, session, registered := r.sessionByUsername(username)
 	if session == nil || !registered {
@@ -749,7 +1009,32 @@ func normalizeRemoteParty(value string) string {
 
 func (r *SIPGoRuntime) onAck(request *sipmessage.Request, tx sipmessage.ServerTransaction) {
 	callValue := r.callBySIPRequest(request)
-	if callValue == nil || callValue.inbound == nil {
+	if callValue == nil {
+		return
+	}
+	if cseq := request.CSeq(); cseq != nil {
+		matched, needsAnswer, codec := callValue.ackReinvite(cseq.SeqNo)
+		if matched {
+			remoteSDP := append([]byte(nil), request.Body()...)
+			if needsAnswer && len(remoteSDP) == 0 {
+				r.logger.Warn("offerless SIP re-INVITE ACK omitted SDP answer",
+					"callId", callValue.callID, "reason", "invalid_sdp")
+				r.emit(Event{Type: EventFailed, SessionID: callValue.sessionID,
+					CallID: callValue.callID, Reason: "media_failed"})
+			} else if len(remoteSDP) > 0 {
+				if _, err := ParseRemoteSDPForCodec(remoteSDP, codec); err != nil {
+					r.logger.Warn("SIP re-INVITE ACK SDP rejected", "callId", callValue.callID,
+						"reason", "invalid_sdp")
+					r.emit(Event{Type: EventFailed, SessionID: callValue.sessionID,
+						CallID: callValue.callID, Reason: "media_failed"})
+				} else {
+					r.emit(Event{Type: EventMediaUpdated, SessionID: callValue.sessionID,
+						CallID: callValue.callID, RemoteSDP: remoteSDP})
+				}
+			}
+		}
+	}
+	if callValue.inbound == nil {
 		return
 	}
 	if err := callValue.inbound.ReadAck(request, tx); err != nil {
@@ -865,6 +1150,12 @@ func (r *SIPGoRuntime) waitOutbound(ctx context.Context, callValue *sipgoCall, c
 			if response == nil {
 				return errors.New("SIP transaction returned an empty response")
 			}
+			if response.StatusCode > sipmessage.StatusTrying && response.IsProvisional() &&
+				messageHasHeaderToken(response, "Require", "100rel") {
+				if err := r.sendReliableProvisionalACK(ctx, callValue, response); err != nil {
+					return err
+				}
+			}
 			if response.StatusCode == sipmessage.StatusTrying {
 				r.logger.Debug("outbound SIP provisional response",
 					"sessionId", callValue.sessionID, "callId", callValue.callID,
@@ -964,6 +1255,61 @@ func (r *SIPGoRuntime) waitOutbound(ctx context.Context, callValue *sipgoCall, c
 		StatusCode: callValue.outbound.InviteResponse.StatusCode,
 		RemoteSDP:  append([]byte(nil), callValue.outbound.InviteResponse.Body()...),
 	})
+}
+
+func (r *SIPGoRuntime) sendReliableProvisionalACK(
+	parent context.Context,
+	callValue *sipgoCall,
+	response *sipmessage.Response,
+) error {
+	rseqHeader := response.GetHeader("RSeq")
+	inviteCSeq := callValue.outbound.InviteRequest.CSeq()
+	if rseqHeader == nil || inviteCSeq == nil {
+		return errors.New("reliable provisional response omitted RSeq or INVITE CSeq")
+	}
+	rseqValue, err := strconv.ParseUint(strings.TrimSpace(rseqHeader.Value()), 10, 32)
+	if err != nil || rseqValue == 0 {
+		return errors.New("reliable provisional response has invalid RSeq")
+	}
+	if !callValue.claimReliableProvisional(uint32(rseqValue)) {
+		return nil
+	}
+	recipient := callValue.outbound.InviteRequest.Recipient
+	if contact := response.Contact(); contact != nil {
+		recipient = contact.Address
+	}
+	prack := sipmessage.NewRequest(sipmessage.PRACK, recipient)
+	prack.AppendHeader(sipmessage.NewHeader("RAck", fmt.Sprintf("%d %d INVITE",
+		rseqValue, inviteCSeq.SeqNo)))
+	ctx, cancel := boundedSIPContext(parent)
+	defer cancel()
+	result, err := callValue.outbound.Do(ctx, prack)
+	if err != nil {
+		return fmt.Errorf("send PRACK: %w", err)
+	}
+	if result == nil || !result.IsSuccess() {
+		status := 0
+		if result != nil {
+			status = result.StatusCode
+		}
+		return fmt.Errorf("PRACK rejected with status %d", status)
+	}
+	r.logger.Debug("outbound reliable provisional response acknowledged",
+		"sessionId", callValue.sessionID, "callId", callValue.callID,
+		"sipStatusCode", response.StatusCode)
+	return nil
+}
+
+func messageHasHeaderToken(message sipmessage.Message, name, expected string) bool {
+	expected = strings.ToLower(strings.TrimSpace(expected))
+	for _, header := range message.GetHeaders(name) {
+		for _, value := range strings.Split(header.Value(), ",") {
+			if strings.ToLower(strings.TrimSpace(value)) == expected {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func outboundFailureReason(status int, err error) string {
@@ -1450,6 +1796,66 @@ func (c *sipgoCall) isConnected() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.connected
+}
+
+func (c *sipgoCall) setLocalMedia(localSDP []byte, codec string) {
+	c.mu.Lock()
+	c.localSDP = append(c.localSDP[:0], localSDP...)
+	c.codec = codec
+	c.mu.Unlock()
+}
+
+func (c *sipgoCall) localMedia() ([]byte, string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return append([]byte(nil), c.localSDP...), c.codec
+}
+
+func (c *sipgoCall) claimReliableProvisional(rseq uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if rseq <= c.lastReliableRSeq {
+		return false
+	}
+	c.lastReliableRSeq = rseq
+	return true
+}
+
+func (c *sipgoCall) beginReinvite(cseq uint32, needsAnswer bool) (<-chan struct{}, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.connected || c.reinviteAck != nil {
+		return nil, false
+	}
+	c.reinviteCSeq = cseq
+	c.reinviteNeedsAnswer = needsAnswer
+	c.reinviteAck = make(chan struct{})
+	return c.reinviteAck, true
+}
+
+func (c *sipgoCall) ackReinvite(cseq uint32) (matched, needsAnswer bool, codec string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.reinviteAck == nil || c.reinviteCSeq != cseq {
+		return false, false, ""
+	}
+	close(c.reinviteAck)
+	c.reinviteAck = nil
+	needsAnswer = c.reinviteNeedsAnswer
+	c.reinviteNeedsAnswer = false
+	c.reinviteCSeq = 0
+	return true, needsAnswer, c.codec
+}
+
+func (c *sipgoCall) finishReinvite(cseq uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.reinviteAck == nil || c.reinviteCSeq != cseq {
+		return
+	}
+	c.reinviteAck = nil
+	c.reinviteNeedsAnswer = false
+	c.reinviteCSeq = 0
 }
 
 func (r *SIPGoRuntime) logInboundResponseFailure(callValue *sipgoCall, reason string, err error) {

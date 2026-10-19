@@ -226,6 +226,40 @@ func TestValidateRejectsMoreCallsThanSessions(t *testing.T) {
 	}
 }
 
+func TestValidateRequiresTerminalOutboxReserveForEveryActiveCall(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{
+			name: "per-session-terminal-pair",
+			mutate: func(cfg *Config) {
+				cfg.Storage.MaxPendingSession = 10
+			},
+			want: "maxPendingSession",
+		},
+		{
+			name: "global-active-call-fleet",
+			mutate: func(cfg *Config) {
+				cfg.Storage.MaxPendingSession = 20
+				cfg.Storage.MaxPendingGlobal = 1_000
+			},
+			want: "maxPendingGlobal",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Default()
+			makeCapabilityValid(&cfg)
+			cfg.TURN.AdvertisedIP = "10.0.0.10"
+			test.mutate(&cfg)
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("expected terminal outbox reserve error containing %q, got %v", test.want, err)
+			}
+		})
+	}
+}
+
 func TestValidateRequiresAdvertisedICEIP(t *testing.T) {
 	cfg := Default()
 	makeCapabilityValid(&cfg)

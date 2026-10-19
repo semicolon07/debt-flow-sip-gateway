@@ -30,6 +30,7 @@ type fakeCapabilityVerifier struct {
 	userSession  string
 	sessionID    string
 	sipBootstrap capability.SIPBootstrap
+	callErr      error
 	mu           sync.Mutex
 	redeems      int
 }
@@ -400,6 +401,9 @@ func TestReplayEnvelopeKeepsStableBusinessEventID(t *testing.T) {
 }
 
 func (f *fakeCapabilityVerifier) VerifyCall(_ string, binding capability.CallBinding) (capability.CallClaims, error) {
+	if f.callErr != nil {
+		return capability.CallClaims{}, f.callErr
+	}
 	return capability.CallClaims{
 		CapabilityID: "call-capability-" + binding.CallID, Destination: f.destination,
 		ExpiresAt: time.Now().Add(time.Minute).Unix(),
@@ -605,10 +609,19 @@ func newTestCoordinatorWithMedia(t *testing.T, verifier *fakeCapabilityVerifier,
 }
 
 func newTestCoordinatorWithStore(t *testing.T, verifier *fakeCapabilityVerifier, sipRuntime *fakeSIP) (*Coordinator, *fakeRTC, *fakeMedia, *store.Store) {
-	t.Helper()
-	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"), store.Limits{
+	return newTestCoordinatorWithStoreLimits(t, verifier, sipRuntime, store.Limits{
 		PerSession: 100, Global: 1000, MaxBytes: 1 << 20,
 	})
+}
+
+func newTestCoordinatorWithStoreLimits(
+	t *testing.T,
+	verifier *fakeCapabilityVerifier,
+	sipRuntime *fakeSIP,
+	limits store.Limits,
+) (*Coordinator, *fakeRTC, *fakeMedia, *store.Store) {
+	t.Helper()
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"), limits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -721,6 +734,278 @@ func TestCoordinatorConfirmsDurableEventACKOnlyAfterStoreCommit(t *testing.T) {
 	}
 }
 
+func TestCoordinatorDrainsDurableReplayInBoundedPages(t *testing.T) {
+	verifier := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	coordinator, _, _, database := newTestCoordinatorWithStoreLimits(
+		t, verifier, newFakeSIP(), store.Limits{
+			PerSession: eventReplayPageSize + 100,
+			Global:     (eventReplayPageSize + 100) * 2,
+			MaxBytes:   64 << 20,
+		},
+	)
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := eventReplayPageSize + 17
+	for index := 0; index < total; index++ {
+		_, err = database.AppendEvent(
+			context.Background(), claims.SessionID, claims.AgentInstanceID,
+			fmt.Sprintf("replay-page-%d", index), "registration.state_changed",
+			[]byte(`{"state":"registered"}`), time.Now(),
+		)
+		if err != nil {
+			t.Fatalf("append event %d: %v", index, err)
+		}
+	}
+
+	initial, _, err := coordinator.Connect(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(initial) != eventReplayPageSize+2 {
+		t.Fatalf("initial event count=%d, want %d", len(initial), eventReplayPageSize+2)
+	}
+	lastInitialSequence := durableSequence(t, initial[len(initial)-2])
+	if lastInitialSequence != eventReplayPageSize {
+		t.Fatalf("initial replay ended at sequence=%d, want %d", lastInitialSequence, eventReplayPageSize)
+	}
+
+	commandID := uuid.NewString()
+	ackPayload, err := json.Marshal(protocol.EventsACK{
+		CommandID: commandID,
+		Sequence:  lastInitialSequence,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := coordinator.Handle(context.Background(), claims, protocol.Envelope{
+		Type: "events.ack", Payload: ackPayload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(next) != 18 || next[0].Type != "command_result" {
+		t.Fatalf("next page=%d events, first=%q; want result plus 17 events", len(next), next[0].Type)
+	}
+	for index, event := range next[1:] {
+		want := uint64(eventReplayPageSize + index + 1)
+		if got := durableSequence(t, event); got != want {
+			t.Fatalf("next page event %d sequence=%d, want %d", index, got, want)
+		}
+	}
+
+	finalSequence := durableSequence(t, next[len(next)-1])
+	ackPayload, err = json.Marshal(protocol.EventsACK{Sequence: finalSequence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drained, err := coordinator.Handle(context.Background(), claims, protocol.Envelope{
+		Type: "events.ack", Payload: ackPayload,
+	})
+	if err != nil || len(drained) != 0 {
+		t.Fatalf("replay did not drain cleanly: events=%+v err=%v", drained, err)
+	}
+}
+
+func TestCoordinatorDoesNotPublishDurableEventsAheadOfPagedReplay(t *testing.T) {
+	verifier := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	coordinator, _, _, database := newTestCoordinatorWithStoreLimits(
+		t, verifier, newFakeSIP(), store.Limits{
+			PerSession: eventReplayPageSize + 100,
+			Global:     (eventReplayPageSize + 100) * 2,
+			MaxBytes:   64 << 20,
+		},
+	)
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < eventReplayPageSize+1; index++ {
+		if _, err := database.AppendEvent(context.Background(), claims.SessionID,
+			claims.AgentInstanceID, fmt.Sprintf("barrier-%d", index),
+			"registration.state_changed", []byte(`{"state":"registered"}`), time.Now()); err != nil {
+			t.Fatalf("append event %d: %v", index, err)
+		}
+	}
+
+	initial, live, err := coordinator.Connect(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := coordinator.session(claims.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastInitial := durableSequence(t, initial[len(initial)-2])
+	if _, err := coordinator.emit(context.Background(), session,
+		"registration.state_changed", map[string]any{"state": "registering"}, "barrier-new"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-live:
+		t.Fatalf("durable event %q overtook paged replay", event.Type)
+	default:
+	}
+	forgedACK, err := json.Marshal(protocol.EventsACK{Sequence: lastInitial + 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Handle(context.Background(), claims,
+		protocol.Envelope{Type: "events.ack", Payload: forgedACK}); err == nil {
+		t.Fatal("ACK beyond the delivered replay watermark was accepted")
+	}
+	pending, err := database.PendingEvents(context.Background(), claims.SessionID, 0,
+		eventReplayPageSize+10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != eventReplayPageSize+2 {
+		t.Fatalf("invalid ACK mutated durable outbox: pending=%d", len(pending))
+	}
+
+	ack, err := json.Marshal(protocol.EventsACK{Sequence: lastInitial})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := coordinator.Handle(context.Background(), claims,
+		protocol.Envelope{Type: "events.ack", Payload: ack})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(next) != 2 {
+		t.Fatalf("next replay page has %d events, want original tail plus concurrent event", len(next))
+	}
+	if first, second := durableSequence(t, next[0]), durableSequence(t, next[1]); first != uint64(eventReplayPageSize+1) || second != uint64(eventReplayPageSize+2) {
+		t.Fatalf("next replay sequences=(%d,%d), want (%d,%d)", first, second,
+			eventReplayPageSize+1, eventReplayPageSize+2)
+	}
+
+	ack, err = json.Marshal(protocol.EventsACK{Sequence: durableSequence(t, next[len(next)-1])})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drained, err := coordinator.Handle(context.Background(), claims,
+		protocol.Envelope{Type: "events.ack", Payload: ack}); err != nil || len(drained) != 0 {
+		t.Fatalf("replay barrier did not drain: events=%+v err=%v", drained, err)
+	}
+	if _, err := coordinator.emit(context.Background(), session,
+		"registration.state_changed", map[string]any{"state": "registered"}, "barrier-live"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-live:
+		if got := durableSequence(t, event); got != uint64(eventReplayPageSize+3) {
+			t.Fatalf("live sequence=%d, want %d", got, eventReplayPageSize+3)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("durable live publication did not resume after replay ACK")
+	}
+}
+
+func TestCoordinatorTerminalizesFromLastDurableStateWhenAsyncTransitionCannotPersist(t *testing.T) {
+	verifier := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	sipRuntime := newFakeSIP()
+	coordinator, _, _, database := newTestCoordinatorWithStoreLimits(
+		t, verifier, sipRuntime, store.Limits{
+			PerSession: 100,
+			Global:     1000,
+			MaxBytes:   64 << 20,
+		},
+	)
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventRegistered, SessionID: claims.SessionID})
+	callID := uuid.NewString()
+	startPayload, err := json.Marshal(protocol.StartCall{
+		CommandID: uuid.NewString(), CallID: callID, CallContextID: "context-1",
+		GatewayCapability: "call-capability",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Handle(context.Background(), claims, protocol.Envelope{
+		Type: "call.start", Payload: startPayload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// registration + call.created + dialing use three slots. Fill the regular
+	// 90% budget so a subsequent non-terminal transition is rejected while the
+	// terminal reserve remains available.
+	for index := 0; index < 87; index++ {
+		_, err = database.AppendEvent(
+			context.Background(), claims.SessionID, claims.AgentInstanceID,
+			fmt.Sprintf("capacity-fill-%d", index), "registration.state_changed",
+			[]byte(`{"state":"registered"}`), time.Now(),
+		)
+		if err != nil {
+			t.Fatalf("fill outbox %d: %v", index, err)
+		}
+	}
+
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventRinging, SessionID: claims.SessionID, CallID: callID,
+		StatusCode: 180,
+	})
+	session, err := coordinator.session(claims.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	snapshot := session.activeCall.Snapshot()
+	session.mu.Unlock()
+	if snapshot.State != call.StateEnded || snapshot.EndReason != call.EndAPIUnavailable {
+		t.Fatalf("call snapshot=%+v, want ended/api_unavailable", snapshot)
+	}
+	sipRuntime.mu.Lock()
+	hangups := sipRuntime.hangups
+	sipRuntime.mu.Unlock()
+	if hangups != 1 {
+		t.Fatalf("SIP hangups=%d, want 1", hangups)
+	}
+	pending, err := database.PendingEvents(context.Background(), claims.SessionID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 92 || pending[90].Type != "call.state_changed" ||
+		pending[91].Type != "call.ended" {
+		t.Fatalf("terminal reserve did not persist ordered ending events: count=%d tail=%+v",
+			len(pending), pending[len(pending)-2:])
+	}
+	var durable call.Snapshot
+	if err := json.Unmarshal(pending[91].Payload, &durable); err != nil {
+		t.Fatal(err)
+	}
+	if durable.State != call.StateEnded || durable.EndReason != call.EndAPIUnavailable {
+		t.Fatalf("durable terminal snapshot=%+v", durable)
+	}
+}
+
+func durableSequence(t *testing.T, envelope protocol.Envelope) uint64 {
+	t.Helper()
+	var payload struct {
+		Sequence uint64 `json:"sequence"`
+	}
+	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	return payload.Sequence
+}
+
 func TestCoordinatorPreservesActiveCallCodecDuringWebRTCReconnect(t *testing.T) {
 	verifier := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
 	coordinator, rtc, _ := newTestCoordinatorWithMedia(t, verifier, newFakeSIP())
@@ -770,6 +1055,13 @@ func TestCoordinatorAcceptsLegacyDurableEventACKWithoutResult(t *testing.T) {
 		claims.AgentInstanceID, "legacy-ack", "registration.state_changed", []byte(`{"state":"registered"}`), time.Now())
 	if err != nil {
 		t.Fatal(err)
+	}
+	initial, _, err := coordinator.Connect(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(initial) != 3 || durableSequence(t, initial[1]) != stored.Sequence {
+		t.Fatalf("legacy event was not delivered before ACK: %+v", initial)
 	}
 	payload, err := json.Marshal(protocol.EventsACK{Sequence: stored.Sequence})
 	if err != nil {
@@ -1356,6 +1648,53 @@ func TestCoordinatorRejectsInboundWithoutCodecIntersection(t *testing.T) {
 	sipRuntime.mu.Unlock()
 	if len(rejects) != 1 || rejects[0] != 488 {
 		t.Fatalf("inbound without codec intersection rejects=%v, want [488]", rejects)
+	}
+}
+
+func TestCoordinatorRejectsInboundAtCallCapacityWithoutRetainingState(t *testing.T) {
+	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	sipRuntime := newFakeSIP()
+	coordinator := newTestCoordinator(t, api, sipRuntime)
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventRegistered, SessionID: claims.SessionID})
+	coordinator.mu.Lock()
+	for index := 0; index < coordinator.cfg.MaxCalls; index++ {
+		coordinator.callOwners[fmt.Sprintf("occupied-%d", index)] = "another-session"
+	}
+	coordinator.mu.Unlock()
+
+	callID := uuid.NewString()
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventIncoming, SessionID: claims.SessionID, CallID: callID,
+		RemoteSDP: []byte("v=0\r\nc=IN IP4 10.0.0.20\r\n" +
+			"m=audio 20500 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n" +
+			"a=rtpmap:101 telephone-event/8000\r\n"),
+	})
+
+	session, err := coordinator.session(claims.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	activeCall := session.activeCall
+	session.mu.Unlock()
+	if activeCall != nil {
+		t.Fatalf("capacity-rejected inbound call was retained: %+v", activeCall.Snapshot())
+	}
+	sipRuntime.mu.Lock()
+	rejects := append([]int(nil), sipRuntime.rejects...)
+	sipRuntime.mu.Unlock()
+	if len(rejects) != 1 || rejects[0] != 486 {
+		t.Fatalf("capacity rejection statuses=%v, want [486]", rejects)
 	}
 }
 
@@ -1963,6 +2302,75 @@ func TestCoordinatorPreservesNormalizedOutboundFailureReason(t *testing.T) {
 	}
 }
 
+func TestCoordinatorAppliesInDialogMediaUpdateWithoutDuplicatingLifecycleEvent(t *testing.T) {
+	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	sipRuntime := newFakeSIP()
+	coordinator, _, media, database := newTestCoordinatorWithStore(t, api, sipRuntime)
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventRegistered, SessionID: claims.SessionID})
+	callID := uuid.NewString()
+	startPayload, _ := json.Marshal(protocol.StartCall{
+		CommandID: uuid.NewString(), CallID: callID, CallContextID: "context-1",
+		GatewayCapability: "call-capability",
+	})
+	if _, err := coordinator.Handle(context.Background(), claims,
+		protocol.Envelope{Type: "call.start", Payload: startPayload}); err != nil {
+		t.Fatal(err)
+	}
+	connectedSDP := []byte("v=0\r\nc=IN IP4 10.0.0.20\r\n" +
+		"m=audio 20500 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n" +
+		"a=rtpmap:101 telephone-event/8000\r\n")
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventConnected, SessionID: claims.SessionID, CallID: callID,
+		StatusCode: 200, RemoteSDP: connectedSDP,
+	})
+	before, err := database.PendingEvents(context.Background(), claims.SessionID, 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedSDP := []byte("v=0\r\nc=IN IP4 10.0.0.30\r\n" +
+		"m=audio 22500 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n" +
+		"a=rtpmap:101 telephone-event/8000\r\n")
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventMediaUpdated, SessionID: claims.SessionID, CallID: callID,
+		RemoteSDP: updatedSDP,
+	})
+	media.mu.Lock()
+	remote := media.remote
+	remoteRTCP := media.remoteRTCP
+	media.mu.Unlock()
+	if remote == nil || remote.IP.String() != "10.0.0.30" || remote.Port != 22500 ||
+		remoteRTCP == nil || remoteRTCP.Port != 22501 {
+		t.Fatalf("updated RTP/RTCP target=%v/%v", remote, remoteRTCP)
+	}
+	after, err := database.PendingEvents(context.Background(), claims.SessionID, 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("media-only update added lifecycle events: before=%d after=%d", len(before), len(after))
+	}
+	session, err := coordinator.session(claims.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	snapshot := session.activeCall.Snapshot()
+	session.mu.Unlock()
+	if snapshot.State != call.StateConnected {
+		t.Fatalf("media update changed call lifecycle: %+v", snapshot)
+	}
+}
+
 func TestCoordinatorMapsOutboundTerminalReasonsToAgentContract(t *testing.T) {
 	for reason, expected := range map[string]call.EndReason{
 		"busy":      call.EndBusy,
@@ -2029,6 +2437,54 @@ func TestCoordinatorUsesCanonicalAuthorizedDestinationAndDeduplicates(t *testing
 	defer sipRuntime.mu.Unlock()
 	if sipRuntime.starts != 1 {
 		t.Fatalf("duplicate command started %d SIP calls", sipRuntime.starts)
+	}
+}
+
+func TestCoordinatorRejectsInvalidCallCapabilityWithoutLeavingRecoverableCall(t *testing.T) {
+	verifier := &fakeCapabilityVerifier{
+		destination: "sip:canonical@pbx.internal",
+		callErr:     errors.New("invalid capability"),
+	}
+	sipRuntime := newFakeSIP()
+	coordinator, _, _, database := newTestCoordinatorWithStore(t, verifier, sipRuntime)
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventRegistered, SessionID: claims.SessionID})
+	failedCallID := uuid.NewString()
+	payload, _ := json.Marshal(protocol.StartCall{
+		CommandID: uuid.NewString(), CallID: failedCallID, CallContextID: "context-invalid",
+		GatewayCapability: "invalid-call-capability",
+	})
+	if _, err := coordinator.Handle(context.Background(), claims,
+		protocol.Envelope{Type: "call.start", Payload: payload}); err == nil {
+		t.Fatal("invalid call capability was accepted")
+	}
+	if recovered, err := database.RecoverRestartedCalls(context.Background(), time.Now().Add(time.Second)); err != nil || recovered != 0 {
+		t.Fatalf("rejected pre-lifecycle call became restart-recoverable: count=%d err=%v", recovered, err)
+	}
+
+	verifier.callErr = nil
+	payload, _ = json.Marshal(protocol.StartCall{
+		CommandID: uuid.NewString(), CallID: uuid.NewString(), CallContextID: "context-retry",
+		GatewayCapability: "valid-call-capability",
+	})
+	if _, err := coordinator.Handle(context.Background(), claims,
+		protocol.Envelope{Type: "call.start", Payload: payload}); err != nil {
+		t.Fatalf("valid retry after capability rejection failed: %v", err)
+	}
+	sipRuntime.mu.Lock()
+	starts := sipRuntime.starts
+	sipRuntime.mu.Unlock()
+	if starts != 1 {
+		t.Fatalf("valid retry started %d SIP calls, want 1", starts)
 	}
 }
 

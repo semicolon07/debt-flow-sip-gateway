@@ -174,6 +174,39 @@ func TestOutboundSessionProgressPublishesEarlyMediaSDP(t *testing.T) {
 	}
 }
 
+func TestOutboundReliableProvisionalResponseSendsPRACKBeforeEarlyMedia(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	const callID = "outbound-reliable-provisional"
+	if err := runtime.StartCall(context.Background(), "session-1", callID, "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatal(err)
+	}
+	invite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	writeSIPResponseWithHeadersAndBody(t, peer, gateway, invite,
+		183, "Session Progress", "reliable-progress",
+		[]string{"Require: 100rel", "RSeq: 41"}, testInboundSDP)
+
+	prack, prackTarget := readSIPRequestFromContaining(t, peer, "PRACK ")
+	inviteCSeq := strings.Fields(headerValue(invite, "CSeq"))[0]
+	wantRAck := "41 " + inviteCSeq + " INVITE"
+	if rack := headerValue(prack, "RAck"); rack != wantRAck {
+		t.Fatalf("PRACK RAck=%q, want %q", rack, wantRAck)
+	}
+	if _, err := peer.WriteTo([]byte(buildResponseForRequest(prack, 200, "OK")), prackTarget); err != nil {
+		t.Fatal(err)
+	}
+	event := readRuntimeEvent(t, runtime, EventEarlyMedia)
+	if event.CallID != callID || event.StatusCode != 183 {
+		t.Fatalf("early media event=%+v", event)
+	}
+
+	writeSIPResponse(t, peer, gateway, invite, 486, "Busy Here", "reliable-progress")
+	_, _ = readSIPRequestFromContaining(t, peer, "ACK ")
+	failed := readRuntimeEvent(t, runtime, EventFailed)
+	if failed.CallID != callID || failed.Reason != "busy" {
+		t.Fatalf("terminal event=%+v", failed)
+	}
+}
+
 func TestOutboundRingingWithSDPPublishesEarlyMedia(t *testing.T) {
 	runtime, peer := newOutboundSIPTestRuntime(t)
 	const callID = "outbound-ringing-early-media"
@@ -766,6 +799,108 @@ func TestOutboundConnectedRemoteByeEndsCallAndAllowsImmediateRedial(t *testing.T
 	assertImmediateOutboundRedial(t, runtime, peer, "outbound-remote-bye-2")
 }
 
+func TestEstablishedOutboundCallAcceptsCompatibleAndOfferlessReinvite(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	const applicationCallID = "outbound-reinvite"
+	_, ack, gateway := establishOutboundTestCall(t, runtime, peer, applicationCallID, "remote-reinvite")
+	_, peerPortText, err := net.SplitHostPort(peer.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerPort, err := strconv.Atoi(peerPortText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, serverPortText, err := net.SplitHostPort(gateway.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverPort, err := strconv.Atoi(serverPortText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteTag := sipTagFromHeader(headerValue(ack, "To"))
+	localTo := headerValue(ack, "From")
+	sipCallID := headerValue(ack, "Call-ID")
+	if remoteTag == "" || localTo == "" || sipCallID == "" {
+		t.Fatalf("established dialog headers are incomplete: %q", ack)
+	}
+
+	updatedSDP := strings.Replace(testInboundSDP, "m=audio 20000", "m=audio 24000", 1)
+	reinvite := buildInboundRequest("INVITE", serverPort, peerPort, remoteTag, localTo, sipCallID,
+		"z9hG4bK-outbound-reinvite", "2 INVITE", updatedSDP)
+	if _, err := peer.WriteTo([]byte(reinvite), gateway); err != nil {
+		t.Fatal(err)
+	}
+	response := readSIPResponseContaining(t, peer, "SIP/2.0 ")
+	if !strings.Contains(response, "200 OK") {
+		t.Fatalf("re-INVITE was not accepted: %q", response)
+	}
+	if cseq := headerValue(response, "CSeq"); cseq != "2 INVITE" {
+		t.Fatalf("re-INVITE response CSeq=%q", cseq)
+	}
+	mediaUpdated := readRuntimeEvent(t, runtime, EventMediaUpdated)
+	if mediaUpdated.CallID != applicationCallID || string(mediaUpdated.RemoteSDP) != updatedSDP {
+		t.Fatalf("media update event=%+v", mediaUpdated)
+	}
+	reinviteAck := buildInboundRequest("ACK", serverPort, peerPort, remoteTag, localTo, sipCallID,
+		"z9hG4bK-outbound-reinvite-ack", "2 ACK", "")
+	if _, err := peer.WriteTo([]byte(reinviteAck), gateway); err != nil {
+		t.Fatal(err)
+	}
+	callValue, err := runtime.call("session-1", applicationCallID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		callValue.mu.RLock()
+		pending := callValue.reinviteAck != nil
+		callValue.mu.RUnlock()
+		if !pending {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	callValue.mu.RLock()
+	stillPending := callValue.reinviteAck != nil
+	callValue.mu.RUnlock()
+	if stillPending {
+		t.Fatal("compatible re-INVITE ACK did not complete the transaction")
+	}
+
+	offerless := buildInboundRequest("INVITE", serverPort, peerPort, remoteTag, localTo, sipCallID,
+		"z9hG4bK-outbound-offerless", "3 INVITE", "")
+	if _, err := peer.WriteTo([]byte(offerless), gateway); err != nil {
+		t.Fatal(err)
+	}
+	response = readSIPResponseContaining(t, peer, "200 OK")
+	if cseq := headerValue(response, "CSeq"); cseq != "3 INVITE" || !strings.Contains(response, "m=audio") {
+		t.Fatalf("offerless re-INVITE response is incomplete: %q", response)
+	}
+	answerSDP := strings.Replace(testInboundSDP, "m=audio 20000", "m=audio 25000", 1)
+	offerlessAck := buildInboundRequest("ACK", serverPort, peerPort, remoteTag, localTo, sipCallID,
+		"z9hG4bK-outbound-offerless-ack", "3 ACK", answerSDP)
+	if _, err := peer.WriteTo([]byte(offerlessAck), gateway); err != nil {
+		t.Fatal(err)
+	}
+	mediaUpdated = readRuntimeEvent(t, runtime, EventMediaUpdated)
+	if mediaUpdated.CallID != applicationCallID || string(mediaUpdated.RemoteSDP) != answerSDP {
+		t.Fatalf("offerless media update event=%+v", mediaUpdated)
+	}
+
+	remoteBye := buildInboundRequest("BYE", serverPort, peerPort, remoteTag, localTo, sipCallID,
+		"z9hG4bK-outbound-reinvite-bye", "4 BYE", "")
+	if _, err := peer.WriteTo([]byte(remoteBye), gateway); err != nil {
+		t.Fatal(err)
+	}
+	readSIPResponseContaining(t, peer, "200 OK")
+	ended := readRuntimeEvent(t, runtime, EventEnded)
+	if ended.CallID != applicationCallID || ended.Reason != "remote_hangup" {
+		t.Fatalf("terminal event=%+v", ended)
+	}
+}
+
 func TestOutboundLateAnswerAfterCancelIsAckedAndEndedWithByeBeforeRedial(t *testing.T) {
 	runtime, peer := newOutboundSIPTestRuntime(t)
 	const firstCallID = "outbound-late-answer-1"
@@ -962,6 +1097,29 @@ func TestCloseSessionDoesNotDeleteConcurrentReplacement(t *testing.T) {
 	}
 }
 
+func TestInboundInviteRejectsUnsupportedRequiredExtensionBeforeCreatingCall(t *testing.T) {
+	runtime, peer, serverUDP, serverPort, peerPort := newInboundSIPTestRuntime(t)
+	callID := "inbound-required-extension@example.test"
+	invite := buildInboundRequest("INVITE", serverPort, peerPort, "from-required", "", callID,
+		"z9hG4bK-required", "1 INVITE", testInboundSDP)
+	invite = strings.Replace(invite, "Content-Length:", "Require: 100rel, timer\r\nContent-Length:", 1)
+	if _, err := peer.WriteTo([]byte(invite), serverUDP); err != nil {
+		t.Fatal(err)
+	}
+	response := readSIPResponseContaining(t, peer, "420 Bad Extension")
+	unsupported := strings.ToLower(headerValue(response, "Unsupported"))
+	if !strings.Contains(unsupported, "100rel") || !strings.Contains(unsupported, "timer") {
+		t.Fatalf("Unsupported header=%q, want 100rel and timer", unsupported)
+	}
+	assertNoRuntimeEvent(t, runtime, EventIncoming, 100*time.Millisecond)
+	runtime.mu.RLock()
+	_, retained := runtime.sipCallID[callID]
+	runtime.mu.RUnlock()
+	if retained {
+		t.Fatal("unsupported INVITE retained a SIP Call-ID mapping")
+	}
+}
+
 func TestInboundInviteCanBeAnsweredAfterInviteHandlerPublishesRinging(t *testing.T) {
 	udpAddress := reservePacketAddress(t)
 	tcpAddress := reserveTCPAddress(t)
@@ -1087,6 +1245,83 @@ func TestInboundInviteCanBeAnsweredAfterInviteHandlerPublishesRinging(t *testing
 		t.Fatal("timed out waiting for inbound ended event")
 	}
 	waitForCallRemoval(t, runtime, "session-1", incoming.CallID)
+}
+
+func TestEstablishedInboundCallAcceptsCompatibleReinviteWithoutCreatingAnotherCall(t *testing.T) {
+	runtime, peer, serverUDP, serverPort, peerPort := newInboundSIPTestRuntime(t)
+	callID := "inbound-reinvite@example.test"
+	fromTag := "from-reinvite"
+	incoming, toValue := establishInboundTestCall(
+		t, runtime, peer, serverUDP, serverPort, peerPort, callID, fromTag,
+	)
+	updatedSDP := strings.Replace(testInboundSDP, "m=audio 20000", "m=audio 21000", 1)
+	reinvite := buildInboundRequest("INVITE", serverPort, peerPort, fromTag, toValue, callID,
+		"z9hG4bK-reinvite", "2 INVITE", updatedSDP)
+	if _, err := peer.WriteTo([]byte(reinvite), serverUDP); err != nil {
+		t.Fatal(err)
+	}
+	response := readSIPResponseContaining(t, peer, "200 OK")
+	if cseq := headerValue(response, "CSeq"); cseq != "2 INVITE" {
+		t.Fatalf("re-INVITE response CSeq=%q", cseq)
+	}
+	mediaUpdated := readRuntimeEvent(t, runtime, EventMediaUpdated)
+	if mediaUpdated.CallID != incoming.CallID || string(mediaUpdated.RemoteSDP) != updatedSDP {
+		t.Fatalf("media update event=%+v", mediaUpdated)
+	}
+	ack := buildInboundRequest("ACK", serverPort, peerPort, fromTag, toValue, callID,
+		"z9hG4bK-reinvite-ack", "2 ACK", "")
+	if _, err := peer.WriteTo([]byte(ack), serverUDP); err != nil {
+		t.Fatal(err)
+	}
+	assertNoRuntimeEvent(t, runtime, EventIncoming, 100*time.Millisecond)
+	runtime.mu.RLock()
+	callCount := len(runtime.calls)
+	runtime.mu.RUnlock()
+	if callCount != 1 {
+		t.Fatalf("re-INVITE changed active call count to %d", callCount)
+	}
+	endInboundTestCall(t, runtime, peer, serverUDP, serverPort, peerPort,
+		incoming, callID, fromTag, toValue, 3)
+}
+
+func TestEstablishedInboundCallAcceptsCompatibleUpdateAndRejectsCodecChange(t *testing.T) {
+	runtime, peer, serverUDP, serverPort, peerPort := newInboundSIPTestRuntime(t)
+	callID := "inbound-update@example.test"
+	fromTag := "from-update"
+	incoming, toValue := establishInboundTestCall(
+		t, runtime, peer, serverUDP, serverPort, peerPort, callID, fromTag,
+	)
+	updatedSDP := strings.Replace(testInboundSDP, "m=audio 20000", "m=audio 22000", 1)
+	update := buildInboundRequest("UPDATE", serverPort, peerPort, fromTag, toValue, callID,
+		"z9hG4bK-update", "2 UPDATE", updatedSDP)
+	if _, err := peer.WriteTo([]byte(update), serverUDP); err != nil {
+		t.Fatal(err)
+	}
+	response := readSIPResponseContaining(t, peer, "200 OK")
+	if cseq := headerValue(response, "CSeq"); cseq != "2 UPDATE" {
+		t.Fatalf("UPDATE response CSeq=%q", cseq)
+	}
+	mediaUpdated := readRuntimeEvent(t, runtime, EventMediaUpdated)
+	if mediaUpdated.CallID != incoming.CallID || string(mediaUpdated.RemoteSDP) != updatedSDP {
+		t.Fatalf("media update event=%+v", mediaUpdated)
+	}
+
+	unsupportedSDP := strings.ReplaceAll(testInboundSDP,
+		"m=audio 20000 RTP/AVP 0 101", "m=audio 23000 RTP/AVP 8 101")
+	unsupportedSDP = strings.ReplaceAll(unsupportedSDP,
+		"a=rtpmap:0 PCMU/8000", "a=rtpmap:8 PCMA/8000")
+	update = buildInboundRequest("UPDATE", serverPort, peerPort, fromTag, toValue, callID,
+		"z9hG4bK-update-codec", "3 UPDATE", unsupportedSDP)
+	if _, err := peer.WriteTo([]byte(update), serverUDP); err != nil {
+		t.Fatal(err)
+	}
+	response = readSIPResponseContaining(t, peer, "488 Not Acceptable Here")
+	if cseq := headerValue(response, "CSeq"); cseq != "3 UPDATE" {
+		t.Fatalf("codec rejection CSeq=%q", cseq)
+	}
+	assertNoRuntimeEvent(t, runtime, EventMediaUpdated, 100*time.Millisecond)
+	endInboundTestCall(t, runtime, peer, serverUDP, serverPort, peerPort,
+		incoming, callID, fromTag, toValue, 4)
 }
 
 func TestInboundInviteAnswerAndRemoteByeOverTCP(t *testing.T) {
@@ -1433,6 +1668,63 @@ func newOutboundSIPTestRuntime(t *testing.T) (*SIPGoRuntime, net.PacketConn) {
 	return runtime, peer
 }
 
+func establishInboundTestCall(
+	t *testing.T,
+	runtime *SIPGoRuntime,
+	peer net.PacketConn,
+	serverUDP *net.UDPAddr,
+	serverPort, peerPort int,
+	callID, fromTag string,
+) (Event, string) {
+	t.Helper()
+	invite := buildInboundRequest("INVITE", serverPort, peerPort, fromTag, "", callID,
+		"z9hG4bK-"+fromTag+"-invite", "1 INVITE", testInboundSDP)
+	if _, err := peer.WriteTo([]byte(invite), serverUDP); err != nil {
+		t.Fatal(err)
+	}
+	readSIPResponseContaining(t, peer, "180 Ringing")
+	incoming := readRuntimeEvent(t, runtime, EventIncoming)
+	if err := runtime.Answer(context.Background(), "session-1", incoming.CallID, testAnswerSDP(t)); err != nil {
+		t.Fatal(err)
+	}
+	response := readSIPResponseContaining(t, peer, "200 OK")
+	toValue := headerValue(response, "To")
+	ack := buildInboundRequest("ACK", serverPort, peerPort, fromTag, toValue, callID,
+		"z9hG4bK-"+fromTag+"-ack", "1 ACK", "")
+	if _, err := peer.WriteTo([]byte(ack), serverUDP); err != nil {
+		t.Fatal(err)
+	}
+	connected := readRuntimeEvent(t, runtime, EventConnected)
+	if connected.CallID != incoming.CallID {
+		t.Fatalf("connected event=%+v", connected)
+	}
+	return incoming, toValue
+}
+
+func endInboundTestCall(
+	t *testing.T,
+	runtime *SIPGoRuntime,
+	peer net.PacketConn,
+	serverUDP *net.UDPAddr,
+	serverPort, peerPort int,
+	incoming Event,
+	callID, fromTag, toValue string,
+	cseq uint32,
+) {
+	t.Helper()
+	bye := buildInboundRequest("BYE", serverPort, peerPort, fromTag, toValue, callID,
+		"z9hG4bK-"+fromTag+"-bye", fmt.Sprintf("%d BYE", cseq), "")
+	if _, err := peer.WriteTo([]byte(bye), serverUDP); err != nil {
+		t.Fatal(err)
+	}
+	readSIPResponseContaining(t, peer, "200 OK")
+	ended := readRuntimeEvent(t, runtime, EventEnded)
+	if ended.CallID != incoming.CallID || ended.Reason != "remote_hangup" {
+		t.Fatalf("ended event=%+v", ended)
+	}
+	waitForCallRemoval(t, runtime, "session-1", incoming.CallID)
+}
+
 func establishOutboundTestCall(
 	t *testing.T,
 	runtime *SIPGoRuntime,
@@ -1484,6 +1776,16 @@ func buildInboundRequest(method string, serverPort, peerPort int, fromTag, toVal
 		"%sContent-Length: %d\r\n\r\n%s",
 		method, serverPort, peerPort, branch, fromTag, toValue, callID, cseq, peerPort,
 		contentHeaders, len(body), body)
+}
+
+func sipTagFromHeader(value string) string {
+	for _, parameter := range strings.Split(value, ";")[1:] {
+		name, tag, found := strings.Cut(strings.TrimSpace(parameter), "=")
+		if found && strings.EqualFold(name, "tag") {
+			return strings.TrimSpace(tag)
+		}
+	}
+	return ""
 }
 
 func buildResponseForRequest(request string, status int, reason string) string {
@@ -1663,6 +1965,20 @@ func writeSIPResponseWithBody(
 	toTag string,
 	body string,
 ) {
+	writeSIPResponseWithHeadersAndBody(t, peer, target, request, status, reason, toTag, nil, body)
+}
+
+func writeSIPResponseWithHeadersAndBody(
+	t *testing.T,
+	peer net.PacketConn,
+	target net.Addr,
+	request string,
+	status int,
+	reason string,
+	toTag string,
+	headers []string,
+	body string,
+) {
 	t.Helper()
 	to := headerValue(request, "To")
 	if toTag != "" && !strings.Contains(strings.ToLower(to), ";tag=") {
@@ -1674,6 +1990,9 @@ func writeSIPResponseWithBody(
 	}
 	if body != "" {
 		extraHeaders += "Content-Type: application/sdp\r\n"
+	}
+	for _, header := range headers {
+		extraHeaders += header + "\r\n"
 	}
 	response := fmt.Sprintf("SIP/2.0 %d %s\r\n"+
 		"Via: %s\r\n"+

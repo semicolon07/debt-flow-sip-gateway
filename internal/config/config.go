@@ -277,6 +277,19 @@ func (c Config) Validate() error {
 	}
 	if c.Storage.MaxPendingSession <= 0 || c.Storage.MaxPendingGlobal < c.Storage.MaxPendingSession {
 		problems = append(problems, errors.New("storage pending-event limits are invalid"))
+	} else {
+		// Regular events stop at 90% so the remaining capacity can always carry the
+		// atomic terminal pair: call.state_changed(ended) + call.ended. Reject a
+		// configuration that could make this safety reserve smaller than the active
+		// call fleet it is intended to protect.
+		if terminalEventReserve(c.Storage.MaxPendingSession) < 2 {
+			problems = append(problems, errors.New(
+				"storage.maxPendingSession must reserve at least two terminal call events"))
+		}
+		if terminalEventReserve(c.Storage.MaxPendingGlobal) < int64(c.Limits.MaxCalls)*2 {
+			problems = append(problems, errors.New(
+				"storage.maxPendingGlobal terminal reserve must provide two events per maximum call"))
+		}
 	}
 	if !c.TURN.Enabled {
 		problems = append(problems, errors.New("embedded TURN must be enabled in P1"))
@@ -326,6 +339,12 @@ func (c Config) Validate() error {
 		problems = append(problems, errors.New("P1 shutdownGrace must be 15s"))
 	}
 	return errors.Join(problems...)
+}
+
+func terminalEventReserve(limit int) int64 {
+	// Regular writes stop at ceil(90%), leaving floor(10%) for terminal writes.
+	// Division avoids overflowing when strict YAML receives an extreme int value.
+	return int64(limit) / 10
 }
 
 type namedPort struct {

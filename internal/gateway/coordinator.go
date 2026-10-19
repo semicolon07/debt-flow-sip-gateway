@@ -126,6 +126,8 @@ type runtimeSession struct {
 	earlyMediaCallID        string
 	earlyMediaAudibleCallID string
 	earlyMediaStatusCode    int
+	replayCursor            uint64
+	replayActive            bool
 	activeMedia             *callMedia
 	leaseExpires            time.Time
 }
@@ -153,8 +155,15 @@ type callMedia struct {
 
 type commandError struct{ code string }
 
+type durableCallEvent struct {
+	eventType string
+	payload   any
+	eventKey  string
+}
+
 const (
 	liveEventQueueCapacity           = 256
+	eventReplayPageSize              = 256
 	earlyMediaAudiblePacketThreshold = 5
 )
 
@@ -333,7 +342,7 @@ func (c *Coordinator) Connect(_ context.Context, claims Claims) ([]protocol.Enve
 		close(previousLive)
 	}
 	pending, err := c.store.PendingAgentEvents(context.Background(), claims.AgentInstanceID,
-		claims.UserSessionID, 0, 10_000)
+		claims.UserSessionID, 0, eventReplayPageSize)
 	if err != nil {
 		c.closeLiveStream(session, nextLive)
 		return nil, nil, err
@@ -353,6 +362,16 @@ func (c *Coordinator) Connect(_ context.Context, claims Claims) ([]protocol.Enve
 		c.closeLiveStream(session, nextLive)
 		return nil, nil, err
 	}
+	session.mu.Lock()
+	session.replayCursor = acknowledgedThrough
+	if len(pending) > 0 {
+		session.replayCursor = pending[len(pending)-1].Sequence
+	}
+	// Keep a replay barrier until the browser ACKs the last page. Durable events
+	// created meanwhile stay in SQLite and are delivered by the next page rather
+	// than overtaking the replay through the live channel.
+	session.replayActive = len(pending) > 0
+	session.mu.Unlock()
 	if monitorNeeded {
 		go c.monitorLease(claims.SessionID, claims.CapabilityID)
 	}
@@ -371,6 +390,54 @@ func (c *Coordinator) Connect(_ context.Context, claims Claims) ([]protocol.Enve
 	initial := append([]protocol.Envelope{welcome}, replay...)
 	initial = append(initial, snapshotEvent)
 	return initial, nextLive, nil
+}
+
+func (c *Coordinator) appendReplayPage(
+	session *runtimeSession,
+	claims Claims,
+	acknowledgedThrough uint64,
+	result []protocol.Envelope,
+) ([]protocol.Envelope, error) {
+	// Serialize page advancement with live durable-event publication. This keeps
+	// each reconnect replay bounded without allowing concurrent ACK commands to
+	// skip a page or publish duplicate pages into the browser queue.
+	session.eventMu.Lock()
+	defer session.eventMu.Unlock()
+
+	session.mu.Lock()
+	replayCursor := session.replayCursor
+	session.mu.Unlock()
+	if acknowledgedThrough < replayCursor {
+		return result, nil
+	}
+
+	pending, err := c.store.PendingAgentEvents(context.Background(), claims.AgentInstanceID,
+		claims.UserSessionID, replayCursor, eventReplayPageSize)
+	if err != nil {
+		return nil, commandError{"event_replay_failed"}
+	}
+	for _, event := range pending {
+		envelope, envelopeErr := replayEnvelope(event)
+		if envelopeErr != nil {
+			return nil, commandError{"event_replay_failed"}
+		}
+		result = append(result, envelope)
+	}
+	session.mu.Lock()
+	if len(pending) > 0 {
+		lastSequence := pending[len(pending)-1].Sequence
+		if lastSequence > session.replayCursor {
+			session.replayCursor = lastSequence
+		}
+		session.replayActive = true
+	} else {
+		if acknowledgedThrough > session.replayCursor {
+			session.replayCursor = acknowledgedThrough
+		}
+		session.replayActive = false
+	}
+	session.mu.Unlock()
+	return result, nil
 }
 
 func (c *Coordinator) Handle(ctx context.Context, claims Claims, envelope protocol.Envelope) (events []protocol.Envelope, resultErr error) {
@@ -406,6 +473,14 @@ func (c *Coordinator) Handle(ctx context.Context, claims Claims, envelope protoc
 			(ack.CommandID != "" && protocol.ValidateCommandID(ack.CommandID) != nil) {
 			return nil, commandError{"invalid_events_ack"}
 		}
+		session.mu.Lock()
+		deliveredThrough := session.replayCursor
+		session.mu.Unlock()
+		if ack.Sequence > deliveredThrough {
+			// Never let a stale, buggy or forged client cumulatively ACK durable
+			// events that this connection has not actually been sent.
+			return nil, commandError{"invalid_events_ack"}
+		}
 		acknowledgedThrough, err := c.store.AcknowledgeAgent(ctx, claims.AgentInstanceID,
 			claims.UserSessionID, ack.Sequence, c.now())
 		if err != nil {
@@ -419,9 +494,10 @@ func (c *Coordinator) Handle(ctx context.Context, claims Claims, envelope protoc
 				"commandId": ack.CommandID, "commandType": "events.ack",
 				"status": "completed", "sequence": acknowledgedThrough,
 			}, c.now())
-			return []protocol.Envelope{result}, nil
+			return c.appendReplayPage(session, claims, acknowledgedThrough,
+				[]protocol.Envelope{result})
 		}
-		return nil, nil
+		return c.appendReplayPage(session, claims, acknowledgedThrough, nil)
 	case "webrtc.offer":
 		offer, err := protocol.DecodePayload[protocol.WebRTCOffer](envelope)
 		if err != nil || offer.SDP == "" {
@@ -605,8 +681,10 @@ func (c *Coordinator) OnWebRTCState(sessionID string, state pion.PeerConnectionS
 	}
 	snapshot := machine.Snapshot()
 	session.mu.Unlock()
-	_ = c.store.SaveCall(context.Background(), sessionID, session.claims.AgentInstanceID, snapshot, c.now())
-	_ = c.emitCallEnded(context.Background(), session, snapshot)
+	if err := c.emitCallEnded(context.Background(), session, snapshot); err != nil {
+		c.logger.Error("persist WebRTC failure terminal event failed", "callId", snapshot.CallID,
+			"reason", "call_lifecycle_store_unavailable")
+	}
 	_ = c.sip.Hangup(context.Background(), sessionID, snapshot.CallID)
 	c.closeCallMedia(session, snapshot.CallID)
 }
@@ -966,11 +1044,6 @@ func (c *Coordinator) startCall(ctx context.Context, session *runtimeSession, en
 	session.callContext = ""
 	session.callCommand = ""
 	session.mu.Unlock()
-	if err := c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, machine.Snapshot(), c.now()); err != nil {
-		c.discardCall(session, machine)
-		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, "call_persistence_failed", c.now())
-		return nil, commandError{"call_persistence_failed"}
-	}
 	if err := machine.BeginAuthorization(); err != nil {
 		c.releaseCallOwner(command.CallID)
 		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, "call_state_conflict", c.now())
@@ -985,8 +1058,6 @@ func (c *Coordinator) startCall(ctx context.Context, session *runtimeSession, en
 	if err != nil || authorization.Destination == "" {
 		c.observeCapability("call", "rejected")
 		machine.AuthorizationFailed(c.now())
-		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID,
-			machine.Snapshot(), c.now())
 		c.discardCall(session, machine)
 		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil,
 			"call_authorization_failed", c.now())
@@ -999,7 +1070,7 @@ func (c *Coordinator) startCall(ctx context.Context, session *runtimeSession, en
 	session.mu.Unlock()
 	createdPayload := callEventPayload(createdSnapshot, authorization.Destination,
 		command.CallContextID, command.CommandID)
-	if _, err := c.emit(ctx, session, "call.created", createdPayload,
+	if _, err := c.persistCallState(ctx, session, machine.Snapshot(), "call.created", createdPayload,
 		"call-created:"+command.CallID); err != nil {
 		c.logger.Error("persist call.created event failed", "callId", command.CallID, "error", err)
 		c.failCallBeforeInvite(ctx, session, machine, command.CommandID, "event_outbox_failed", false)
@@ -1015,7 +1086,6 @@ func (c *Coordinator) startCall(ctx context.Context, session *runtimeSession, en
 		}
 		machine.AuthorizationFailed(c.now())
 		c.releaseCallOwner(command.CallID)
-		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, machine.Snapshot(), c.now())
 		_ = c.emitCallEnded(ctx, session, machine.Snapshot())
 		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, "call_authorization_failed", c.now())
 		return nil, commandError{"call_authorization_failed"}
@@ -1027,11 +1097,8 @@ func (c *Coordinator) startCall(ctx context.Context, session *runtimeSession, en
 		return nil, commandError{"call_state_conflict"}
 	}
 	dialing := machine.Snapshot()
-	if err := c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, dialing, c.now()); err != nil {
-		c.failCallBeforeInvite(ctx, session, machine, command.CommandID, "call_persistence_failed", true)
-		return nil, commandError{"call_persistence_failed"}
-	}
-	if _, err := c.emit(ctx, session, "call.state_changed", dialing, "call-dialing:"+command.CallID); err != nil {
+	if _, err := c.persistCallState(ctx, session, dialing, "call.state_changed", dialing,
+		"call-dialing:"+command.CallID); err != nil {
 		c.logger.Error("persist outbound dialing event failed", "callId", command.CallID, "error", err)
 		c.failCallBeforeInvite(ctx, session, machine, command.CommandID, "event_outbox_failed", true)
 		return nil, commandError{"event_outbox_failed"}
@@ -1041,7 +1108,6 @@ func (c *Coordinator) startCall(ctx context.Context, session *runtimeSession, en
 		c.logger.Error("setup outbound call media failed", "callId", command.CallID, "error", err)
 		c.closeCallMedia(session, command.CallID)
 		machine.RemoteHangup(call.EndMediaFailed, c.now())
-		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, machine.Snapshot(), c.now())
 		_ = c.emitCallEnded(ctx, session, machine.Snapshot())
 		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, "media_not_ready", c.now())
 		return nil, commandError{"media_not_ready"}
@@ -1060,7 +1126,6 @@ func (c *Coordinator) startCall(ctx context.Context, session *runtimeSession, en
 		}
 		c.closeCallMedia(session, command.CallID)
 		machine.RemoteHangup(call.EndSIPFailed, c.now())
-		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, machine.Snapshot(), c.now())
 		_ = c.emitCallEnded(ctx, session, machine.Snapshot())
 		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, errorCode, c.now())
 		return nil, commandError{errorCode}
@@ -1094,12 +1159,15 @@ func (c *Coordinator) hangup(ctx context.Context, session *runtimeSession, envel
 	if !emitted {
 		return c.finishCommand(ctx, command.CommandID, "call.hangup")
 	}
-	_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, ending, c.now())
-	_, _ = c.emit(ctx, session, "call.state_changed", ending, "call-ending:"+command.CallID)
+	if _, err := c.persistCallState(ctx, session, ending, "call.state_changed", ending,
+		"call-ending:"+command.CallID); err != nil {
+		c.failCallBeforeInvite(ctx, session, machine, command.CommandID, "event_outbox_failed", true)
+		_ = c.sip.Hangup(ctx, session.claims.SessionID, command.CallID)
+		return nil, commandError{"event_outbox_failed"}
+	}
 	sipErr := c.sip.Hangup(ctx, session.claims.SessionID, command.CallID)
 	if machine.CompleteEnding(call.EndLocalHangup, c.now()) {
 		snapshot := machine.Snapshot()
-		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now())
 		_ = c.emitCallEnded(ctx, session, snapshot)
 	}
 	c.closeCallMedia(session, command.CallID)
@@ -1138,11 +1206,8 @@ func (c *Coordinator) answer(ctx context.Context, session *runtimeSession, envel
 	snapshot := machine.Snapshot()
 	localSDP := append([]byte(nil), media.localSDP...)
 	session.mu.Unlock()
-	if err := c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now()); err != nil {
-		c.failCallBeforeAnswer(ctx, session, machine, command.CommandID, "call_persistence_failed")
-		return nil, commandError{"call_persistence_failed"}
-	}
-	if _, err := c.emit(ctx, session, "call.state_changed", snapshot, "call-answering:"+command.CallID); err != nil {
+	if _, err := c.persistCallState(ctx, session, snapshot, "call.state_changed", snapshot,
+		"call-answering:"+command.CallID); err != nil {
 		c.failCallBeforeAnswer(ctx, session, machine, command.CommandID, "event_outbox_failed")
 		return nil, commandError{"event_outbox_failed"}
 	}
@@ -1150,7 +1215,6 @@ func (c *Coordinator) answer(ctx context.Context, session *runtimeSession, envel
 		machine.RemoteHangup(call.EndSIPFailed, c.now())
 		failed := machine.Snapshot()
 		c.closeCallMedia(session, command.CallID)
-		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, failed, c.now())
 		_ = c.emitCallEnded(ctx, session, failed)
 		_ = c.store.FinishCommand(ctx, command.CommandID, store.CommandFailed, nil, "sip_answer_failed", c.now())
 		return nil, commandError{"sip_answer_failed"}
@@ -1182,12 +1246,14 @@ func (c *Coordinator) reject(ctx context.Context, session *runtimeSession, envel
 	ending := machine.Snapshot()
 	session.mu.Unlock()
 	if emitted {
-		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, ending, c.now())
-		_, _ = c.emit(ctx, session, "call.state_changed", ending, "call-ending:"+command.CallID)
+		if _, err := c.persistCallState(ctx, session, ending, "call.state_changed", ending,
+			"call-ending:"+command.CallID); err != nil {
+			c.failCallBeforeAnswer(ctx, session, machine, command.CommandID, "event_outbox_failed")
+			return nil, commandError{"event_outbox_failed"}
+		}
 		sipErr := c.sip.Reject(ctx, session.claims.SessionID, command.CallID, 486)
 		if machine.CompleteEnding(call.EndRejected, c.now()) {
 			snapshot := machine.Snapshot()
-			_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now())
 			_ = c.emitCallEnded(ctx, session, snapshot)
 		}
 		c.closeCallMedia(session, command.CallID)
@@ -1323,10 +1389,50 @@ func (c *Coordinator) applySIPEvent(event sip.Event) {
 		}
 	case sip.EventIncoming:
 		c.applyIncomingCall(session, event)
+	case sip.EventMediaUpdated:
+		c.applyMediaUpdate(session, event)
 	case sip.EventTrying, sip.EventRinging, sip.EventEarlyMedia, sip.EventConnected,
 		sip.EventEnded, sip.EventFailed:
 		c.applyCallEvent(session, event)
 	}
+}
+
+func (c *Coordinator) applyMediaUpdate(session *runtimeSession, event sip.Event) {
+	session.callMu.Lock()
+	if !c.isCurrentSession(session) {
+		session.callMu.Unlock()
+		return
+	}
+	session.mu.Lock()
+	machine := session.activeCall
+	media := session.activeMedia
+	valid := machine != nil && machine.Snapshot().CallID == event.CallID &&
+		machine.Snapshot().State == call.StateConnected && media != nil && media.callID == event.CallID
+	if !valid {
+		session.mu.Unlock()
+		session.callMu.Unlock()
+		return
+	}
+	codec := media.codec.Name
+	session.mu.Unlock()
+	remote, err := sip.ParseRemoteSDPForCodec(event.RemoteSDP, codec)
+	if err == nil {
+		err = c.media.SetRemote(event.CallID,
+			&net.UDPAddr{IP: net.ParseIP(remote.IP), Port: int(remote.Port)},
+			&net.UDPAddr{IP: net.ParseIP(remote.RTCPIP), Port: int(remote.RTCPPort)})
+	}
+	session.callMu.Unlock()
+	if err != nil {
+		c.logger.Warn("SIP in-dialog media update failed", "callId", event.CallID,
+			"reason", "media_remote_invalid")
+		c.applyCallEvent(session, sip.Event{
+			Type: sip.EventFailed, SessionID: event.SessionID,
+			CallID: event.CallID, Reason: "media_failed",
+		})
+		return
+	}
+	c.logger.Info("SIP in-dialog media target updated", "callId", event.CallID,
+		"codec", remote.Codec)
 }
 
 func (c *Coordinator) applyIncomingCall(session *runtimeSession, event sip.Event) {
@@ -1413,39 +1519,24 @@ func (c *Coordinator) applyIncomingCall(session *runtimeSession, event sip.Event
 		return
 	}
 	incoming := machine.Snapshot()
-	if err := c.store.SaveCall(context.Background(), event.SessionID, session.claims.AgentInstanceID, incoming, c.now()); err != nil {
-		c.logger.Error("persist inbound call failed", "callId", event.CallID,
-			"reason", "call_store_unavailable")
-		machine.RemoteHangup(call.EndAPIUnavailable, c.now())
-		c.discardCall(session, machine)
-		_ = c.sip.Reject(context.Background(), event.SessionID, event.CallID, 500)
-		c.closeCallMedia(session, event.CallID)
-		return
-	}
 	payload := map[string]any{
 		"callId": created.CallID, "direction": created.Direction, "state": created.State,
 		"createdAtUtc": created.CreatedAt, "revision": created.Revision,
 		"remoteParty": event.RemoteParty,
 	}
-	if _, err := c.emit(context.Background(), session, "call.created", payload, "call-created:"+event.CallID); err != nil {
-		c.logger.Error("persist inbound call.created event failed", "callId", event.CallID,
-			"reason", "event_outbox_unavailable")
+	if _, err := c.persistCallEvents(context.Background(), session, incoming,
+		durableCallEvent{eventType: "call.created", payload: payload,
+			eventKey: "call-created:" + event.CallID},
+		durableCallEvent{eventType: "call.state_changed", payload: incoming,
+			eventKey: "call-incoming:" + event.CallID},
+	); err != nil {
+		c.logger.Error("persist inbound call lifecycle failed", "callId", event.CallID,
+			"reason", "call_lifecycle_store_unavailable")
 		machine.RemoteHangup(call.EndAPIUnavailable, c.now())
-		terminal := machine.Snapshot()
-		_ = c.store.SaveCall(context.Background(), event.SessionID, session.claims.AgentInstanceID, terminal, c.now())
+		c.discardCall(session, machine)
 		_ = c.sip.Reject(context.Background(), event.SessionID, event.CallID, 500)
 		c.closeCallMedia(session, event.CallID)
 		return
-	}
-	if _, err := c.emit(context.Background(), session, "call.state_changed", incoming, "call-incoming:"+event.CallID); err != nil {
-		c.logger.Error("persist inbound incoming event failed", "callId", event.CallID,
-			"reason", "event_outbox_unavailable")
-		machine.RemoteHangup(call.EndAPIUnavailable, c.now())
-		terminal := machine.Snapshot()
-		_ = c.store.SaveCall(context.Background(), event.SessionID, session.claims.AgentInstanceID, terminal, c.now())
-		_ = c.emitCallEnded(context.Background(), session, terminal)
-		_ = c.sip.Reject(context.Background(), event.SessionID, event.CallID, 500)
-		c.closeCallMedia(session, event.CallID)
 	}
 }
 
@@ -1461,23 +1552,28 @@ func (c *Coordinator) applyCallEvent(session *runtimeSession, event sip.Event) {
 		session.mu.Unlock()
 		return
 	}
+	previous := machine.Snapshot()
+	nextMachine, err := call.Restore(previous)
+	if err != nil {
+		session.mu.Unlock()
+		return
+	}
 	eventType := "call.state_changed"
 	closeMedia := false
 	hangupSIP := false
-	previousRevision := machine.Snapshot().Revision
 	switch event.Type {
 	case sip.EventTrying:
-		if err := machine.MarkTrying(); err != nil {
+		if err := nextMachine.MarkTrying(); err != nil {
 			session.mu.Unlock()
 			return
 		}
 	case sip.EventRinging:
-		if err := machine.MarkRinging(); err != nil {
+		if err := nextMachine.MarkRinging(); err != nil {
 			session.mu.Unlock()
 			return
 		}
 	case sip.EventEarlyMedia:
-		if err := machine.MarkRinging(); err != nil {
+		if err := nextMachine.MarkRinging(); err != nil {
 			session.mu.Unlock()
 			return
 		}
@@ -1510,7 +1606,7 @@ func (c *Coordinator) applyCallEvent(session *runtimeSession, event sip.Event) {
 		session.earlyMediaAudibleCallID = ""
 		session.earlyMediaStatusCode = 0
 		media := session.activeMedia
-		snapshot := machine.Snapshot()
+		snapshot := nextMachine.Snapshot()
 		mediaReady := media != nil && media.callID == event.CallID
 		if mediaReady && snapshot.Direction == call.Outbound {
 			if len(event.RemoteSDP) == 0 {
@@ -1527,45 +1623,61 @@ func (c *Coordinator) applyCallEvent(session *runtimeSession, event sip.Event) {
 		// so parsing event.RemoteSDP here would incorrectly terminalize every
 		// answered inbound call as media_failed.
 		if !mediaReady {
-			machine.RemoteHangup(call.EndMediaFailed, c.now())
+			nextMachine.RemoteHangup(call.EndMediaFailed, c.now())
 			eventType = "call.ended"
 			closeMedia = true
 			hangupSIP = true
 		} else {
-			if err := machine.Connected(c.now()); err != nil {
+			if err := nextMachine.Connected(c.now()); err != nil {
 				session.mu.Unlock()
 				return
 			}
 		}
 	case sip.EventEnded:
-		machine.RemoteHangup(endReason(event.Reason), c.now())
+		nextMachine.RemoteHangup(endReason(event.Reason), c.now())
 		eventType = "call.ended"
 		closeMedia = true
 	case sip.EventFailed:
-		machine.RemoteHangup(failedEndReason(event.Reason), c.now())
+		nextMachine.RemoteHangup(failedEndReason(event.Reason), c.now())
 		eventType = "call.ended"
 		closeMedia = true
 	}
-	snapshot := machine.Snapshot()
+	snapshot := nextMachine.Snapshot()
 	session.mu.Unlock()
-	if snapshot.Revision == previousRevision {
+	if snapshot.Revision == previous.Revision {
 		return
 	}
-	if err := c.store.SaveCall(context.Background(), session.claims.SessionID,
-		session.claims.AgentInstanceID, snapshot, c.now()); err != nil {
-		c.logger.Error("persist asynchronous call state failed", "callId", event.CallID,
-			"state", snapshot.State, "reason", "call_store_unavailable")
-	}
+	var persistErr error
 	if eventType == "call.ended" {
-		if err := c.emitCallEnded(context.Background(), session, snapshot); err != nil {
-			c.logger.Error("persist asynchronous call ended event failed", "callId", event.CallID,
-				"reason", "event_outbox_unavailable")
-		}
+		persistErr = c.emitCallEnded(context.Background(), session, snapshot)
 	} else {
-		if _, err := c.emit(context.Background(), session, eventType, snapshot, ""); err != nil {
-			c.logger.Error("persist asynchronous call state event failed", "callId", event.CallID,
-				"state", snapshot.State, "reason", "event_outbox_unavailable")
+		_, persistErr = c.persistCallState(context.Background(), session, snapshot, eventType, snapshot, "")
+	}
+	if persistErr != nil {
+		c.logger.Error("persist asynchronous call transition failed", "callId", event.CallID,
+			"state", snapshot.State, "reason", "call_lifecycle_store_unavailable")
+		// Terminalize from the last durable state. API transition rules allow every
+		// active state to end, so a transient write failure cannot create a gap.
+		machine.RemoteHangup(call.EndAPIUnavailable, c.now())
+		terminal := machine.Snapshot()
+		session.mu.Lock()
+		if session.activeCall == machine {
+			session.activeCall = machine
 		}
+		session.mu.Unlock()
+		if terminalErr := c.emitCallEnded(context.Background(), session, terminal); terminalErr != nil {
+			c.logger.Error("persist fail-safe terminal call event failed", "callId", event.CallID,
+				"reason", "call_lifecycle_store_unavailable")
+			go c.removeSession(session.claims.SessionID)
+		}
+		hangupSIP = true
+		closeMedia = true
+	} else {
+		session.mu.Lock()
+		if session.activeCall == machine {
+			session.activeCall = nextMachine
+		}
+		session.mu.Unlock()
 	}
 	if hangupSIP {
 		_ = c.sip.Hangup(context.Background(), session.claims.SessionID, event.CallID)
@@ -1683,9 +1795,10 @@ func (c *Coordinator) failCallBeforeInvite(
 ) {
 	machine.RemoteHangup(call.EndAPIUnavailable, c.now())
 	snapshot := machine.Snapshot()
-	_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now())
 	if lifecycleStarted {
 		_ = c.emitCallEnded(ctx, session, snapshot)
+	} else {
+		_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now())
 	}
 	c.closeCallMedia(session, snapshot.CallID)
 	_ = c.store.FinishCommand(ctx, commandID, store.CommandFailed, nil, errorCode, c.now())
@@ -1700,7 +1813,6 @@ func (c *Coordinator) failCallBeforeAnswer(
 ) {
 	machine.RemoteHangup(call.EndAPIUnavailable, c.now())
 	snapshot := machine.Snapshot()
-	_ = c.store.SaveCall(ctx, session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now())
 	_ = c.emitCallEnded(ctx, session, snapshot)
 	_ = c.sip.Reject(ctx, session.claims.SessionID, snapshot.CallID, 500)
 	c.closeCallMedia(session, snapshot.CallID)
@@ -1971,8 +2083,10 @@ func (c *Coordinator) terminateSession(session *runtimeSession, reason call.EndR
 	session.registration = "idle"
 	session.mu.Unlock()
 	if snapshot.CallID != "" {
-		_ = c.store.SaveCall(context.Background(), session.claims.SessionID, session.claims.AgentInstanceID, snapshot, c.now())
-		_ = c.emitCallEnded(context.Background(), session, snapshot)
+		if err := c.emitCallEnded(context.Background(), session, snapshot); err != nil {
+			c.logger.Error("persist session terminal call event failed", "callId", snapshot.CallID,
+				"reason", "call_lifecycle_store_unavailable")
+		}
 		_ = c.sip.Hangup(context.Background(), session.claims.SessionID, snapshot.CallID)
 		c.closeCallMedia(session, snapshot.CallID)
 	}
@@ -1981,13 +2095,75 @@ func (c *Coordinator) terminateSession(session *runtimeSession, reason call.EndR
 }
 
 func (c *Coordinator) emitCallEnded(ctx context.Context, session *runtimeSession, snapshot call.Snapshot) error {
+	_, err := c.persistCallEvents(ctx, session, snapshot,
+		durableCallEvent{eventType: "call.state_changed", payload: snapshot,
+			eventKey: "call-ended-state:" + snapshot.CallID},
+		durableCallEvent{eventType: "call.ended", payload: snapshot,
+			eventKey: "call-ended:" + snapshot.CallID},
+	)
+	return err
+}
+
+func (c *Coordinator) persistCallState(
+	ctx context.Context,
+	session *runtimeSession,
+	snapshot call.Snapshot,
+	eventType string,
+	payload any,
+	eventKey string,
+) (protocol.Envelope, error) {
+	events, err := c.persistCallEvents(ctx, session, snapshot, durableCallEvent{
+		eventType: eventType, payload: payload, eventKey: eventKey,
+	})
+	if err != nil {
+		return protocol.Envelope{}, err
+	}
+	return events[0], nil
+}
+
+func (c *Coordinator) persistCallEvents(
+	ctx context.Context,
+	session *runtimeSession,
+	snapshot call.Snapshot,
+	events ...durableCallEvent,
+) ([]protocol.Envelope, error) {
 	session.eventMu.Lock()
 	defer session.eventMu.Unlock()
-	if _, err := c.emitLocked(ctx, session, "call.state_changed", snapshot, "call-ended-state:"+snapshot.CallID); err != nil {
-		return err
+	writes := make([]store.EventWrite, len(events))
+	for index, event := range events {
+		raw, err := json.Marshal(event.payload)
+		if err != nil {
+			return nil, err
+		}
+		writes[index] = store.EventWrite{Key: event.eventKey, Type: event.eventType, Payload: raw}
 	}
-	_, err := c.emitLocked(ctx, session, "call.ended", snapshot, "call-ended:"+snapshot.CallID)
-	return err
+	stored, err := c.store.SaveCallWithEvents(ctx, session.claims.SessionID,
+		session.claims.AgentInstanceID, snapshot, writes, c.now())
+	if err != nil {
+		return nil, err
+	}
+	envelopes := make([]protocol.Envelope, 0, len(stored))
+	for _, event := range stored {
+		envelope, err := replayEnvelope(event)
+		if err != nil {
+			return envelopes, err
+		}
+		envelopes = append(envelopes, envelope)
+		c.publishDurable(session.claims.SessionID, envelope, event.Sequence)
+	}
+	if c.observer != nil {
+		for _, event := range events {
+			switch {
+			case event.eventType == "call.state_changed" && snapshot.State == call.StateConnected &&
+				snapshot.ConnectedAt != nil:
+				c.observer.ObserveCallConnected(string(snapshot.Direction),
+					snapshot.ConnectedAt.Sub(snapshot.CreatedAt))
+			case event.eventType == "call.ended":
+				c.observer.ObserveCallEnded(string(snapshot.Direction), string(snapshot.EndReason))
+			}
+		}
+	}
+	return envelopes, nil
 }
 
 func (c *Coordinator) emit(ctx context.Context, session *runtimeSession, eventType string, payload any, eventKey string) (protocol.Envelope, error) {
@@ -2017,7 +2193,7 @@ func (c *Coordinator) emitLocked(ctx context.Context, session *runtimeSession, e
 	}
 	envelope, err := replayEnvelope(stored)
 	if err == nil {
-		c.publish(session.claims.SessionID, envelope)
+		c.publishDurable(session.claims.SessionID, envelope, stored.Sequence)
 	}
 	return envelope, err
 }
@@ -2052,11 +2228,26 @@ func replayEnvelope(event store.Event) (protocol.Envelope, error) {
 }
 
 func (c *Coordinator) publish(sessionID string, event protocol.Envelope) {
+	c.publishWithReplayPolicy(sessionID, event, 0)
+}
+
+func (c *Coordinator) publishDurable(sessionID string, event protocol.Envelope, sequence uint64) {
+	c.publishWithReplayPolicy(sessionID, event, sequence)
+}
+
+func (c *Coordinator) publishWithReplayPolicy(sessionID string, event protocol.Envelope, durableSequence uint64) {
 	session, err := c.session(sessionID)
 	if err != nil {
 		return
 	}
 	session.mu.Lock()
+	if durableSequence != 0 && session.replayActive {
+		// The committed event is intentionally not copied into the live queue. It
+		// will be selected from the durable outbox after the current page is ACKed,
+		// preserving strict sequence ordering across reconnect and concurrent calls.
+		session.mu.Unlock()
+		return
+	}
 	live := session.live
 	if live == nil {
 		session.mu.Unlock()
@@ -2064,6 +2255,9 @@ func (c *Coordinator) publish(sessionID string, event protocol.Envelope) {
 	}
 	select {
 	case live <- event:
+		if durableSequence > session.replayCursor {
+			session.replayCursor = durableSequence
+		}
 		session.mu.Unlock()
 	default:
 		// Never silently drop signaling. Closing the stream forces a reconnect,

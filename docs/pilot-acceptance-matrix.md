@@ -47,6 +47,11 @@ P1 engineering scope ปิดรับมอบเมื่อ 18/10/2026 แ�
 | OPS-01 | alerts/dashboard/diagnostics/rollback drill | alert screenshots/export, sanitized bundle, explicit runtime switch timeline | PENDING |
 | REL-01 | Authenticode/SBOM/license/security approval | signature verify, clean-source release manifest/binary version binding, checksums, SBOM review and approvals | PENDING |
 
+Automated stabilization วันที่ 19/10/2026 เพิ่ม regression coverage สำหรับ lifecycle atomicity, replay,
+PRACK, UPDATE, re-INVITE/offerless re-INVITE, Require policy และ Gateway event contract แล้ว แต่หลักฐานนี้
+ไม่เปลี่ยนสถานะ SIP/WEB/EVT/LOAD/SOAK ด้านบน: แต่ละ gate ยังต้องเก็บ trace จาก Windows Server,
+Issabel/Asterisk และ browser จริงตาม Required evidence ก่อน rollout
+
 ## Commands and evidence layout
 
 Build the release with required signature, then run on the clean VM:

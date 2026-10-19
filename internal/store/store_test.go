@@ -469,7 +469,7 @@ VALUES('call-legacy', 'session-legacy', X'7B7D', 0, '2026-10-17T00:00:00Z');`)
 	}
 }
 
-func TestRestartTerminalEventIsCreatedOnce(t *testing.T) {
+func TestRestartTerminalLifecycleIsCreatedOnce(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t, 10, 100)
 	now := time.Now().UTC()
@@ -486,7 +486,8 @@ func TestRestartTerminalEventIsCreatedOnce(t *testing.T) {
 		t.Fatalf("second recovery: count=%d err=%v", count, err)
 	}
 	events, err := store.PendingEvents(ctx, "session-1", 0, 10)
-	if err != nil || len(events) != 1 || events[0].Type != "call.ended" {
+	if err != nil || len(events) != 2 || events[0].Type != "call.state_changed" ||
+		events[1].Type != "call.ended" || events[1].Sequence != events[0].Sequence+1 {
 		t.Fatalf("unexpected restart events: %+v %v", events, err)
 	}
 }
@@ -506,8 +507,114 @@ func TestRestartTerminalEventContinuesThePersistedAgentSequence(t *testing.T) {
 		t.Fatalf("recovery: count=%d err=%v", count, err)
 	}
 	events, err := store.PendingEvents(ctx, "session-active", 0, 10)
-	if err != nil || len(events) != 1 || events[0].Sequence != 2 {
+	if err != nil || len(events) != 2 || events[0].Sequence != 2 || events[1].Sequence != 3 ||
+		events[0].Type != "call.state_changed" || events[1].Type != "call.ended" {
 		t.Fatalf("restart event did not continue agent sequence: events=%+v err=%v", events, err)
+	}
+}
+
+func TestRestartTerminalLifecycleRollsBackWhenPairCannotFit(t *testing.T) {
+	ctx := context.Background()
+	database := openTestStore(t, 2, 10)
+	now := time.Now().UTC()
+	if _, err := database.AppendEvent(ctx, "session-1", "agent-1", "existing",
+		"registration.state_changed", []byte(`{"state":"registered"}`), now); err != nil {
+		t.Fatal(err)
+	}
+	machine, _ := call.NewInbound("call-restart-capacity", now)
+	if err := database.SaveCall(ctx, "session-1", "agent-1", machine.Snapshot(), now); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := database.RecoverRestartedCalls(ctx, now.Add(time.Second)); !errors.Is(err, ErrCapacity) || count != 0 {
+		t.Fatalf("recovery count=%d err=%v, want atomic capacity failure", count, err)
+	}
+	events, err := database.PendingEvents(ctx, "session-1", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Type != "registration.state_changed" {
+		t.Fatalf("partial restart lifecycle escaped rolled-back transaction: %+v", events)
+	}
+}
+
+func TestSaveCallWithEventsCommitsSnapshotAndOrderedOutboxAtomically(t *testing.T) {
+	ctx := context.Background()
+	database := openTestStore(t, 10, 100)
+	now := time.Now().UTC()
+	if err := database.BindSession(ctx, "session-1", "agent-1", "user-session-1",
+		"collection-1", "binding-1", now); err != nil {
+		t.Fatal(err)
+	}
+	machine, _ := call.NewOutbound("call-atomic", now)
+	if err := machine.BeginAuthorization(); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := database.SaveCallWithEvents(ctx, "session-1", "agent-1", machine.Snapshot(), []EventWrite{
+		{Key: "created-atomic", Type: "call.created", Payload: []byte(`{"state":"created"}`)},
+		{Key: "authorizing-atomic", Type: "call.state_changed", Payload: []byte(`{"state":"authorizing"}`)},
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 2 || stored[0].Sequence != 1 || stored[1].Sequence != 2 ||
+		stored[0].CollectionID != "collection-1" || stored[1].CollectionBindingID != "binding-1" {
+		t.Fatalf("unexpected atomic events: %+v", stored)
+	}
+	var raw []byte
+	if err := database.db.QueryRowContext(ctx,
+		`SELECT snapshot_json FROM calls WHERE call_id='call-atomic'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var snapshot call.Snapshot
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.State != call.StateAuthorizing || snapshot.Revision != 2 {
+		t.Fatalf("unexpected stored snapshot: %+v", snapshot)
+	}
+}
+
+func TestSaveCallWithEventsRollsBackSnapshotAndAllEventsOnFailure(t *testing.T) {
+	ctx := context.Background()
+	database := openTestStore(t, 10, 100)
+	now := time.Now().UTC()
+	machine, _ := call.NewOutbound("call-rollback", now)
+	if err := database.SaveCall(ctx, "session-1", "agent-1", machine.Snapshot(), now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.AppendEvent(ctx, "session-1", "agent-1", "duplicate-key",
+		"call.created", []byte(`{"state":"created"}`), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := machine.BeginAuthorization(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := database.SaveCallWithEvents(ctx, "session-1", "agent-1", machine.Snapshot(), []EventWrite{
+		{Key: "would-be-inserted", Type: "call.state_changed", Payload: []byte(`{"state":"authorizing"}`)},
+		{Key: "duplicate-key", Type: "call.state_changed", Payload: []byte(`{"state":"authorizing"}`)},
+	}, now.Add(time.Second))
+	if err == nil {
+		t.Fatal("expected duplicate event key to roll back the transaction")
+	}
+	var raw []byte
+	if err := database.db.QueryRowContext(ctx,
+		`SELECT snapshot_json FROM calls WHERE call_id='call-rollback'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var snapshot call.Snapshot
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.State != call.StateCreated || snapshot.Revision != 1 {
+		t.Fatalf("call snapshot escaped rolled-back transaction: %+v", snapshot)
+	}
+	var count int
+	if err := database.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM outbox WHERE event_key='would-be-inserted'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("partial event escaped rolled-back transaction: count=%d", count)
 	}
 }
 
@@ -571,6 +678,17 @@ func TestByteReserveThresholdRoundsUpToNinetyPercent(t *testing.T) {
 		if got := atOrAboveReserve64(test.value, test.limit); got != test.want {
 			t.Errorf("atOrAboveReserve64(%d, %d)=%v, want %v", test.value, test.limit, got, test.want)
 		}
+	}
+}
+
+func TestEventReserveThresholdAvoidsIntegerOverflow(t *testing.T) {
+	limit := int(^uint(0) >> 1)
+	cutoff := limit - limit/10
+	if atOrAboveReserve(cutoff-1, limit) {
+		t.Fatal("event reserve started below the ninety-percent cutoff")
+	}
+	if !atOrAboveReserve(cutoff, limit) {
+		t.Fatal("event reserve did not start at the ninety-percent cutoff")
 	}
 }
 
