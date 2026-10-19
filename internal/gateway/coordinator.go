@@ -656,6 +656,7 @@ func (c *Coordinator) OnPBXRTP(callID string, packet *rtp.Packet) {
 	}
 	session.mu.Lock()
 	media := session.activeMedia
+	earlyMediaStatusCode := session.earlyMediaStatusCode
 	session.mu.Unlock()
 	if media == nil || media.callID != callID {
 		return
@@ -674,6 +675,13 @@ func (c *Coordinator) OnPBXRTP(callID string, packet *rtp.Packet) {
 	if packet.PayloadType != media.sipAudioPayload {
 		return
 	}
+	// A 180 response asks the client to present local ringing. Continue
+	// forwarding its RTP for compatibility, but only 183/other progress media
+	// can replace browser-generated ringback.
+	if earlyMediaStatusCode == 180 {
+		media.audibleRTPStreak = 0
+		return
+	}
 	if !gatewaymedia.HasAudibleG711(media.codec.Name, packet.Payload) {
 		media.audibleRTPStreak = 0
 		return
@@ -689,7 +697,8 @@ func (c *Coordinator) OnPBXRTP(callID string, packet *rtp.Packet) {
 	session.mu.Lock()
 	if session.activeMedia == media && session.earlyMediaCallID == callID &&
 		session.earlyMediaAudibleCallID != callID && session.activeCall != nil &&
-		session.activeCall.Snapshot().State == call.StateRinging {
+		session.activeCall.Snapshot().State == call.StateRinging &&
+		session.earlyMediaStatusCode != 180 {
 		session.earlyMediaAudibleCallID = callID
 		statusCode = session.earlyMediaStatusCode
 		publishEarlyMedia = true

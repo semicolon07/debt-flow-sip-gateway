@@ -807,7 +807,7 @@ func TestCoordinatorBridgesOutboundEarlyMediaBeforeAnswer(t *testing.T) {
 	remoteSDP := []byte("v=0\r\nc=IN IP4 10.0.0.20\r\nm=audio 20500 RTP/AVP 0 101\r\na=rtcp:30500 IN IP4 10.0.0.21\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n")
 	coordinator.applySIPEvent(sip.Event{
 		Type: sip.EventEarlyMedia, SessionID: claims.SessionID, CallID: callID,
-		StatusCode: 183, RemoteSDP: remoteSDP,
+		StatusCode: 180, RemoteSDP: remoteSDP,
 	})
 	for draining := true; draining; {
 		select {
@@ -845,6 +845,24 @@ func TestCoordinatorBridgesOutboundEarlyMediaBeforeAnswer(t *testing.T) {
 		}
 	default:
 	}
+
+	for range earlyMediaAudiblePacketThreshold {
+		coordinator.OnPBXRTP(callID, &rtp.Packet{
+			Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 22}, Payload: repeatedPayload(0x00, 160),
+		})
+	}
+	select {
+	case event := <-live:
+		if event.Type == "call.early_media" {
+			t.Fatal("180 Ringing RTP incorrectly replaced local ringback")
+		}
+	default:
+	}
+
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventEarlyMedia, SessionID: claims.SessionID, CallID: callID,
+		StatusCode: 183, RemoteSDP: remoteSDP,
+	})
 
 	coordinator.OnPBXRTP(callID, &rtp.Packet{
 		Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 22}, Payload: repeatedPayload(0xff, 160),
@@ -902,7 +920,7 @@ func TestCoordinatorBridgesOutboundEarlyMediaBeforeAnswer(t *testing.T) {
 	rtc.mu.Lock()
 	writeCount := len(rtc.writes)
 	rtc.mu.Unlock()
-	wantWriteCount := 2 + earlyMediaAudiblePacketThreshold
+	wantWriteCount := 2 + (2 * earlyMediaAudiblePacketThreshold)
 	if writeCount != wantWriteCount {
 		t.Fatalf("early media WebRTC writes=%d, want %d (DTMF + silence + sustained audio)",
 			writeCount, wantWriteCount)
