@@ -865,26 +865,32 @@ func (r *SIPGoRuntime) waitOutbound(ctx context.Context, callValue *sipgoCall, c
 			if response == nil {
 				return errors.New("SIP transaction returned an empty response")
 			}
-			switch response.StatusCode {
-			case sipmessage.StatusTrying:
+			if response.StatusCode == sipmessage.StatusTrying {
 				r.logger.Debug("outbound SIP provisional response",
 					"sessionId", callValue.sessionID, "callId", callValue.callID,
 					"callRef", callRef,
 					"sipStatusCode", response.StatusCode)
 				r.emit(Event{Type: EventTrying, SessionID: callValue.sessionID, CallID: callValue.callID, StatusCode: response.StatusCode})
-			case sipmessage.StatusRinging, sipmessage.StatusSessionInProgress:
-				r.logger.Info("outbound SIP call is progressing",
+			} else if response.IsProvisional() {
+				hasEarlyMedia := len(response.Body()) > 0
+				r.logger.Info("outbound SIP provisional response received",
+					"sessionId", callValue.sessionID, "callId", callValue.callID,
+					"callRef", callRef,
+					"sipStatusCode", response.StatusCode,
+					"earlyMedia", hasEarlyMedia)
+				if !hasEarlyMedia {
+					r.emit(Event{Type: EventRinging, SessionID: callValue.sessionID,
+						CallID: callValue.callID, StatusCode: response.StatusCode})
+					return nil
+				}
+				r.emit(Event{Type: EventEarlyMedia, SessionID: callValue.sessionID,
+					CallID: callValue.callID, StatusCode: response.StatusCode,
+					RemoteSDP: append([]byte(nil), response.Body()...)})
+			} else {
+				r.logger.Info("outbound SIP final response received",
 					"sessionId", callValue.sessionID, "callId", callValue.callID,
 					"callRef", callRef,
 					"sipStatusCode", response.StatusCode)
-				r.emit(Event{Type: EventRinging, SessionID: callValue.sessionID, CallID: callValue.callID, StatusCode: response.StatusCode})
-			default:
-				if !response.IsProvisional() {
-					r.logger.Info("outbound SIP final response received",
-						"sessionId", callValue.sessionID, "callId", callValue.callID,
-						"callRef", callRef,
-						"sipStatusCode", response.StatusCode)
-				}
 			}
 			return nil
 		},

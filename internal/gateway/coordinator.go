@@ -109,22 +109,23 @@ type RuntimeStats struct {
 }
 
 type runtimeSession struct {
-	mu           sync.Mutex
-	callMu       sync.Mutex
-	connectMu    sync.Mutex
-	eventMu      sync.Mutex
-	claims       Claims
-	sipConfig    sip.Configuration
-	live         chan protocol.Envelope
-	connected    bool
-	generation   uint64
-	registration string
-	activeCall   *call.Machine
-	remoteParty  string
-	callContext  string
-	callCommand  string
-	activeMedia  *callMedia
-	leaseExpires time.Time
+	mu               sync.Mutex
+	callMu           sync.Mutex
+	connectMu        sync.Mutex
+	eventMu          sync.Mutex
+	claims           Claims
+	sipConfig        sip.Configuration
+	live             chan protocol.Envelope
+	connected        bool
+	generation       uint64
+	registration     string
+	activeCall       *call.Machine
+	remoteParty      string
+	callContext      string
+	callCommand      string
+	earlyMediaCallID string
+	activeMedia      *callMedia
+	leaseExpires     time.Time
 }
 
 type callMedia struct {
@@ -610,8 +611,13 @@ func (c *Coordinator) OnBrowserRTP(sessionID string, packet *rtp.Packet) {
 	}
 	session.mu.Lock()
 	media := session.activeMedia
+	machine := session.activeCall
+	state := call.State("")
+	if machine != nil {
+		state = machine.Snapshot().State
+	}
 	session.mu.Unlock()
-	if media == nil {
+	if media == nil || state != call.StateConnected {
 		return
 	}
 	media.toSIPMu.Lock()
@@ -1267,7 +1273,8 @@ func (c *Coordinator) applySIPEvent(event sip.Event) {
 		}
 	case sip.EventIncoming:
 		c.applyIncomingCall(session, event)
-	case sip.EventTrying, sip.EventRinging, sip.EventConnected, sip.EventEnded, sip.EventFailed:
+	case sip.EventTrying, sip.EventRinging, sip.EventEarlyMedia, sip.EventConnected,
+		sip.EventEnded, sip.EventFailed:
 		c.applyCallEvent(session, event)
 	}
 }
@@ -1407,6 +1414,7 @@ func (c *Coordinator) applyCallEvent(session *runtimeSession, event sip.Event) {
 	eventType := "call.state_changed"
 	closeMedia := false
 	hangupSIP := false
+	earlyMediaActivated := false
 	previousRevision := machine.Snapshot().Revision
 	switch event.Type {
 	case sip.EventTrying:
@@ -1419,16 +1427,51 @@ func (c *Coordinator) applyCallEvent(session *runtimeSession, event sip.Event) {
 			session.mu.Unlock()
 			return
 		}
+	case sip.EventEarlyMedia:
+		if err := machine.MarkRinging(); err != nil {
+			session.mu.Unlock()
+			return
+		}
+		media := session.activeMedia
+		if media == nil || media.callID != event.CallID {
+			c.logger.Warn("outbound SIP early media ignored", "callId", event.CallID,
+				"reason", "media_not_ready", "sipStatusCode", event.StatusCode)
+			break
+		}
+		remote, err := sip.ParseRemoteSDPForCodec(event.RemoteSDP, media.codec.Name)
+		if err != nil {
+			c.logger.Warn("outbound SIP early media ignored", "callId", event.CallID,
+				"reason", "invalid_sdp", "sipStatusCode", event.StatusCode)
+			break
+		}
+		if err := c.media.SetRemote(event.CallID,
+			&net.UDPAddr{IP: net.ParseIP(remote.IP), Port: int(remote.Port)},
+			&net.UDPAddr{IP: net.ParseIP(remote.RTCPIP), Port: int(remote.RTCPPort)}); err != nil {
+			c.logger.Warn("outbound SIP early media ignored", "callId", event.CallID,
+				"reason", "media_remote_invalid", "sipStatusCode", event.StatusCode)
+			break
+		}
+		if session.earlyMediaCallID != event.CallID {
+			session.earlyMediaCallID = event.CallID
+			earlyMediaActivated = true
+		}
+		c.logger.Info("outbound SIP early media activated", "callId", event.CallID,
+			"sipStatusCode", event.StatusCode, "codec", remote.Codec)
 	case sip.EventConnected:
+		hadEarlyMedia := session.earlyMediaCallID == event.CallID
+		session.earlyMediaCallID = ""
 		media := session.activeMedia
 		snapshot := machine.Snapshot()
 		mediaReady := media != nil && media.callID == event.CallID
 		if mediaReady && snapshot.Direction == call.Outbound {
-			remote, err := sip.ParseRemoteSDP(event.RemoteSDP)
-			mediaReady = err == nil && remote.Codec == media.codec.Name &&
-				c.media.SetRemote(event.CallID,
+			if len(event.RemoteSDP) == 0 {
+				mediaReady = hadEarlyMedia
+			} else {
+				remote, err := sip.ParseRemoteSDPForCodec(event.RemoteSDP, media.codec.Name)
+				mediaReady = err == nil && c.media.SetRemote(event.CallID,
 					&net.UDPAddr{IP: net.ParseIP(remote.IP), Port: int(remote.Port)},
 					&net.UDPAddr{IP: net.ParseIP(remote.RTCPIP), Port: int(remote.RTCPPort)}) == nil
+			}
 		}
 		// Inbound RTP/RTCP and codec were validated and bound from the INVITE in
 		// applyIncomingCall. A UAS 200 response does not contain a new remote SDP,
@@ -1457,6 +1500,9 @@ func (c *Coordinator) applyCallEvent(session *runtimeSession, event sip.Event) {
 	snapshot := machine.Snapshot()
 	session.mu.Unlock()
 	if snapshot.Revision == previousRevision {
+		if earlyMediaActivated {
+			c.publishCallEarlyMedia(session, event)
+		}
 		return
 	}
 	if err := c.store.SaveCall(context.Background(), session.claims.SessionID,
@@ -1474,6 +1520,9 @@ func (c *Coordinator) applyCallEvent(session *runtimeSession, event sip.Event) {
 			c.logger.Error("persist asynchronous call state event failed", "callId", event.CallID,
 				"state", snapshot.State, "reason", "event_outbox_unavailable")
 		}
+	}
+	if earlyMediaActivated {
+		c.publishCallEarlyMedia(session, event)
 	}
 	if hangupSIP {
 		_ = c.sip.Hangup(context.Background(), session.claims.SessionID, event.CallID)
@@ -1558,6 +1607,9 @@ func (c *Coordinator) closeCallMedia(session *runtimeSession, callID string) {
 	session.mu.Lock()
 	if session.activeMedia != nil && session.activeMedia.callID == callID {
 		session.activeMedia = nil
+	}
+	if session.earlyMediaCallID == callID {
+		session.earlyMediaCallID = ""
 	}
 	session.mu.Unlock()
 	_ = c.media.CloseCall(callID)
@@ -1978,6 +2030,16 @@ func (c *Coordinator) publish(sessionID string, event protocol.Envelope) {
 	}
 }
 
+func (c *Coordinator) publishCallEarlyMedia(session *runtimeSession, event sip.Event) {
+	envelope, err := protocol.NewEvent("call.early_media", map[string]any{
+		"callId": event.CallID, "sipStatusCode": event.StatusCode,
+	}, c.now())
+	if err != nil {
+		return
+	}
+	c.publish(session.claims.SessionID, envelope)
+}
+
 func (c *Coordinator) closeLiveStream(session *runtimeSession, expected chan protocol.Envelope) {
 	session.mu.Lock()
 	if session.live == expected && expected != nil {
@@ -1997,6 +2059,7 @@ func (c *Coordinator) snapshotLocked(session *runtimeSession) map[string]any {
 		snapshot := session.activeCall.Snapshot()
 		if snapshot.State != call.StateEnded {
 			value["call"] = snapshot
+			value["earlyMedia"] = session.earlyMediaCallID == snapshot.CallID
 			if session.remoteParty != "" {
 				value["remoteParty"] = session.remoteParty
 			}

@@ -781,6 +781,194 @@ func TestCoordinatorAcceptsLegacyDurableEventACKWithoutResult(t *testing.T) {
 	}
 }
 
+func TestCoordinatorBridgesOutboundEarlyMediaBeforeAnswer(t *testing.T) {
+	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	coordinator, rtc, media := newTestCoordinatorWithMedia(t, api, newFakeSIP())
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, live, err := coordinator.Connect(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventRegistered, SessionID: claims.SessionID})
+	callID := uuid.NewString()
+	startPayload, _ := json.Marshal(protocol.StartCall{
+		CommandID: uuid.NewString(), CallID: callID, CallContextID: "context-1", GatewayCapability: "call-capability",
+	})
+	if _, err := coordinator.Handle(context.Background(), claims,
+		protocol.Envelope{Type: "call.start", Payload: startPayload}); err != nil {
+		t.Fatal(err)
+	}
+	remoteSDP := []byte("v=0\r\nc=IN IP4 10.0.0.20\r\nm=audio 20500 RTP/AVP 0 101\r\na=rtcp:30500 IN IP4 10.0.0.21\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n")
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventEarlyMedia, SessionID: claims.SessionID, CallID: callID,
+		StatusCode: 183, RemoteSDP: remoteSDP,
+	})
+	foundEarlyMediaEvent := false
+	deadline := time.After(2 * time.Second)
+	for !foundEarlyMediaEvent {
+		select {
+		case event := <-live:
+			foundEarlyMediaEvent = event.Type == "call.early_media"
+		case <-deadline:
+			t.Fatal("timed out waiting for live call.early_media event")
+		}
+	}
+	coordinator.OnPBXRTP(callID, &rtp.Packet{
+		Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 22}, Payload: []byte{3, 4},
+	})
+	coordinator.OnBrowserRTP(claims.SessionID, &rtp.Packet{
+		Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 11}, Payload: []byte{1, 2},
+	})
+
+	media.mu.Lock()
+	remote := media.remote
+	remoteRTCP := media.remoteRTCP
+	browserWriteCount := len(media.writes)
+	media.mu.Unlock()
+	if remote == nil || remote.Port != 20500 || remoteRTCP == nil || remoteRTCP.Port != 30500 {
+		t.Fatalf("early media remote RTP=%v RTCP=%v", remote, remoteRTCP)
+	}
+	if browserWriteCount != 0 {
+		t.Fatalf("browser microphone leaked %d RTP packets before answer", browserWriteCount)
+	}
+	rtc.mu.Lock()
+	writeCount := len(rtc.writes)
+	rtc.mu.Unlock()
+	if writeCount != 1 {
+		t.Fatalf("early media WebRTC writes=%d, want 1", writeCount)
+	}
+	updatedSDP := []byte("v=0\r\nc=IN IP4 10.0.0.22\r\nm=audio 20600 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n")
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventEarlyMedia, SessionID: claims.SessionID, CallID: callID,
+		StatusCode: 183, RemoteSDP: updatedSDP,
+	})
+	media.mu.Lock()
+	remote = media.remote
+	media.mu.Unlock()
+	if remote == nil || remote.Port != 20600 {
+		t.Fatalf("updated early media remote=%v, want port 20600", remote)
+	}
+	select {
+	case event := <-live:
+		if event.Type == "call.early_media" {
+			t.Fatal("duplicate early media activation event was published")
+		}
+	default:
+	}
+	session, err := coordinator.session(claims.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	snapshot := coordinator.snapshotLocked(session)
+	state := session.activeCall.Snapshot().State
+	earlyMediaCallID := session.earlyMediaCallID
+	session.mu.Unlock()
+	if state != call.StateRinging || earlyMediaCallID != callID || snapshot["earlyMedia"] != true {
+		t.Fatalf("early media state=%s callID=%q snapshot=%+v", state, earlyMediaCallID, snapshot)
+	}
+
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventConnected, SessionID: claims.SessionID, CallID: callID,
+	})
+	session.mu.Lock()
+	state = session.activeCall.Snapshot().State
+	earlyMediaCallID = session.earlyMediaCallID
+	session.mu.Unlock()
+	if state != call.StateConnected || earlyMediaCallID != "" {
+		t.Fatalf("answered early media state=%s earlyMediaCallID=%q", state, earlyMediaCallID)
+	}
+	coordinator.OnBrowserRTP(claims.SessionID, &rtp.Packet{
+		Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 11}, Payload: []byte{1, 2},
+	})
+	media.mu.Lock()
+	writeCount = len(media.writes)
+	media.mu.Unlock()
+	if writeCount != 1 {
+		t.Fatalf("connected browser RTP writes=%d, want 1", writeCount)
+	}
+}
+
+func TestCoordinatorIgnoresMalformedEarlyMediaWithoutEndingCall(t *testing.T) {
+	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	coordinator, _, media := newTestCoordinatorWithMedia(t, api, newFakeSIP())
+	claims, err := coordinator.Redeem(context.Background(), protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := coordinator.Connect(context.Background(), claims); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{Type: sip.EventRegistered, SessionID: claims.SessionID})
+	callID := uuid.NewString()
+	startPayload, _ := json.Marshal(protocol.StartCall{
+		CommandID: uuid.NewString(), CallID: callID, CallContextID: "context-1", GatewayCapability: "call-capability",
+	})
+	if _, err := coordinator.Handle(context.Background(), claims,
+		protocol.Envelope{Type: "call.start", Payload: startPayload}); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventEarlyMedia, SessionID: claims.SessionID, CallID: callID,
+		StatusCode: 183, RemoteSDP: []byte("not-sdp"),
+	})
+
+	session, err := coordinator.session(claims.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	state := session.activeCall.Snapshot().State
+	earlyMediaCallID := session.earlyMediaCallID
+	mediaPresent := session.activeMedia != nil
+	session.mu.Unlock()
+	media.mu.Lock()
+	remote := media.remote
+	media.mu.Unlock()
+	if state != call.StateRinging || earlyMediaCallID != "" || !mediaPresent || remote != nil {
+		t.Fatalf("malformed early media state=%s callID=%q media=%v remote=%v",
+			state, earlyMediaCallID, mediaPresent, remote)
+	}
+
+	validSDP := []byte("v=0\r\nc=IN IP4 10.0.0.20\r\nm=audio 20500 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n")
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventEarlyMedia, SessionID: claims.SessionID, CallID: callID,
+		StatusCode: 183, RemoteSDP: validSDP,
+	})
+	session.mu.Lock()
+	earlyMediaCallID = session.earlyMediaCallID
+	session.mu.Unlock()
+	media.mu.Lock()
+	remote = media.remote
+	media.mu.Unlock()
+	if earlyMediaCallID != callID || remote == nil || remote.Port != 20500 {
+		t.Fatalf("recovered early media callID=%q remote=%v", earlyMediaCallID, remote)
+	}
+
+	coordinator.applySIPEvent(sip.Event{
+		Type: sip.EventFailed, SessionID: claims.SessionID, CallID: callID,
+		StatusCode: 603, Reason: "rejected",
+	})
+	session.mu.Lock()
+	state = session.activeCall.Snapshot().State
+	earlyMediaCallID = session.earlyMediaCallID
+	mediaPresent = session.activeMedia != nil
+	session.mu.Unlock()
+	if state != call.StateEnded || earlyMediaCallID != "" || mediaPresent {
+		t.Fatalf("terminal early media state=%s callID=%q media=%v",
+			state, earlyMediaCallID, mediaPresent)
+	}
+}
+
 func TestCoordinatorBridgesRTPAndSendsDTMF(t *testing.T) {
 	api := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
 	sipRuntime := newFakeSIP()

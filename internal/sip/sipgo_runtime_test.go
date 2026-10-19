@@ -151,6 +151,74 @@ func TestOutboundInviteUsesRegisteredSIPUsernameAsFromIdentity(t *testing.T) {
 	}
 }
 
+func TestOutboundSessionProgressPublishesEarlyMediaSDP(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	const callID = "outbound-early-media"
+	if err := runtime.StartCall(context.Background(), "session-1", callID, "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatal(err)
+	}
+	invite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	writeSIPResponseWithBody(t, peer, gateway, invite, 183, "Session Progress",
+		"early-media", testInboundSDP)
+
+	event := readRuntimeEvent(t, runtime, EventEarlyMedia)
+	if event.CallID != callID || event.StatusCode != 183 || string(event.RemoteSDP) != testInboundSDP {
+		t.Fatalf("early media event=%+v", event)
+	}
+
+	writeSIPResponse(t, peer, gateway, invite, 603, "Decline", "early-media")
+	_, _ = readSIPRequestFromContaining(t, peer, "ACK ")
+	failed := readRuntimeEvent(t, runtime, EventFailed)
+	if failed.CallID != callID || failed.Reason != "rejected" {
+		t.Fatalf("terminal event=%+v", failed)
+	}
+}
+
+func TestOutboundRingingWithSDPPublishesEarlyMedia(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	const callID = "outbound-ringing-early-media"
+	if err := runtime.StartCall(context.Background(), "session-1", callID, "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatal(err)
+	}
+	invite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	writeSIPResponseWithBody(t, peer, gateway, invite, 180, "Ringing",
+		"ringing-early-media", testInboundSDP)
+
+	event := readRuntimeEvent(t, runtime, EventEarlyMedia)
+	if event.CallID != callID || event.StatusCode != 180 || string(event.RemoteSDP) != testInboundSDP {
+		t.Fatalf("early media event=%+v", event)
+	}
+
+	writeSIPResponse(t, peer, gateway, invite, 486, "Busy Here", "ringing-early-media")
+	_, _ = readSIPRequestFromContaining(t, peer, "ACK ")
+	failed := readRuntimeEvent(t, runtime, EventFailed)
+	if failed.CallID != callID || failed.Reason != "busy" {
+		t.Fatalf("terminal event=%+v", failed)
+	}
+}
+
+func TestOutboundSessionProgressWithoutSDPFallsBackToRinging(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	const callID = "outbound-progress-without-sdp"
+	if err := runtime.StartCall(context.Background(), "session-1", callID, "9001", []byte(testInboundSDP)); err != nil {
+		t.Fatal(err)
+	}
+	invite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	writeSIPResponse(t, peer, gateway, invite, 183, "Session Progress", "progress-no-sdp")
+
+	event := readRuntimeEvent(t, runtime, EventRinging)
+	if event.CallID != callID || event.StatusCode != 183 || len(event.RemoteSDP) != 0 {
+		t.Fatalf("ringing fallback event=%+v", event)
+	}
+
+	writeSIPResponse(t, peer, gateway, invite, 486, "Busy Here", "progress-no-sdp")
+	_, _ = readSIPRequestFromContaining(t, peer, "ACK ")
+	failed := readRuntimeEvent(t, runtime, EventFailed)
+	if failed.CallID != callID || failed.Reason != "busy" {
+		t.Fatalf("terminal event=%+v", failed)
+	}
+}
+
 func TestOutboundInviteDigestRetryKeepsSessionIdentityAndClassifiesForbidden(t *testing.T) {
 	runtime, peer := newOutboundSIPTestRuntime(t)
 	if err := runtime.StartCall(context.Background(), "session-1", "outbound-auth", "9001", []byte(testInboundSDP)); err != nil {
