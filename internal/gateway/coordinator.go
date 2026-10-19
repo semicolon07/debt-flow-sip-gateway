@@ -109,23 +109,25 @@ type RuntimeStats struct {
 }
 
 type runtimeSession struct {
-	mu               sync.Mutex
-	callMu           sync.Mutex
-	connectMu        sync.Mutex
-	eventMu          sync.Mutex
-	claims           Claims
-	sipConfig        sip.Configuration
-	live             chan protocol.Envelope
-	connected        bool
-	generation       uint64
-	registration     string
-	activeCall       *call.Machine
-	remoteParty      string
-	callContext      string
-	callCommand      string
-	earlyMediaCallID string
-	activeMedia      *callMedia
-	leaseExpires     time.Time
+	mu                      sync.Mutex
+	callMu                  sync.Mutex
+	connectMu               sync.Mutex
+	eventMu                 sync.Mutex
+	claims                  Claims
+	sipConfig               sip.Configuration
+	live                    chan protocol.Envelope
+	connected               bool
+	generation              uint64
+	registration            string
+	activeCall              *call.Machine
+	remoteParty             string
+	callContext             string
+	callCommand             string
+	earlyMediaCallID        string
+	earlyMediaAudibleCallID string
+	earlyMediaStatusCode    int
+	activeMedia             *callMedia
+	leaseExpires            time.Time
 }
 
 type callMedia struct {
@@ -134,6 +136,7 @@ type callMedia struct {
 	localSDP        []byte
 	toSIP           *gatewaymedia.Translator
 	toBrowser       *gatewaymedia.Translator
+	sipAudioPayload uint8
 	sipDTMFPayload  uint8
 	dtmfSSRC        uint32
 	dtmfSequence    uint16
@@ -664,6 +667,25 @@ func (c *Coordinator) OnPBXRTP(callID string, packet *rtp.Packet) {
 		return
 	}
 	c.observeRTPPacket("pbx_to_browser")
+	if packet.PayloadType != media.sipAudioPayload || len(packet.Payload) == 0 {
+		return
+	}
+	publishEarlyMedia := false
+	statusCode := 0
+	session.mu.Lock()
+	if session.activeMedia == media && session.earlyMediaCallID == callID &&
+		session.earlyMediaAudibleCallID != callID && session.activeCall != nil &&
+		session.activeCall.Snapshot().State == call.StateRinging {
+		session.earlyMediaAudibleCallID = callID
+		statusCode = session.earlyMediaStatusCode
+		publishEarlyMedia = true
+	}
+	session.mu.Unlock()
+	if publishEarlyMedia {
+		c.logger.Info("outbound SIP early media audio detected", "callId", callID,
+			"sipStatusCode", statusCode)
+		c.publishCallEarlyMedia(session, callID, statusCode)
+	}
 }
 
 func (c *Coordinator) OnBrowserRTCP(sessionID string, packets []rtcp.Packet) {
@@ -1414,7 +1436,6 @@ func (c *Coordinator) applyCallEvent(session *runtimeSession, event sip.Event) {
 	eventType := "call.state_changed"
 	closeMedia := false
 	hangupSIP := false
-	earlyMediaActivated := false
 	previousRevision := machine.Snapshot().Revision
 	switch event.Type {
 	case sip.EventTrying:
@@ -1451,15 +1472,15 @@ func (c *Coordinator) applyCallEvent(session *runtimeSession, event sip.Event) {
 				"reason", "media_remote_invalid", "sipStatusCode", event.StatusCode)
 			break
 		}
-		if session.earlyMediaCallID != event.CallID {
-			session.earlyMediaCallID = event.CallID
-			earlyMediaActivated = true
-		}
+		session.earlyMediaCallID = event.CallID
+		session.earlyMediaStatusCode = event.StatusCode
 		c.logger.Info("outbound SIP early media activated", "callId", event.CallID,
 			"sipStatusCode", event.StatusCode, "codec", remote.Codec)
 	case sip.EventConnected:
 		hadEarlyMedia := session.earlyMediaCallID == event.CallID
 		session.earlyMediaCallID = ""
+		session.earlyMediaAudibleCallID = ""
+		session.earlyMediaStatusCode = 0
 		media := session.activeMedia
 		snapshot := machine.Snapshot()
 		mediaReady := media != nil && media.callID == event.CallID
@@ -1500,9 +1521,6 @@ func (c *Coordinator) applyCallEvent(session *runtimeSession, event sip.Event) {
 	snapshot := machine.Snapshot()
 	session.mu.Unlock()
 	if snapshot.Revision == previousRevision {
-		if earlyMediaActivated {
-			c.publishCallEarlyMedia(session, event)
-		}
 		return
 	}
 	if err := c.store.SaveCall(context.Background(), session.claims.SessionID,
@@ -1520,9 +1538,6 @@ func (c *Coordinator) applyCallEvent(session *runtimeSession, event sip.Event) {
 			c.logger.Error("persist asynchronous call state event failed", "callId", event.CallID,
 				"state", snapshot.State, "reason", "event_outbox_unavailable")
 		}
-	}
-	if earlyMediaActivated {
-		c.publishCallEarlyMedia(session, event)
 	}
 	if hangupSIP {
 		_ = c.sip.Hangup(context.Background(), session.claims.SessionID, event.CallID)
@@ -1594,7 +1609,8 @@ func (c *Coordinator) setupCallMedia(
 	session.mu.Lock()
 	session.activeMedia = &callMedia{
 		callID: callID, codec: codec, localSDP: localSDP, toSIP: toSIP, toBrowser: toBrowser,
-		sipDTMFPayload: sipDTMFPayload, dtmfSSRC: dtmfSSRC, dtmfSequence: randomUint16(), dtmfTimestamp: randomUint32(),
+		sipAudioPayload: sipAudioPayload, sipDTMFPayload: sipDTMFPayload,
+		dtmfSSRC: dtmfSSRC, dtmfSequence: randomUint16(), dtmfTimestamp: randomUint32(),
 		browserLoss: make(map[uint32]uint32), pbxLoss: make(map[uint32]uint32),
 		toSIPPacket:     rtp.Packet{Payload: make([]byte, 0, 160)},
 		toBrowserPacket: rtp.Packet{Payload: make([]byte, 0, 160)},
@@ -1608,8 +1624,10 @@ func (c *Coordinator) closeCallMedia(session *runtimeSession, callID string) {
 	if session.activeMedia != nil && session.activeMedia.callID == callID {
 		session.activeMedia = nil
 	}
-	if session.earlyMediaCallID == callID {
+	if session.earlyMediaCallID == callID || session.earlyMediaAudibleCallID == callID {
 		session.earlyMediaCallID = ""
+		session.earlyMediaAudibleCallID = ""
+		session.earlyMediaStatusCode = 0
 	}
 	session.mu.Unlock()
 	_ = c.media.CloseCall(callID)
@@ -2030,9 +2048,9 @@ func (c *Coordinator) publish(sessionID string, event protocol.Envelope) {
 	}
 }
 
-func (c *Coordinator) publishCallEarlyMedia(session *runtimeSession, event sip.Event) {
+func (c *Coordinator) publishCallEarlyMedia(session *runtimeSession, callID string, statusCode int) {
 	envelope, err := protocol.NewEvent("call.early_media", map[string]any{
-		"callId": event.CallID, "sipStatusCode": event.StatusCode,
+		"callId": callID, "sipStatusCode": statusCode,
 	}, c.now())
 	if err != nil {
 		return
@@ -2059,7 +2077,7 @@ func (c *Coordinator) snapshotLocked(session *runtimeSession) map[string]any {
 		snapshot := session.activeCall.Snapshot()
 		if snapshot.State != call.StateEnded {
 			value["call"] = snapshot
-			value["earlyMedia"] = session.earlyMediaCallID == snapshot.CallID
+			value["earlyMedia"] = session.earlyMediaAudibleCallID == snapshot.CallID
 			if session.remoteParty != "" {
 				value["remoteParty"] = session.remoteParty
 			}

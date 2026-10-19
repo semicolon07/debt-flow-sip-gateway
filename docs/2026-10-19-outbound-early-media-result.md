@@ -12,12 +12,13 @@ Gateway ส่งเสียงประกาศหรือ tone จาก PB
 
 - `100 Trying` ไม่เปิด media
 - `180/183/1xx` ที่ไม่มี SDP ใช้ browser synthetic ringback
-- `180/183/1xx` ที่มี SDP และ codec PCMU/PCMA ตรงกับสาย เปิด early RTP/RTCP
+- `180/183/1xx` ที่มี SDP และ codec PCMU/PCMA ตรงกับสาย เตรียม early RTP/RTCP แต่ยังคง synthetic ringback จนได้รับ audio RTP แรก
+- Gateway ส่ง `call.early_media` หลังส่ง audio RTP packet แรกเข้า WebRTC สำเร็จเท่านั้น; SDP อย่างเดียว, payload ว่าง หรือ DTMF RTP ไม่ทำให้ ringback เงียบ
 - provisional SDP ผิดรูปแบบ, ไม่มี audio target หรือ codec ไม่ตรง ถูก ignore โดยสายไม่ล้ม และ recovery ได้เมื่อ SDP ถัดไปถูกต้อง
 - provisional SDP ซ้ำอัปเดต RTP target ได้โดยไม่ส่ง `call.early_media` ซ้ำ
 - `200 OK` ที่มี SDP ใช้ final target; ถ้าไม่มี SDP จะ reuse target ที่ negotiate จาก early media
 - browser รับเสียง early media ได้ แต่ microphone RTP ถูก block จน call state เป็น `connected`
-- reconnect ระหว่าง early media คืนสถานะผ่าน `gateway.snapshot.earlyMedia`
+- reconnect ระหว่าง early media คืน `gateway.snapshot.earlyMedia=true` เฉพาะเมื่อเคยได้รับ audio RTP จริง
 - `call.early_media` ไม่ถูก ACK/ingest และไม่เปลี่ยน contract ของ Web API
 - stale event ที่ไม่ตรงกับ durable `call.created` ถูก Web App ปฏิเสธ
 - final failure, timeout, cancel, late answer, duplicate terminal event และ remote hangup ยังคง cleanup ตาม authoritative lifecycle เดิม
@@ -26,10 +27,10 @@ Gateway ส่งเสียงประกาศหรือ tone จาก PB
 
 - `go test ./...`: ผ่านทุก package
 - `go test -race ./...`: ผ่านทุก package โดยไม่พบ data race
-- Gateway early-media coordinator tests: ผ่าน รวม RTP receive-only ก่อน answer, duplicate SDP, malformed SDP recovery และ final response ไม่มี SDP
+- Gateway early-media coordinator tests: ผ่าน รวม SDP ที่ยังไม่มี RTP, DTMF ก่อน audio, RTP receive-only ก่อน answer, duplicate SDP, malformed SDP recovery และ final response ไม่มี SDP
 - SIP runtime tests: ผ่านสำหรับ `183 + SDP`, `180 + SDP` และ `183` ไม่มี SDP
-- Web App tests เฉพาะ adapter/tone: 52 tests ผ่าน
-- Web App full suite: 571 test files / 4,110 tests ผ่าน
+- Web App tests เฉพาะ adapter/tone: 53 tests ผ่าน
+- Web App full suite: 572 test files / 4,116 tests ผ่าน
 - Web App strict app/spec checks และ production build: ผ่าน
 - Windows amd64 executable และ POC package ถูก build ใหม่ พร้อมตรวจ SHA-256 ทั้ง package ภายในและไฟล์ส่งมอบ
 

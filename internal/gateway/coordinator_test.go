@@ -809,6 +809,48 @@ func TestCoordinatorBridgesOutboundEarlyMediaBeforeAnswer(t *testing.T) {
 		Type: sip.EventEarlyMedia, SessionID: claims.SessionID, CallID: callID,
 		StatusCode: 183, RemoteSDP: remoteSDP,
 	})
+	for draining := true; draining; {
+		select {
+		case event := <-live:
+			if event.Type == "call.early_media" {
+				t.Fatal("early media was announced before receiving audio RTP")
+			}
+		default:
+			draining = false
+		}
+	}
+	session, err := coordinator.session(claims.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	snapshot := coordinator.snapshotLocked(session)
+	state := session.activeCall.Snapshot().State
+	earlyMediaCallID := session.earlyMediaCallID
+	earlyMediaAudibleCallID := session.earlyMediaAudibleCallID
+	session.mu.Unlock()
+	if state != call.StateRinging || earlyMediaCallID != callID ||
+		earlyMediaAudibleCallID != "" || snapshot["earlyMedia"] != false {
+		t.Fatalf("silent early media state=%s negotiated=%q audible=%q snapshot=%+v",
+			state, earlyMediaCallID, earlyMediaAudibleCallID, snapshot)
+	}
+
+	coordinator.OnPBXRTP(callID, &rtp.Packet{
+		Header: rtp.Header{Version: 2, PayloadType: 101, SSRC: 22}, Payload: []byte{1, 0, 0, 160},
+	})
+	select {
+	case event := <-live:
+		if event.Type == "call.early_media" {
+			t.Fatal("DTMF RTP incorrectly activated audible early media")
+		}
+	default:
+	}
+
+	// The browser keeps synthetic ringback until the first real audio packet,
+	// then switches to the provider's early media.
+	coordinator.OnPBXRTP(callID, &rtp.Packet{
+		Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 22}, Payload: []byte{3, 4},
+	})
 	foundEarlyMediaEvent := false
 	deadline := time.After(2 * time.Second)
 	for !foundEarlyMediaEvent {
@@ -819,9 +861,6 @@ func TestCoordinatorBridgesOutboundEarlyMediaBeforeAnswer(t *testing.T) {
 			t.Fatal("timed out waiting for live call.early_media event")
 		}
 	}
-	coordinator.OnPBXRTP(callID, &rtp.Packet{
-		Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 22}, Payload: []byte{3, 4},
-	})
 	coordinator.OnBrowserRTP(claims.SessionID, &rtp.Packet{
 		Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 11}, Payload: []byte{1, 2},
 	})
@@ -840,8 +879,8 @@ func TestCoordinatorBridgesOutboundEarlyMediaBeforeAnswer(t *testing.T) {
 	rtc.mu.Lock()
 	writeCount := len(rtc.writes)
 	rtc.mu.Unlock()
-	if writeCount != 1 {
-		t.Fatalf("early media WebRTC writes=%d, want 1", writeCount)
+	if writeCount != 2 {
+		t.Fatalf("early media WebRTC writes=%d, want 2 (DTMF + audio)", writeCount)
 	}
 	updatedSDP := []byte("v=0\r\nc=IN IP4 10.0.0.22\r\nm=audio 20600 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n")
 	coordinator.applySIPEvent(sip.Event{
@@ -861,17 +900,16 @@ func TestCoordinatorBridgesOutboundEarlyMediaBeforeAnswer(t *testing.T) {
 		}
 	default:
 	}
-	session, err := coordinator.session(claims.SessionID)
-	if err != nil {
-		t.Fatal(err)
-	}
 	session.mu.Lock()
-	snapshot := coordinator.snapshotLocked(session)
-	state := session.activeCall.Snapshot().State
-	earlyMediaCallID := session.earlyMediaCallID
+	snapshot = coordinator.snapshotLocked(session)
+	state = session.activeCall.Snapshot().State
+	earlyMediaCallID = session.earlyMediaCallID
+	earlyMediaAudibleCallID = session.earlyMediaAudibleCallID
 	session.mu.Unlock()
-	if state != call.StateRinging || earlyMediaCallID != callID || snapshot["earlyMedia"] != true {
-		t.Fatalf("early media state=%s callID=%q snapshot=%+v", state, earlyMediaCallID, snapshot)
+	if state != call.StateRinging || earlyMediaCallID != callID ||
+		earlyMediaAudibleCallID != callID || snapshot["earlyMedia"] != true {
+		t.Fatalf("audible early media state=%s negotiated=%q audible=%q snapshot=%+v",
+			state, earlyMediaCallID, earlyMediaAudibleCallID, snapshot)
 	}
 
 	coordinator.applySIPEvent(sip.Event{
@@ -880,9 +918,11 @@ func TestCoordinatorBridgesOutboundEarlyMediaBeforeAnswer(t *testing.T) {
 	session.mu.Lock()
 	state = session.activeCall.Snapshot().State
 	earlyMediaCallID = session.earlyMediaCallID
+	earlyMediaAudibleCallID = session.earlyMediaAudibleCallID
 	session.mu.Unlock()
-	if state != call.StateConnected || earlyMediaCallID != "" {
-		t.Fatalf("answered early media state=%s earlyMediaCallID=%q", state, earlyMediaCallID)
+	if state != call.StateConnected || earlyMediaCallID != "" || earlyMediaAudibleCallID != "" {
+		t.Fatalf("answered early media state=%s negotiated=%q audible=%q",
+			state, earlyMediaCallID, earlyMediaAudibleCallID)
 	}
 	coordinator.OnBrowserRTP(claims.SessionID, &rtp.Packet{
 		Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 11}, Payload: []byte{1, 2},
