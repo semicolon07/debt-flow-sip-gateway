@@ -846,10 +846,21 @@ func TestCoordinatorBridgesOutboundEarlyMediaBeforeAnswer(t *testing.T) {
 	default:
 	}
 
-	// The browser keeps synthetic ringback until the first real audio packet,
-	// then switches to the provider's early media.
 	coordinator.OnPBXRTP(callID, &rtp.Packet{
-		Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 22}, Payload: []byte{3, 4},
+		Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 22}, Payload: repeatedPayload(0xff, 160),
+	})
+	select {
+	case event := <-live:
+		if event.Type == "call.early_media" {
+			t.Fatal("silent G.711 RTP incorrectly activated audible early media")
+		}
+	default:
+	}
+
+	// The browser keeps synthetic ringback through silent RTP packets and only
+	// switches when the provider's early media contains an audible signal.
+	coordinator.OnPBXRTP(callID, &rtp.Packet{
+		Header: rtp.Header{Version: 2, PayloadType: 0, SSRC: 22}, Payload: repeatedPayload(0x00, 160),
 	})
 	foundEarlyMediaEvent := false
 	deadline := time.After(2 * time.Second)
@@ -879,8 +890,8 @@ func TestCoordinatorBridgesOutboundEarlyMediaBeforeAnswer(t *testing.T) {
 	rtc.mu.Lock()
 	writeCount := len(rtc.writes)
 	rtc.mu.Unlock()
-	if writeCount != 2 {
-		t.Fatalf("early media WebRTC writes=%d, want 2 (DTMF + audio)", writeCount)
+	if writeCount != 3 {
+		t.Fatalf("early media WebRTC writes=%d, want 3 (DTMF + silence + audio)", writeCount)
 	}
 	updatedSDP := []byte("v=0\r\nc=IN IP4 10.0.0.22\r\nm=audio 20600 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n")
 	coordinator.applySIPEvent(sip.Event{
@@ -933,6 +944,14 @@ func TestCoordinatorBridgesOutboundEarlyMediaBeforeAnswer(t *testing.T) {
 	if writeCount != 1 {
 		t.Fatalf("connected browser RTP writes=%d, want 1", writeCount)
 	}
+}
+
+func repeatedPayload(value byte, count int) []byte {
+	payload := make([]byte, count)
+	for index := range payload {
+		payload[index] = value
+	}
+	return payload
 }
 
 func TestCoordinatorIgnoresMalformedEarlyMediaWithoutEndingCall(t *testing.T) {

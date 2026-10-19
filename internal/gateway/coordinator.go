@@ -667,7 +667,8 @@ func (c *Coordinator) OnPBXRTP(callID string, packet *rtp.Packet) {
 		return
 	}
 	c.observeRTPPacket("pbx_to_browser")
-	if packet.PayloadType != media.sipAudioPayload || len(packet.Payload) == 0 {
+	if packet.PayloadType != media.sipAudioPayload ||
+		!gatewaymedia.HasAudibleG711(media.codec.Name, packet.Payload) {
 		return
 	}
 	publishEarlyMedia := false
@@ -682,7 +683,7 @@ func (c *Coordinator) OnPBXRTP(callID string, packet *rtp.Packet) {
 	}
 	session.mu.Unlock()
 	if publishEarlyMedia {
-		c.logger.Info("outbound SIP early media audio detected", "callId", callID,
+		c.logger.Info("outbound SIP audible early media detected", "callId", callID,
 			"sipStatusCode", statusCode)
 		c.publishCallEarlyMedia(session, callID, statusCode)
 	}

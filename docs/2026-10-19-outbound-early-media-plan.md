@@ -13,11 +13,11 @@
 - provisional response ที่ไม่มี SDP (`180`, `183` หรือรหัส `1xx` อื่น) ใช้ synthetic ringback
 - provisional response ที่มี SDP (`180`, `183` หรือรหัส `1xx` อื่น) เปิด early media
 - ตั้ง remote RTP/RTCP ทันทีเมื่อ SDP และ codec ถูกต้อง
-- ส่ง live-only `call.early_media` ไปยัง browser เพื่อหยุด synthetic ringback หลังได้รับ audio RTP packet แรกจริง ไม่ใช่เพียงเมื่อได้รับ SDP
+- ส่ง live-only `call.early_media` ไปยัง browser เพื่อหยุด synthetic ringback หลังตรวจพบสัญญาณเสียงจริงใน G.711 ไม่ใช่เพียงเมื่อได้รับ SDP หรือ RTP silence
 - เก็บสถานะ early media ใน gateway snapshot เพื่อรองรับ reconnect
 - SDP ชั่วคราวที่ไม่ถูกต้องหรือ codec ไม่ตรงต้องไม่ทำให้สายล้ม เพราะ provisional หรือ final response ถัดไปอาจถูกต้อง
 - provisional SDP ซ้ำเปลี่ยน RTP target ได้ แต่ไม่ส่ง activation event ซ้ำ
-- provisional SDP ที่ยังไม่มี RTP ต้องคง synthetic ringback เพื่อไม่ให้ผู้ใช้ได้ยินความเงียบ
+- provisional SDP ที่ยังไม่มี RTP หรือได้รับเฉพาะ PCMU/PCMA digital silence ต้องคง synthetic ringback เพื่อไม่ให้ผู้ใช้ได้ยินความเงียบ
 - final `2xx` ที่มี SDP ใช้ SDP สุดท้าย; final `2xx` ที่ไม่มี SDP ใช้ early-media target เดิมได้
 - ไม่ส่ง browser microphone RTP ไป PBX จนกว่าสายจะ `connected`
 - final `3xx`–`6xx`, timeout, local cancel, late answer, duplicate final และ remote hangup ต้องยัง terminalize/cleanup ได้ครั้งเดียว
@@ -26,7 +26,7 @@
 ## เกณฑ์ยอมรับ
 
 - `180` ที่ไม่มี SDP ยังใช้ synthetic ringback ตามเดิม
-- `180/183/1xx + SDP` เตรียมเส้นทาง media และหยุด synthetic ringback เมื่อ audio RTP แรกไปถึง WebRTC
+- `180/183/1xx + SDP` เตรียมเส้นทาง media และหยุด synthetic ringback เมื่อ G.711 RTP มีระดับสัญญาณเสียงจริงไปถึง WebRTC
 - provisional response ที่ไม่มี SDP fallback เป็น ringing
 - final response ยัง terminalize และ cleanup ได้ครั้งเดียว
 - early-media event ไม่เข้า durable outbox และไม่ถูกส่งไป ingest API
