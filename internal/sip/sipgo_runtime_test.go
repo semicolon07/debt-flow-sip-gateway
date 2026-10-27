@@ -83,6 +83,25 @@ func TestBuildContactUsesSelectedTransportListener(t *testing.T) {
 	}
 }
 
+func TestContactUserIsStablePerSessionAndDistinctAcrossSessions(t *testing.T) {
+	identity, err := IdentityOf(Configuration{
+		Host: "pbx.example", Port: 5060, Transport: TransportUDP, Username: "100",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := contactUserFor("session-1", identity)
+	if first != contactUserFor("session-1", identity) {
+		t.Fatal("contact user changed for the same session identity")
+	}
+	if first == contactUserFor("session-2", identity) {
+		t.Fatal("different sessions shared an inbound Contact user")
+	}
+	if strings.Contains(first, identity.Username) {
+		t.Fatal("opaque Contact user exposed the SIP username")
+	}
+}
+
 func TestSetURITransportOverridesCanonicalDestination(t *testing.T) {
 	var parsed sipmessage.Uri
 	if err := sipmessage.ParseUri("sip:0812345678@pbx.internal:5060;transport=udp", &parsed); err != nil {
@@ -607,6 +626,34 @@ func TestConcurrentSessionsDoNotCrossDigestIdentities(t *testing.T) {
 	}
 }
 
+func TestConfigureAllowsSameUsernameAcrossDifferentPBXIdentities(t *testing.T) {
+	runtime, peer := newOutboundSIPTestRuntime(t)
+	firstPort := peer.LocalAddr().(*net.UDPAddr).Port
+	secondPort := firstPort + 1
+	if firstPort == 65535 {
+		secondPort = firstPort - 1
+	}
+	if err := runtime.Configure(context.Background(), "session-2", Configuration{
+		Host: "127.0.0.1", Port: uint16(secondPort), Transport: TransportUDP,
+		Username: "1129", Password: "branch-two-secret",
+	}); err != nil {
+		t.Fatalf("same username on another PBX was rejected: %v", err)
+	}
+	if err := runtime.Configure(context.Background(), "session-3", Configuration{
+		Host: "127.0.0.1", Port: uint16(firstPort), Transport: TransportUDP,
+		Username: "1129", Password: "duplicate-secret",
+	}); err == nil {
+		t.Fatal("same SIP identity was accepted for another session")
+	}
+	runtime.mu.RLock()
+	first := runtime.sessions["session-1"]
+	second := runtime.sessions["session-2"]
+	runtime.mu.RUnlock()
+	if first == nil || second == nil || first.contactUser == second.contactUser {
+		t.Fatalf("sessions did not receive distinct Contact identities: first=%v second=%v", first, second)
+	}
+}
+
 func TestTransportLevelFinalResponseFallbackEndsCallWhenTransactionDoesNotMatch(t *testing.T) {
 	runtime, peer := newOutboundSIPTestRuntime(t)
 	runtime.cfg.OutboundTimeout = 2 * time.Second
@@ -950,6 +997,231 @@ func TestRegistrationRetryDelayIsExponentiallyBounded(t *testing.T) {
 	}
 }
 
+func TestResolveSessionTargetRefreshesIPv4ARecordAndReusesCurrentTarget(t *testing.T) {
+	addresses := []net.IP{net.ParseIP("192.0.2.10"), net.ParseIP("192.0.2.11")}
+	calls := 0
+	runtime := &SIPGoRuntime{cfg: SIPGoConfig{ResolveIPv4: func(context.Context, string) ([]net.IP, error) {
+		address := addresses[calls]
+		calls++
+		return []net.IP{address}, nil
+	}}}
+	session := &sipgoSession{identity: Identity{
+		Host: "pbx.branch.example", Port: 5060, Transport: TransportUDP, Username: "100",
+	}}
+	first, err := runtime.resolveSessionTarget(context.Background(), session, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := runtime.resolveSessionTarget(context.Background(), session, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cached, err := runtime.resolveSessionTarget(context.Background(), session, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != "192.0.2.10:5060" || second != "192.0.2.11:5060" || cached != second || calls != 2 {
+		t.Fatalf("targets first=%q second=%q cached=%q calls=%d", first, second, cached, calls)
+	}
+}
+
+func TestResolveSessionTargetRejectsMissingIPv4AndPropagatesCancellation(t *testing.T) {
+	providerFailure := errors.New("resolver unavailable")
+	for name, resolver := range map[string]func(context.Context, string) ([]net.IP, error){
+		"empty":     func(context.Context, string) ([]net.IP, error) { return nil, nil },
+		"aaaa-only": func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("2001:db8::10")}, nil },
+		"error":     func(context.Context, string) ([]net.IP, error) { return nil, providerFailure },
+	} {
+		t.Run(name, func(t *testing.T) {
+			runtime := &SIPGoRuntime{cfg: SIPGoConfig{ResolveIPv4: resolver}}
+			session := &sipgoSession{identity: Identity{
+				Host: "pbx.branch.example", Port: 5060, Transport: TransportUDP, Username: "100",
+			}}
+			_, err := runtime.resolveSessionTarget(context.Background(), session, true)
+			if name == "error" {
+				if !errors.Is(err, providerFailure) {
+					t.Fatalf("resolver error=%v, want provider failure", err)
+				}
+			} else if !errors.Is(err, errSIPHostIPv4Unavailable) {
+				t.Fatalf("resolver error=%v, want IPv4 unavailable", err)
+			}
+		})
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	runtime := &SIPGoRuntime{cfg: SIPGoConfig{ResolveIPv4: func(context.Context, string) ([]net.IP, error) {
+		called = true
+		return nil, nil
+	}}}
+	session := &sipgoSession{identity: Identity{
+		Host: "pbx.branch.example", Port: 5060, Transport: TransportUDP, Username: "100",
+	}}
+	if _, err := runtime.resolveSessionTarget(cancelled, session, true); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled resolve error=%v", err)
+	}
+	if called {
+		t.Fatal("resolver was called after cancellation")
+	}
+}
+
+func TestHostnameUsesIPv4DestinationWhileKeepingConfiguredHostInUDPRequestURI(t *testing.T) {
+	peer, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+	resolverCalls := 0
+	runtime, err := NewSIPGoRuntime(SIPGoConfig{
+		ListenUDP: reservePacketAddress(t), ListenTCP: reserveTCPAddress(t), AdvertisedIP: "127.0.0.1",
+		EventBuffer: 16,
+		ResolveIPv4: func(context.Context, string) ([]net.IP, error) {
+			resolverCalls++
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	peerPort := peer.LocalAddr().(*net.UDPAddr).Port
+	if err := runtime.Configure(context.Background(), "session-1", Configuration{
+		Host: "pbx.branch.example", Port: uint16(peerPort), Transport: TransportUDP,
+		Username: "1129", Password: "secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	registerResult := make(chan error, 1)
+	go func() { registerResult <- runtime.Register(context.Background(), "session-1") }()
+	register, gateway := readSIPRequestFromContaining(t, peer, "REGISTER ")
+	if !strings.HasPrefix(register, fmt.Sprintf("REGISTER sip:pbx.branch.example:%d SIP/2.0", peerPort)) {
+		t.Fatalf("REGISTER request URI lost configured hostname: %q", strings.Split(register, "\r\n")[0])
+	}
+	writeSIPResponse(t, peer, gateway, register, 200, "OK", "hostname-register")
+	if err := <-registerResult; err != nil {
+		t.Fatal(err)
+	}
+	_ = readRuntimeEvent(t, runtime, EventRegistered)
+	if err := runtime.StartCall(
+		context.Background(), "session-1", "hostname-outbound", "9001", []byte(testInboundSDP),
+	); err != nil {
+		t.Fatal(err)
+	}
+	invite, gateway := readSIPRequestFromContaining(t, peer, "INVITE ")
+	if !strings.Contains(strings.Split(invite, "\r\n")[0], "@pbx.branch.example:") {
+		t.Fatalf("INVITE request URI lost configured hostname: %q", strings.Split(invite, "\r\n")[0])
+	}
+	writeSIPResponse(t, peer, gateway, invite, 603, "Decline", "hostname-outbound")
+	_, _ = readSIPRequestFromContaining(t, peer, "ACK ")
+	_ = readRuntimeEvent(t, runtime, EventFailed)
+	runtime.cfg.ResolveIPv4 = func(context.Context, string) ([]net.IP, error) {
+		return nil, errors.New("DNS must not run during unregister")
+	}
+	unregisterResult := make(chan error, 1)
+	go func() { unregisterResult <- runtime.Unregister(context.Background(), "session-1") }()
+	unregister, gateway := readSIPRequestFromContaining(t, peer, "REGISTER ")
+	writeSIPResponse(t, peer, gateway, unregister, 200, "OK", "hostname-unregister")
+	if err := <-unregisterResult; err != nil {
+		t.Fatal(err)
+	}
+	if resolverCalls != 1 {
+		t.Fatalf("resolver calls=%d, want 1 registration lookup", resolverCalls)
+	}
+}
+
+func TestHostnameRegistrationUsesExplicitIPv4DestinationOverTCP(t *testing.T) {
+	pbx, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pbx.Close() })
+	runtime, err := NewSIPGoRuntime(SIPGoConfig{
+		ListenUDP: reservePacketAddress(t), ListenTCP: reserveTCPAddress(t), AdvertisedIP: "127.0.0.1",
+		EventBuffer: 16,
+		ResolveIPv4: func(context.Context, string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	pbxPort := pbx.Addr().(*net.TCPAddr).Port
+	if err := runtime.Configure(context.Background(), "session-1", Configuration{
+		Host: "pbx.tcp.example", Port: uint16(pbxPort), Transport: TransportTCP,
+		Username: "1129", Password: "secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	registerResult := make(chan error, 1)
+	go func() { registerResult <- runtime.Register(context.Background(), "session-1") }()
+	peer, err := pbx.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+	reader := bufio.NewReader(peer)
+	register := readTCPResponseContaining(t, peer, reader, "REGISTER ")
+	if !strings.HasPrefix(register, fmt.Sprintf("REGISTER sip:pbx.tcp.example:%d SIP/2.0", pbxPort)) {
+		t.Fatalf("TCP REGISTER request URI lost configured hostname: %q", strings.Split(register, "\r\n")[0])
+	}
+	if _, err := io.WriteString(peer, buildResponseForRequest(register, 200, "OK")); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-registerResult; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInboundSessionSelectionSeparatesSameUsernameByPBXPeer(t *testing.T) {
+	firstIdentity, err := IdentityOf(Configuration{
+		Host: "192.0.2.10", Port: 5060, Transport: TransportUDP, Username: "100",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondIdentity, err := IdentityOf(Configuration{
+		Host: "192.0.2.11", Port: 5060, Transport: TransportUDP, Username: "100",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &SIPGoRuntime{
+		sessions: map[string]*sipgoSession{
+			"first": {
+				identity: firstIdentity, registered: true, registeredPeer: "192.0.2.10:5060",
+				contactUser: "df-first",
+			},
+			"second": {
+				identity: secondIdentity, registered: true, registeredPeer: "192.0.2.11:5060",
+				contactUser: "df-second",
+			},
+		},
+		contacts: map[string]string{"df-first": "first", "df-second": "second"},
+	}
+	request := sipmessage.NewRequest(sipmessage.INVITE, sipmessage.Uri{User: "100"})
+	request.SetTransport("UDP")
+	request.SetSource("192.0.2.11:5060")
+	sessionID, _, registered := runtime.sessionForInboundRequest(request)
+	if sessionID != "second" || !registered {
+		t.Fatalf("inbound request selected session %q registered=%v, want second", sessionID, registered)
+	}
+
+	request.Recipient.User = "df-first"
+	request.SetSource("198.51.100.20:5090")
+	sessionID, _, registered = runtime.sessionForInboundRequest(request)
+	if sessionID != "first" || !registered {
+		t.Fatalf("unique registered Contact selected session %q registered=%v, want first", sessionID, registered)
+	}
+
+	request.Recipient.User = "100"
+	request.SetSource("198.51.100.20:5090")
+	sessionID, session, registered := runtime.sessionForInboundRequest(request)
+	if sessionID != "" || session != nil || registered {
+		t.Fatalf("ambiguous username fallback selected session %q registered=%v", sessionID, registered)
+	}
+}
+
 func TestStartCallRejectsUnregisteredSessionBeforeSendingInvite(t *testing.T) {
 	runtime, peer := newOutboundSIPTestRuntime(t)
 	runtime.setRegistered("session-1", false)
@@ -1011,7 +1283,7 @@ func TestRegisterResponseFromReplacedSessionIsDiscarded(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Register did not finish")
 	}
-	if _, err := runtime.registeredSession("session-1"); !errors.Is(err, ErrRegistrationNotReady) {
+	if _, _, err := runtime.registeredSession("session-1"); !errors.Is(err, ErrRegistrationNotReady) {
 		t.Fatalf("replacement registration state error=%v", err)
 	}
 	assertNoRuntimeEvent(t, runtime, EventRegistered, 100*time.Millisecond)
@@ -1031,7 +1303,7 @@ func TestFirstRegistrationRefreshFailureIsAuthoritative(t *testing.T) {
 	if event.SessionID != "session-1" || event.Reason != "refresh_failed" {
 		t.Fatalf("registration event=%+v", event)
 	}
-	if _, err := runtime.registeredSession("session-1"); !errors.Is(err, ErrRegistrationNotReady) {
+	if _, _, err := runtime.registeredSession("session-1"); !errors.Is(err, ErrRegistrationNotReady) {
 		t.Fatalf("registration state error=%v, want %v", err, ErrRegistrationNotReady)
 	}
 	err = runtime.StartCall(
@@ -1060,7 +1332,7 @@ func TestRegistrationRefreshFailureIsIsolatedAcrossSessions(t *testing.T) {
 	writeSIPResponse(t, peer, gateway, request, 500, "Server Error", "session-one-refresh-failed")
 	_ = readRuntimeEvent(t, runtime, EventRegistrationFailed)
 
-	if _, err := runtime.registeredSession("session-2"); err != nil {
+	if _, _, err := runtime.registeredSession("session-2"); err != nil {
 		t.Fatalf("session-1 refresh failure changed session-2 registration: %v", err)
 	}
 }
@@ -1117,6 +1389,61 @@ func TestInboundInviteRejectsUnsupportedRequiredExtensionBeforeCreatingCall(t *t
 	runtime.mu.RUnlock()
 	if retained {
 		t.Fatal("unsupported INVITE retained a SIP Call-ID mapping")
+	}
+}
+
+func TestInboundInviteWithSameUsernameRoutesByRegisteredPBXPeer(t *testing.T) {
+	udpAddress := reservePacketAddress(t)
+	runtime, err := NewSIPGoRuntime(SIPGoConfig{
+		ListenUDP: udpAddress, ListenTCP: reserveTCPAddress(t), AdvertisedIP: "127.0.0.1",
+		EventBuffer: 16,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	firstPeer, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = firstPeer.Close() })
+	secondPeer, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = secondPeer.Close() })
+	for _, session := range []struct {
+		id   string
+		peer net.PacketConn
+	}{
+		{id: "session-1", peer: firstPeer},
+		{id: "session-2", peer: secondPeer},
+	} {
+		if err := runtime.Configure(context.Background(), session.id, Configuration{
+			Host: "127.0.0.1", Port: uint16(session.peer.LocalAddr().(*net.UDPAddr).Port),
+			Transport: TransportUDP, Username: "1129", Password: "secret",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		runtime.setRegistered(session.id, true)
+	}
+	serverUDP, err := net.ResolveUDPAddr("udp", udpAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverPort := mustPort(t, udpAddress)
+	secondPort := secondPeer.LocalAddr().(*net.UDPAddr).Port
+	invite := buildInboundRequest(
+		"INVITE", serverPort, secondPort, "from-branch-two", "",
+		"same-extension-branch-two@example.test", "z9hG4bK-branch-two", "1 INVITE", testInboundSDP,
+	)
+	if _, err := secondPeer.WriteTo([]byte(invite), serverUDP); err != nil {
+		t.Fatal(err)
+	}
+	_ = readSIPResponseContaining(t, secondPeer, "180 Ringing")
+	incoming := readRuntimeEvent(t, runtime, EventIncoming)
+	if incoming.SessionID != "session-2" {
+		t.Fatalf("inbound same-username call routed to %q, want session-2", incoming.SessionID)
 	}
 }
 
@@ -1395,6 +1722,92 @@ func TestInboundInviteAnswerAndRemoteByeOverTCP(t *testing.T) {
 		t.Fatalf("ended event=%+v", ended)
 	}
 	waitForCallRemoval(t, runtime, "session-1", incoming.CallID)
+}
+
+func TestInboundTCPSeparatesSameUsernameByOpaqueContactAndPBXPeer(t *testing.T) {
+	udpAddress := reservePacketAddress(t)
+	tcpAddress := reserveTCPAddress(t)
+	runtime, err := NewSIPGoRuntime(SIPGoConfig{
+		ListenUDP: udpAddress, ListenTCP: tcpAddress, AdvertisedIP: "127.0.0.1",
+		EventBuffer: 16,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	firstPeer, err := net.DialTimeout("tcp", tcpAddress, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = firstPeer.Close() })
+	secondPeer, err := net.DialTimeout("tcp", tcpAddress, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = secondPeer.Close() })
+	for _, session := range []struct {
+		id   string
+		peer net.Conn
+	}{
+		{id: "session-1", peer: firstPeer},
+		{id: "session-2", peer: secondPeer},
+	} {
+		if err := runtime.Configure(context.Background(), session.id, Configuration{
+			Host: "127.0.0.1", Port: uint16(session.peer.LocalAddr().(*net.TCPAddr).Port),
+			Transport: TransportTCP, Username: "1129", Password: "secret",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		runtime.setRegistered(session.id, true)
+	}
+	serverPort := mustPort(t, tcpAddress)
+	secondPort := secondPeer.LocalAddr().(*net.TCPAddr).Port
+	rewrittenInvite := strings.ReplaceAll(buildInboundRequest(
+		"INVITE", serverPort, secondPort, "from-tcp-peer", "",
+		"tcp-peer-routing@example.test", "z9hG4bK-tcp-peer", "1 INVITE", testInboundSDP,
+	), "SIP/2.0/UDP", "SIP/2.0/TCP")
+	if _, err := io.WriteString(secondPeer, rewrittenInvite); err != nil {
+		t.Fatal(err)
+	}
+	secondReader := bufio.NewReader(secondPeer)
+	_ = readTCPResponseContaining(t, secondPeer, secondReader, "180 Ringing")
+	if incoming := readRuntimeEvent(t, runtime, EventIncoming); incoming.SessionID != "session-2" {
+		t.Fatalf("rewritten Contact routed to %q, want session-2 by PBX peer", incoming.SessionID)
+	}
+
+	runtime.mu.RLock()
+	firstContact := runtime.sessions["session-1"].contactUser
+	runtime.mu.RUnlock()
+	firstPort := firstPeer.LocalAddr().(*net.TCPAddr).Port
+	opaqueInvite := strings.ReplaceAll(buildInboundRequest(
+		"INVITE", serverPort, firstPort, "from-tcp-contact", "",
+		"tcp-contact-routing@example.test", "z9hG4bK-tcp-contact", "1 INVITE", testInboundSDP,
+	), "SIP/2.0/UDP", "SIP/2.0/TCP")
+	opaqueInvite = strings.ReplaceAll(opaqueInvite, "sip:1129@", "sip:"+firstContact+"@")
+	if _, err := io.WriteString(firstPeer, opaqueInvite); err != nil {
+		t.Fatal(err)
+	}
+	firstReader := bufio.NewReader(firstPeer)
+	_ = readTCPResponseContaining(t, firstPeer, firstReader, "180 Ringing")
+	if incoming := readRuntimeEvent(t, runtime, EventIncoming); incoming.SessionID != "session-1" {
+		t.Fatalf("opaque Contact routed to %q, want session-1", incoming.SessionID)
+	}
+
+	ambiguousPeer, err := net.DialTimeout("tcp", tcpAddress, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ambiguousPeer.Close() })
+	ambiguousPort := ambiguousPeer.LocalAddr().(*net.TCPAddr).Port
+	ambiguousInvite := strings.ReplaceAll(buildInboundRequest(
+		"INVITE", serverPort, ambiguousPort, "from-tcp-ambiguous", "",
+		"tcp-ambiguous@example.test", "z9hG4bK-tcp-ambiguous", "1 INVITE", testInboundSDP,
+	), "SIP/2.0/UDP", "SIP/2.0/TCP")
+	if _, err := io.WriteString(ambiguousPeer, ambiguousInvite); err != nil {
+		t.Fatal(err)
+	}
+	ambiguousReader := bufio.NewReader(ambiguousPeer)
+	_ = readTCPResponseContaining(t, ambiguousPeer, ambiguousReader, "480 Temporarily Unavailable")
 }
 
 func TestInboundInviteCanBeRejectedAfterRinging(t *testing.T) {

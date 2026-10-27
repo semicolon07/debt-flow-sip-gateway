@@ -4,6 +4,10 @@
 rollback runtime ทำที่ Collection บน Web API/Admin Portal แบบ explicit และห้าม automatic fallback
 ขณะที่มี active call
 
+Multi-profile targetยังคงไม่มี Web API→Gateway management channel. เมื่อ master/profileถูก Disable Portalที่ online
+poll runtime statusและส่ง hangup/closeภายใน healthy 10-second SLA; browser/APIที่ disconnectedใช้ Gateway lease/
+reconnect graceเดิม. หาก SLAผิดให้ตรวจ Portal status requestและ command deliveryก่อน restart Gateway.
+
 ## First response
 
 1. หยุดเปิด Collection ใหม่เข้า `sip_gateway` และเก็บเวลาที่ incident เริ่ม
@@ -52,7 +56,9 @@ Gateway รุ่นที่แก้แล้วต้องไม่แสด
 - ตรวจ registration state ใน `http://127.0.0.1:9090/diagnostics/` และ operational log ที่ sanitize แล้ว
 - ถ้ามี authenticated session แต่ registered เป็นศูนย์ ให้ตรวจ PBX reachability, SIP transport, credential,
   realm และ firewall โดยห้ามพิมพ์ password หรือ Authorization header ลง ticket
-- ตรวจว่า SIP username ไม่มี session owner ซ้ำ และ browser session ยัง renew lease ตามปกติ
+- Current P1ตรวจว่า SIP usernameไม่มี session ownerซ้ำ. Multi-profile buildต้องตรวจ composite owner
+  `transport|canonical configured host|port|realm|exact username`; usernameเดียวต่าง PBXต้องอยู่พร้อมกันได้และ
+  browser sessionยัง renew leaseตามปกติ.
 - ทดสอบ REGISTER หนึ่ง account หลังแก้ และรอให้ alert resolve ก่อนเปิด Collection เพิ่ม
 - รุ่นที่มี registration generation guard จะ log `SIP registration failed` หรือ
   `SIP registration refresh failed` พร้อม `sessionId`, `sipStatusCode`, `failureKind` และ

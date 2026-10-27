@@ -16,6 +16,11 @@ SIP Gateway ไม่มี route, URL, credential, client certificate หรื
 - Web API configuration: `PhoneGateway:PublicWebSocketUrl`, `PhoneGateway:GatewayId`,
   `PhoneGateway:Capability:Issuer`, `Audience`, `ActiveKeyId` และ `Keys:<keyId>`
 
+รายการข้างต้นเป็น **current P1 singleton deployment contract**. ใช้ singleton variablesด้านล่างต่อไปจน Web API
+endpoint-registry implementationและ migration
+ตาม [canonical contract](https://git.uniga.app/debt-flow/docs/-/blob/main/features/collection-sip-provider/multi-profile-architecture.md)
+ถูก deployครบ ห้ามเปลี่ยน environment variablesล่วงหน้า.
+
 เปิดใช้งานฝั่ง Web API ด้วย environment variables ด้านล่าง โดย `GatewayId`, issuer, audience, key ID
 และ decoded key ต้องตรงกับ Gateway configuration ทุกค่า:
 
@@ -33,6 +38,28 @@ PhoneGateway__Capability__Keys__cap-2026-10=<base64-encoded-32-byte-key>
 จาก secret manager เท่านั้น Web API จะปฏิเสธการเริ่ม process เมื่อ `PhoneGateway__Enabled=true` แต่ URL,
 identity หรือ active key ตั้งค่าไม่ครบ/ไม่ถูกต้อง หากยังใช้เฉพาะ Desktop Agent ให้คง `Enabled=false`
 ไว้ได้โดยไม่ต้อง provision capability key
+
+### Planned multi-profile breaking cutover
+
+Web APIรุ่น multi-profileไม่อ่าน singleton `PublicWebSocketUrl`/`GatewayId`และไม่มี fallback. Operationsต้อง provision
+registryครบทุก environmentก่อน deploy; shared Capability ringอยู่ rootและ endpointเก็บ DisplayName/Enabled/WSS/GatewayId:
+
+```text
+PhoneGateway__Enabled=true
+PhoneGateway__DefaultEndpointKey=central
+PhoneGateway__Capability__Issuer=debt-flow-web-api
+PhoneGateway__Capability__Audience=debt-flow-sip-gateway
+PhoneGateway__Capability__ActiveKeyId=cap-2026-10
+PhoneGateway__Capability__Keys__cap-2026-10=<base64-encoded-32-byte-key>
+PhoneGateway__Endpoints__central__DisplayName=Central SIP Gateway
+PhoneGateway__Endpoints__central__Enabled=true
+PhoneGateway__Endpoints__central__PublicWebSocketUrl=wss://sip-gateway.uniga.app/gateway/v1
+PhoneGateway__Endpoints__central__GatewayId=sip-gateway-01
+```
+
+Web API validate registryตอน startupและเปลี่ยน configด้วย restart ไม่มี hot reload. Gatewayทุก logical endpointได้รับ
+shared verifier keysชุดเดียวกันแต่ config `gatewayId`ของตัวเอง; capabilityของ endpointอื่นต้องถูกปฏิเสธแม้ decryptได้.
+Admin/browserเห็นเฉพาะ endpoint key/display name/configured statusและเลือก arbitrary URLไม่ได้.
 
 ## Install
 
@@ -121,9 +148,9 @@ ICE/TURN credential หรือ media ก่อน zip script จะทำ secr
 
 ## Key rotation
 
-เพิ่ม key ใหม่ทั้ง Web API secret configuration และ Gateway `protectedKeys` ก่อน เปลี่ยน
-`ActiveKeyId` ฝั่ง Web API แล้วรออย่างน้อย 120 วินาทีจึงนำ key เก่าออก การ overlap ทำให้ capability
-และ lease ที่ยังไม่หมดอายุใช้งานต่อได้โดยไม่สร้าง direct dependency ระหว่างสอง service
+เพิ่ม keyใหม่ใน shared Web API ringและ Gateway `protectedKeys`ของ **ทุก endpoint** ก่อน เปลี่ยน `ActiveKeyId`ฝั่ง
+Web API แล้วรออย่างน้อย 120 วินาทีจึงนำ keyเก่าออกจากทุก verifier. ห้าม activate keyจน readinessยืนยันครบทุก endpoint.
+Shared-key compromiseมี blast radiusทั้ง registry; incidentต้อง rotateทุก endpointแต่ GatewayId bindingยังคงบังคับ.
 
 ## Upgrade and rollback
 

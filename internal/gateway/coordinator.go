@@ -84,7 +84,7 @@ type Coordinator struct {
 	mu         sync.RWMutex
 	redeemMu   sync.Mutex
 	sessions   map[string]*runtimeSession
-	sipOwners  map[string]string
+	sipOwners  map[sip.Identity]string
 	callOwners map[string]string
 	closed     chan struct{}
 	closeOnce  sync.Once
@@ -192,7 +192,7 @@ func NewCoordinator(
 	coordinator := &Coordinator{
 		cfg: cfg, capability: capabilityVerifier, store: storeValue, turn: turnCredentials, rtc: rtc, media: media,
 		sip: sipRuntime, logger: logger, now: time.Now,
-		sessions: make(map[string]*runtimeSession), sipOwners: make(map[string]string),
+		sessions: make(map[string]*runtimeSession), sipOwners: make(map[sip.Identity]string),
 		callOwners: make(map[string]string),
 		closed:     make(chan struct{}),
 	}
@@ -227,6 +227,14 @@ func (c *Coordinator) Redeem(ctx context.Context, auth protocol.Authenticate) (C
 		Host: response.SIP.Host, Port: uint16(response.SIP.Port), Transport: transport,
 		Username: response.SIP.Username, Password: response.SIP.Password, Realm: response.SIP.Realm,
 	}
+	identity, err := sip.IdentityOf(configuration)
+	if err != nil {
+		c.observeCapability("session", "rejected")
+		return Claims{}, errors.New("invalid SIP identity in session capability")
+	}
+	configuration.Host = identity.Host
+	configuration.Transport = identity.Transport
+	configuration.Realm = identity.Realm
 	if err := c.store.BindSession(ctx, claims.SessionID, claims.AgentInstanceID,
 		claims.UserSessionID, claims.CollectionID, claims.CollectionBindingID, now); err != nil {
 		c.observeCapability("session", "rejected")
@@ -260,7 +268,7 @@ func (c *Coordinator) Redeem(ctx context.Context, auth protocol.Authenticate) (C
 	// A SIP address-of-record must have exactly one owner in this process. Without
 	// this takeover, a browser refresh/new identity can leave the old registration
 	// retrying during reconnect grace and inbound INVITEs become nondeterministic.
-	if ownerID := c.sipOwners[configuration.Username]; ownerID != "" && ownerID != claims.SessionID {
+	if ownerID := c.sipOwners[identity]; ownerID != "" && ownerID != claims.SessionID {
 		owner := c.sessions[ownerID]
 		c.mu.Unlock()
 		if owner != nil {
@@ -281,7 +289,7 @@ func (c *Coordinator) Redeem(ctx context.Context, auth protocol.Authenticate) (C
 		return Claims{}, errors.New("gateway session capacity reached")
 	}
 	c.sessions[claims.SessionID] = session
-	c.sipOwners[configuration.Username] = claims.SessionID
+	c.sipOwners[identity] = claims.SessionID
 	c.mu.Unlock()
 	c.observeCapability("session", "accepted")
 	go c.monitorLease(claims.SessionID, claims.CapabilityID)
@@ -870,7 +878,7 @@ func (c *Coordinator) Close() error {
 	c.mu.Lock()
 	sessions := c.sessions
 	c.sessions = make(map[string]*runtimeSession)
-	c.sipOwners = make(map[string]string)
+	c.sipOwners = make(map[sip.Identity]string)
 	c.mu.Unlock()
 	var result error
 	sessionIDs := make([]string, 0, len(sessions))
@@ -2374,8 +2382,9 @@ func (c *Coordinator) removeSessionLocked(sessionID string, session *runtimeSess
 		return
 	}
 	delete(c.sessions, sessionID)
-	if c.sipOwners[session.sipConfig.Username] == sessionID {
-		delete(c.sipOwners, session.sipConfig.Username)
+	identity, identityErr := sip.IdentityOf(session.sipConfig)
+	if identityErr == nil && c.sipOwners[identity] == sessionID {
+		delete(c.sipOwners, identity)
 	}
 	for callID, owner := range c.callOwners {
 		if owner == sessionID {

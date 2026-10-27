@@ -195,6 +195,83 @@ func TestCoordinatorAtomicallyTakesOverAnIdleSIPIdentity(t *testing.T) {
 	}
 }
 
+func TestCoordinatorAllowsSameUsernameOnDifferentPBXIdentities(t *testing.T) {
+	verifier := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	sipRuntime := newFakeSIP()
+	coordinator := newTestCoordinator(t, verifier, sipRuntime)
+	authentication := protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	}
+	first, err := coordinator.Redeem(context.Background(), authentication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier.mu.Lock()
+	verifier.sessionID = "session-2"
+	verifier.userSession = "user-session-2"
+	verifier.sipBootstrap = capability.SIPBootstrap{
+		Host: "pbx-branch-b.internal", Port: 5060, Transport: "udp",
+		Username: "100", Password: "password",
+	}
+	verifier.mu.Unlock()
+	second, err := coordinator.Redeem(context.Background(), authentication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.session(first.SessionID); err != nil {
+		t.Fatalf("first PBX session was incorrectly taken over: %v", err)
+	}
+	if _, err := coordinator.session(second.SessionID); err != nil {
+		t.Fatalf("second PBX session was not retained: %v", err)
+	}
+	sipRuntime.mu.Lock()
+	defer sipRuntime.mu.Unlock()
+	if len(sipRuntime.closed) != 0 {
+		t.Fatalf("different PBX identity closed sessions: %v", sipRuntime.closed)
+	}
+}
+
+func TestCoordinatorRejectsSameAoRTakeoverWhileCallIsActive(t *testing.T) {
+	verifier := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
+	sipRuntime := newFakeSIP()
+	coordinator := newTestCoordinator(t, verifier, sipRuntime)
+	authentication := protocol.Authenticate{
+		CollectionID: "collection-1", SessionCapability: "capability", PortalVersion: "1",
+		SupportedProtocolVersions: []int{1},
+	}
+	first, err := coordinator.Redeem(context.Background(), authentication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := coordinator.session(first.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	machine, err := call.NewOutbound(uuid.NewString(), time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	session.activeCall = machine
+	session.mu.Unlock()
+	verifier.mu.Lock()
+	verifier.sessionID = "session-2"
+	verifier.userSession = "user-session-2"
+	verifier.mu.Unlock()
+	if _, err := coordinator.Redeem(context.Background(), authentication); err == nil {
+		t.Fatal("same AoR takeover was accepted while the existing session had an active call")
+	}
+	if _, err := coordinator.session(first.SessionID); err != nil {
+		t.Fatalf("active same-AoR owner was removed: %v", err)
+	}
+	sipRuntime.mu.Lock()
+	defer sipRuntime.mu.Unlock()
+	if len(sipRuntime.closed) != 0 {
+		t.Fatalf("active same-AoR session was closed: %v", sipRuntime.closed)
+	}
+}
+
 func TestCoordinatorResumesSessionAndIgnoresStaleDisconnect(t *testing.T) {
 	verifier := &fakeCapabilityVerifier{destination: "sip:canonical@pbx.internal"}
 	coordinator := newTestCoordinator(t, verifier, newFakeSIP())

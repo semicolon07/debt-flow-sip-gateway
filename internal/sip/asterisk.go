@@ -11,8 +11,8 @@ import (
 type AsteriskProfile struct{}
 
 func (AsteriskProfile) ValidateConfiguration(cfg Configuration) error {
-	if net.ParseIP(cfg.Host) == nil && strings.TrimSpace(cfg.Host) == "" {
-		return errors.New("SIP host is required")
+	if _, err := IdentityOf(cfg); err != nil {
+		return err
 	}
 	if cfg.Port == 0 || cfg.Username == "" || cfg.Password == "" {
 		return errors.New("SIP port, username and password are required")

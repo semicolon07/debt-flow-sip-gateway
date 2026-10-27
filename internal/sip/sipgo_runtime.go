@@ -2,6 +2,8 @@ package sip
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +30,7 @@ type SIPGoConfig struct {
 	EventBuffer       int
 	OutboundTimeout   time.Duration
 	CanAcceptIncoming func(sessionID string) bool
+	ResolveIPv4       func(context.Context, string) ([]net.IP, error)
 	Logger            *slog.Logger
 	Debug             bool
 }
@@ -42,6 +45,8 @@ type SIPGoRuntime struct {
 	cancel    context.CancelFunc
 	mu        sync.RWMutex
 	sessions  map[string]*sipgoSession
+	sipOwners map[Identity]string
+	contacts  map[string]string
 	calls     map[string]*sipgoCall
 	sipCallID map[string]string
 	udpConn   net.PacketConn
@@ -55,7 +60,11 @@ var configureSIPGoLoggingOnce sync.Once
 
 type sipgoSession struct {
 	configuration  Configuration
+	identity       Identity
 	contact        sipmessage.ContactHeader
+	contactUser    string
+	registeredPeer string
+	resolvedTarget string
 	client         *sipgo.Client
 	clientDialogs  *sipgo.DialogClientCache
 	serverDialogs  *sipgo.DialogServerCache
@@ -109,8 +118,9 @@ var errOutboundAnswerTimeout = errors.New("outbound answer timeout")
 var (
 	// ErrRegistrationNotReady lets the coordinator distinguish a stale
 	// registration view from an adapter or transport failure.
-	ErrRegistrationNotReady = errors.New("SIP registration is not ready")
-	errSIPSessionChanged    = errors.New("SIP session changed during operation")
+	ErrRegistrationNotReady   = errors.New("SIP registration is not ready")
+	errSIPSessionChanged      = errors.New("SIP session changed during operation")
+	errSIPHostIPv4Unavailable = errors.New("SIP host has no usable IPv4 A record")
 )
 
 func NewSIPGoRuntime(cfg SIPGoConfig) (*SIPGoRuntime, error) {
@@ -128,6 +138,11 @@ func NewSIPGoRuntime(cfg SIPGoConfig) (*SIPGoRuntime, error) {
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.ResolveIPv4 == nil {
+		cfg.ResolveIPv4 = func(ctx context.Context, host string) ([]net.IP, error) {
+			return net.DefaultResolver.LookupIP(ctx, "ip4", host)
+		}
 	}
 	udpConn, err := net.ListenPacket("udp", cfg.ListenUDP)
 	if err != nil {
@@ -201,6 +216,7 @@ func NewSIPGoRuntime(cfg SIPGoConfig) (*SIPGoRuntime, error) {
 	runtime := &SIPGoRuntime{
 		cfg: cfg, ua: ua, clients: clients, server: server, events: make(chan Event, cfg.EventBuffer),
 		ctx: ctx, cancel: cancel, sessions: make(map[string]*sipgoSession),
+		sipOwners: make(map[Identity]string), contacts: make(map[string]string),
 		calls: make(map[string]*sipgoCall), sipCallID: make(map[string]string),
 		udpConn: udpConn, tcpListen: tcpListener,
 		logger: cfg.Logger,
@@ -226,7 +242,15 @@ func (r *SIPGoRuntime) Configure(_ context.Context, sessionID string, configurat
 	if err := (AsteriskProfile{}).ValidateConfiguration(configuration); err != nil {
 		return err
 	}
-	contact, err := buildContact(r.cfg, configuration)
+	identity, err := IdentityOf(configuration)
+	if err != nil {
+		return err
+	}
+	configuration.Host = identity.Host
+	configuration.Transport = identity.Transport
+	configuration.Realm = identity.Realm
+	contactUser := contactUserFor(sessionID, identity)
+	contact, err := buildContact(r.cfg, configuration, contactUser)
 	if err != nil {
 		return err
 	}
@@ -236,19 +260,27 @@ func (r *SIPGoRuntime) Configure(_ context.Context, sessionID string, configurat
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for ownerID, owner := range r.sessions {
-		if ownerID != sessionID && owner.configuration.Username == configuration.Username {
-			return errors.New("SIP username is already owned by another session")
+	if ownerID := r.sipOwners[identity]; ownerID != "" && ownerID != sessionID {
+		return errors.New("SIP identity is already owned by another session")
+	}
+	if existing := r.sessions[sessionID]; existing != nil {
+		if existing.registerCancel != nil {
+			existing.registerCancel()
+		}
+		if r.sipOwners[existing.identity] == sessionID {
+			delete(r.sipOwners, existing.identity)
+		}
+		if r.contacts[existing.contactUser] == sessionID {
+			delete(r.contacts, existing.contactUser)
 		}
 	}
-	if existing := r.sessions[sessionID]; existing != nil && existing.registerCancel != nil {
-		existing.registerCancel()
-	}
 	r.sessions[sessionID] = &sipgoSession{
-		configuration: configuration, contact: contact, client: client,
+		configuration: configuration, identity: identity, contact: contact, contactUser: contactUser, client: client,
 		clientDialogs: sipgo.NewDialogClientCache(client, contact),
 		serverDialogs: sipgo.NewDialogServerCache(client, contact),
 	}
+	r.sipOwners[identity] = sessionID
+	r.contacts[contactUser] = sessionID
 	return nil
 }
 
@@ -320,7 +352,7 @@ func (r *SIPGoRuntime) StartCall(ctx context.Context, sessionID, callID, destina
 	if err != nil {
 		return fmt.Errorf("invalid local SIP SDP: %w", err)
 	}
-	session, err := r.registeredSession(sessionID)
+	session, resolvedTarget, err := r.registeredSession(sessionID)
 	if err != nil {
 		return err
 	}
@@ -346,10 +378,13 @@ func (r *SIPGoRuntime) StartCall(ctx context.Context, sessionID, callID, destina
 		return ErrRegistrationNotReady
 	}
 	callCtx, cancel := context.WithCancelCause(context.Background())
-	dialog, err := session.clientDialogs.Invite(ctx, recipient, localSDP,
-		sipmessage.NewHeader("Content-Type", "application/sdp"),
-		from,
-	)
+	invite := sipmessage.NewRequest(sipmessage.INVITE, recipient)
+	invite.SetBody(localSDP)
+	invite.SetTransport(strings.ToUpper(string(session.configuration.Transport)))
+	invite.SetDestination(resolvedTarget)
+	invite.AppendHeader(sipmessage.NewHeader("Content-Type", "application/sdp"))
+	invite.AppendHeader(from)
+	dialog, err := session.clientDialogs.WriteInvite(ctx, invite)
 	if err != nil {
 		cancel(err)
 		return err
@@ -582,6 +617,12 @@ func (r *SIPGoRuntime) CloseSession(ctx context.Context, sessionID string) error
 	r.mu.Lock()
 	if r.sessions[sessionID] == session {
 		delete(r.sessions, sessionID)
+		if r.sipOwners[session.identity] == sessionID {
+			delete(r.sipOwners, session.identity)
+		}
+		if r.contacts[session.contactUser] == sessionID {
+			delete(r.contacts, session.contactUser)
+		}
 	}
 	r.mu.Unlock()
 	return nil
@@ -901,8 +942,7 @@ func (r *SIPGoRuntime) onInvite(request *sipmessage.Request, tx sipmessage.Serve
 		r.respondUnsupportedExtension(request, tx, unsupported)
 		return
 	}
-	username := request.Recipient.User
-	sessionID, session, registered := r.sessionByUsername(username)
+	sessionID, session, registered := r.sessionForInboundRequest(request)
 	if session == nil || !registered {
 		r.logInboundRejection(callRef, "registration_not_ready", sipmessage.StatusTemporarilyUnavailable)
 		_ = tx.Respond(sipmessage.NewResponseFromRequest(request, sipmessage.StatusTemporarilyUnavailable, "Temporarily Unavailable", nil))
@@ -1351,13 +1391,17 @@ func (r *SIPGoRuntime) cleanupOutbound(callValue *sipgoCall) {
 
 func (r *SIPGoRuntime) registerOnce(ctx context.Context, session *sipgoSession, expires uint32) error {
 	cfg := session.configuration
+	resolvedTarget, err := r.resolveSessionTarget(ctx, session, expires != 0)
+	if err != nil {
+		return err
+	}
 	recipient := sipmessage.Uri{User: cfg.Username, Host: cfg.Host, Port: int(cfg.Port)}
 	request := sipmessage.NewRequest(sipmessage.REGISTER, recipient)
 	request.AppendHeader(&session.contact)
 	expiresHeader := sipmessage.ExpiresHeader(expires)
 	request.AppendHeader(&expiresHeader)
 	request.SetTransport(strings.ToUpper(string(cfg.Transport)))
-	request.SetDestination(net.JoinHostPort(cfg.Host, strconv.Itoa(int(cfg.Port))))
+	request.SetDestination(resolvedTarget)
 	transaction, err := session.client.TransactionRequest(ctx, request, sipgo.ClientRequestRegisterBuild)
 	if err != nil {
 		return err
@@ -1407,10 +1451,13 @@ func (r *SIPGoRuntime) registerOnce(ctx context.Context, session *sipgoSession, 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return &sipRegisterResponseError{status: response.StatusCode}
 	}
+	r.mu.Lock()
+	session.registeredPeer = canonicalPeerAddress(response.Source())
+	r.mu.Unlock()
 	return nil
 }
 
-func buildContact(cfg SIPGoConfig, configuration Configuration) (sipmessage.ContactHeader, error) {
+func buildContact(cfg SIPGoConfig, configuration Configuration, contactUsers ...string) (sipmessage.ContactHeader, error) {
 	listenAddress := cfg.ListenUDP
 	if configuration.Transport == TransportTCP {
 		listenAddress = cfg.ListenTCP
@@ -1423,7 +1470,11 @@ func buildContact(cfg SIPGoConfig, configuration Configuration) (sipmessage.Cont
 	if err != nil {
 		return sipmessage.ContactHeader{}, err
 	}
-	address := sipmessage.Uri{User: configuration.Username, Host: cfg.AdvertisedIP, Port: port}
+	contactUser := configuration.Username
+	if len(contactUsers) > 0 && contactUsers[0] != "" {
+		contactUser = contactUsers[0]
+	}
+	address := sipmessage.Uri{User: contactUser, Host: cfg.AdvertisedIP, Port: port}
 	setURITransport(&address, configuration.Transport)
 	return sipmessage.ContactHeader{Address: address}, nil
 }
@@ -1569,6 +1620,18 @@ func (r *SIPGoRuntime) setRegistered(sessionID string, registered bool) {
 	r.mu.Lock()
 	if session := r.sessions[sessionID]; session != nil {
 		session.registered = registered
+		if registered && session.registeredPeer == "" {
+			session.registeredPeer = canonicalPeerAddress(net.JoinHostPort(
+				session.identity.Host, strconv.Itoa(int(session.identity.Port)),
+			))
+		}
+		if registered && session.resolvedTarget == "" {
+			if address := net.ParseIP(session.identity.Host); address != nil && address.To4() != nil {
+				session.resolvedTarget = net.JoinHostPort(
+					address.To4().String(), strconv.Itoa(int(session.identity.Port)),
+				)
+			}
+		}
 	}
 	r.mu.Unlock()
 }
@@ -1633,29 +1696,123 @@ func (r *SIPGoRuntime) session(sessionID string) (*sipgoSession, error) {
 	return session, nil
 }
 
-func (r *SIPGoRuntime) registeredSession(sessionID string) (*sipgoSession, error) {
+func (r *SIPGoRuntime) registeredSession(sessionID string) (*sipgoSession, string, error) {
 	r.mu.RLock()
 	session := r.sessions[sessionID]
-	registered := session != nil && session.registered
+	registered := session != nil && session.registered && session.resolvedTarget != ""
+	resolvedTarget := ""
+	if session != nil {
+		resolvedTarget = session.resolvedTarget
+	}
 	r.mu.RUnlock()
 	if session == nil {
-		return nil, errors.New("SIP session is not configured")
+		return nil, "", errors.New("SIP session is not configured")
 	}
 	if !registered {
-		return nil, ErrRegistrationNotReady
+		return nil, "", ErrRegistrationNotReady
 	}
-	return session, nil
+	return session, resolvedTarget, nil
 }
 
-func (r *SIPGoRuntime) sessionByUsername(username string) (string, *sipgoSession, bool) {
+func (r *SIPGoRuntime) resolveSessionTarget(
+	ctx context.Context,
+	session *sipgoSession,
+	refresh bool,
+) (string, error) {
+	r.mu.RLock()
+	current := session.resolvedTarget
+	r.mu.RUnlock()
+	if !refresh && current != "" {
+		return current, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	host := session.identity.Host
+	var resolved net.IP
+	if literal := net.ParseIP(host); literal != nil {
+		resolved = literal.To4()
+	} else {
+		addresses, err := r.cfg.ResolveIPv4(ctx, host)
+		if err != nil {
+			return "", err
+		}
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		for _, address := range addresses {
+			if ipv4 := address.To4(); ipv4 != nil {
+				resolved = ipv4
+				break
+			}
+		}
+	}
+	if resolved == nil {
+		return "", errSIPHostIPv4Unavailable
+	}
+	target := net.JoinHostPort(resolved.String(), strconv.Itoa(int(session.identity.Port)))
+	r.mu.Lock()
+	session.resolvedTarget = target
+	r.mu.Unlock()
+	return target, nil
+}
+
+func (r *SIPGoRuntime) sessionForInboundRequest(request *sipmessage.Request) (string, *sipgoSession, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	for sessionID, session := range r.sessions {
-		if session.configuration.Username == username {
+	transport := Transport(strings.ToLower(request.Transport()))
+	if sessionID := r.contacts[request.Recipient.User]; sessionID != "" {
+		session := r.sessions[sessionID]
+		if session != nil && session.identity.Transport == transport {
 			return sessionID, session, session.registered
 		}
 	}
+	peer := canonicalPeerAddress(request.Source())
+	var matchedID string
+	var matched *sipgoSession
+	var soleID string
+	var sole *sipgoSession
+	candidates := 0
+	for sessionID, session := range r.sessions {
+		if !session.registered || session.identity.Username != request.Recipient.User ||
+			session.identity.Transport != transport {
+			continue
+		}
+		candidates++
+		soleID, sole = sessionID, session
+		if session.registeredPeer == "" || session.registeredPeer != peer {
+			continue
+		}
+		if matched != nil {
+			return "", nil, false
+		}
+		matchedID, matched = sessionID, session
+	}
+	if matched != nil {
+		return matchedID, matched, true
+	}
+	if candidates == 1 {
+		return soleID, sole, true
+	}
 	return "", nil, false
+}
+
+func contactUserFor(sessionID string, identity Identity) string {
+	digest := sha256.Sum256([]byte(sessionID + "\x00" + string(identity.Transport) + "\x00" + identity.Host +
+		"\x00" + strconv.Itoa(int(identity.Port)) + "\x00" + identity.Realm + "\x00" + identity.Username))
+	return "df-" + base64.RawURLEncoding.EncodeToString(digest[:12])
+}
+
+func canonicalPeerAddress(value string) string {
+	host, port, err := net.SplitHostPort(value)
+	if err != nil {
+		return ""
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.To4() == nil {
+		return ""
+	}
+	return net.JoinHostPort(ip.To4().String(), port)
 }
 
 func (r *SIPGoRuntime) call(sessionID, callID string) (*sipgoCall, error) {

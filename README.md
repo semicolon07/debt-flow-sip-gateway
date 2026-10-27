@@ -5,6 +5,16 @@ Debt Flow SIP Windows Agent ที่เครื่องผู้ใช้
 
 สถานะปัจจุบัน: **P1 functional scope accepted and closed (18/10/2026); production release qualification pending**
 
+Multi-profile target 26/10/2026: Gatewayกลางหนึ่งตัวรองรับหลาย PBX profilesได้โดย capabilityเดิมส่ง
+host/port/transport/credentialต่อ session. Sourceวันที่ 27/10/2026เปลี่ยน in-process SIP owner keyจาก
+Usernameอย่างเดียวเป็น canonical `host + port + transport + realm + username`แล้ว พร้อม opaque Contactและ
+PBX-peer fallbackสำหรับ inbound routing. Target contractอยู่ที่
+[FEAT-049 multi-profile architecture](https://git.uniga.app/debt-flow/docs/-/blob/main/features/collection-sip-provider/multi-profile-architecture.md);
+ยังต้องผ่าน Issabel/Asterisk multi-PBX pilotก่อน production. Web API targetใช้ endpoint registryที่มี shared capability
+key ringและ GatewayIdแยกต่อ endpoint; Gatewayทุกตัวต้อง verify keyร่วมและ reject `gatewayId`ที่ไม่ตรง. ไม่มี endpoint
+fallbackหรือ Web API→Gateway management/revocation channel. Administrative Disable SLA 10 วินาทีอาศัย Portalที่ยัง
+onlineส่ง hangup/close; disconnected sessionยังใช้ Gateway lease/reconnect graceเดิม.
+
 เอกสารหลัก:
 
 - [P1 implementation plan](docs/2026-10-17-p1-implementation-plan.md)
